@@ -7681,48 +7681,72 @@ function App() {
 
   // Real-time Firestore listeners — sync across devices
   useEffect(() => {
-    if (!window._db) return;
-    setSyncing(true);
-    const unsubRooms = WS.onSnapshot("rooms", data => {
-      if (data) setRooms(data);
-      setSyncing(false);
-      setSyncErr(false);
-    });
-    const unsubBk = WS.onSnapshot("bookings", data => {
-      if (data) {
-        // Cloud copy has masked IDs and no photos (by design — see
-        // sanitizeBookingsForCloud). Merge with whatever full local data this
-        // device already has for the SAME booking, so we never lose photos/
-        // raw ID numbers that only ever existed on this device.
-        setBookings(prevLocal => data.map(cloudB => {
-          const localB = (prevLocal || []).find(b => b.id === cloudB.id);
-          if (!localB) return cloudB; // new booking from another device — cloud (sanitized) version is all we have
-          return {
-            ...cloudB,
-            aadhaar: localB.aadhaar || cloudB.aadhaar,
-            photoFront: localB.photoFront || cloudB.photoFront,
-            photoBack: localB.photoBack || cloudB.photoBack,
-            signature: localB.signature || cloudB.signature,
-            family: Array.isArray(cloudB.family) ? cloudB.family.map((cm, i) => {
-              const lm = localB.family && localB.family[i];
-              return lm ? { ...cm, idNumber: lm.idNumber || cm.idNumber, photoFront: lm.photoFront || cm.photoFront, photoBack: lm.photoBack || cm.photoBack } : cm;
-            }) : cloudB.family
-          };
-        }));
+    let unsubRooms = () => {};
+    let unsubBk = () => {};
+    let unsubProfile = () => {};
+    let cancelled = false;
+    let pollTimer = null;
+
+    // window._db is set by a separate <script> tag that loads the Firebase
+    // SDK over the network — on a slow/mobile connection, React can finish
+    // mounting and run this effect BEFORE that finishes. Since this effect
+    // has an empty dependency array (runs once), a plain "if (!window._db)
+    // return" here used to mean: if Firebase wasn't ready in that split
+    // second, real-time sync silently never activated for the rest of the
+    // session — explaining why sync worked "sometimes" (fast network) and
+    // not others (any delay loading the SDK). Poll instead of giving up.
+    const trySetup = () => {
+      if (cancelled) return;
+      if (!window._db) {
+        pollTimer = setTimeout(trySetup, 200);
+        return;
       }
-      setSyncing(false);
-    });
-    // Profile (hotel name/address/GSTIN + GST pricing mode) — WITHOUT this,
-    // a setting change (e.g. Owner switching GST Extra ↔ GST Included) would
-    // only reach OTHER already-open devices on their next reload, meaning
-    // Owner and Manager could briefly see different totals for the exact
-    // same active booking. This makes it apply everywhere instantly.
-    const unsubProfile = WS.onSnapshot("profile", data => {
-      if (data) setProfile(p => ({ ...p, ...data }));
-    });
-    // Connection state monitor
-    window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
+      setSyncing(true);
+      unsubRooms = WS.onSnapshot("rooms", data => {
+        if (data) setRooms(data);
+        setSyncing(false);
+        setSyncErr(false);
+      });
+      unsubBk = WS.onSnapshot("bookings", data => {
+        if (data) {
+          // Cloud copy has masked IDs and no photos (by design — see
+          // sanitizeBookingsForCloud). Merge with whatever full local data this
+          // device already has for the SAME booking, so we never lose photos/
+          // raw ID numbers that only ever existed on this device.
+          setBookings(prevLocal => data.map(cloudB => {
+            const localB = (prevLocal || []).find(b => b.id === cloudB.id);
+            if (!localB) return cloudB; // new booking from another device — cloud (sanitized) version is all we have
+            return {
+              ...cloudB,
+              aadhaar: localB.aadhaar || cloudB.aadhaar,
+              photoFront: localB.photoFront || cloudB.photoFront,
+              photoBack: localB.photoBack || cloudB.photoBack,
+              signature: localB.signature || cloudB.signature,
+              family: Array.isArray(cloudB.family) ? cloudB.family.map((cm, i) => {
+                const lm = localB.family && localB.family[i];
+                return lm ? { ...cm, idNumber: lm.idNumber || cm.idNumber, photoFront: lm.photoFront || cm.photoFront, photoBack: lm.photoBack || cm.photoBack } : cm;
+              }) : cloudB.family
+            };
+          }));
+        }
+        setSyncing(false);
+      });
+      // Profile (hotel name/address/GSTIN + GST pricing mode) — WITHOUT this,
+      // a setting change (e.g. Owner switching GST Extra ↔ GST Included) would
+      // only reach OTHER already-open devices on their next reload, meaning
+      // Owner and Manager could briefly see different totals for the exact
+      // same active booking. This makes it apply everywhere instantly.
+      unsubProfile = WS.onSnapshot("profile", data => {
+        if (data) setProfile(p => ({ ...p, ...data }));
+      });
+      // Connection state monitor
+      window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
+    };
+    trySetup();
+
     return () => {
+      cancelled = true;
+      if (pollTimer) clearTimeout(pollTimer);
       unsubRooms();
       unsubBk();
       unsubProfile();
