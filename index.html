@@ -1227,7 +1227,7 @@ const WS = {
     try {
       const ref = this._ref(k);
       if (!ref) return null;
-      const snap = await ref.get();
+      const snap = await ref.get({ source: 'server' });
       if (snap.exists) {
         const val = snap.data().value;
         try {
@@ -7849,10 +7849,10 @@ function App() {
         // polling exists to work around. Doing two at once here would
         // undermine the whole point and add to the load on the listeners
         // above. One at a time, with a small gap between them.
-        const freshRooms = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get();
+        const freshRooms = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get({ source: 'server' });
         if (!cancelled && freshRooms.exists) setRooms(freshRooms.data().value);
         await new Promise(r => setTimeout(r, 500));
-        const freshBookings = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("bookings").get();
+        const freshBookings = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("bookings").get({ source: 'server' });
         if (!cancelled && freshBookings.exists) setBookings(prevLocal => mergeBookings(freshBookings.data().value, prevLocal));
       } catch (e) { /* silent — this is a best-effort backup, live listener is primary */ }
     }, 10000);
