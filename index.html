@@ -7527,8 +7527,25 @@ function App() {
       setView(allowed[0] || "dash");
     }
   }, [view, user, permissions]);
-  const [rooms, setRooms] = useState([]);
-  const [bookings, setBookings] = useState([]);
+  const [rooms, setRooms] = useState(() => {
+    // Synchronous lazy initializer — runs ONCE, before ANY effect (including
+    // the onSnapshot listener setup) gets a chance to run. This is critical:
+    // the OLD code read localStorage inside an async boot effect (after
+    // awaiting WS.get("cu")/WS.get("permissions")), which meant it could
+    // complete AFTER the onSnapshot listener had already delivered fresh
+    // cloud data — silently OVERWRITING correct real-time data with stale
+    // local cache moments later. That race is exactly why sync appeared to
+    // "not work" even after reload: the right data arrived, then got
+    // clobbered. Doing this here instead guarantees correct ordering.
+    try { const v = localStorage.getItem("ab_rooms"); if (v) return JSON.parse(v); } catch {}
+    return initRooms();
+  });
+  const [bookings, setBookings] = useState(() => {
+    // Same fix as rooms above — synchronous lazy initializer so this can
+    // never race against (and overwrite) fresh onSnapshot data.
+    try { const v = localStorage.getItem("ab_bookings"); if (v) return JSON.parse(v); } catch {}
+    return [];
+  });
   const [modal, setModal] = useState(null);
   const [checkInRoom, setCIR] = useState(null);
   const [profile, setProfile] = useState(() => {
@@ -7621,20 +7638,12 @@ function App() {
         const perms = await WS.get("permissions");
         if (u) setUser(u);
         if (perms) setPermissions(perms);
-        // Read localStorage DIRECTLY (never Firestore) for an instant first
-        // paint of Rooms — the "rooms" onSnapshot listener below is what
-        // actually keeps this correct going forward; this is just so a
-        // RETURNING device (which already has a local cache) doesn't show
-        // a blank grid for the split-second before that listener's first
-        // callback fires. A brand-new device (no cache yet, e.g.
-        // Incognito) simply shows initRooms() defaults briefly instead.
-        let cachedRooms = null;
-        try { const v = localStorage.getItem("ab_rooms"); if (v) cachedRooms = JSON.parse(v); } catch {}
-        setRooms(cachedRooms || initRooms());
-        // Same instant-paint treatment for Bookings — direct localStorage
-        // read only, never touching Firestore here (the "bookings"
-        // onSnapshot listener owns the actual live/cloud-synced data).
-        try { const v = localStorage.getItem("ab_bookings"); if (v) setBookings(JSON.parse(v)); } catch {}
+        // NOTE: rooms/bookings instant-paint from localStorage now happens
+        // in their useState lazy initializers (synchronous, runs before any
+        // effect) — NOT here. Setting them here (after two awaited network
+        // calls) used to create a race where this stale-cache write could
+        // land AFTER the onSnapshot listener had already delivered fresh
+        // cloud data, silently clobbering it back to old values.
         // Pull staff logins + audit trail from cloud (new device support)
         await CloudSync.hydrateOnBoot();
         // Silently restore local-folder access if this device already has
