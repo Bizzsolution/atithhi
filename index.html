@@ -58,7 +58,7 @@
         // condition and automatically fall back to plain HTTP long-polling
         // for the Listen stream too, which is far more firewall-friendly.
         try {
-          window._db.settings({ experimentalAutoDetectLongPolling: true });
+          window._db.settings({ experimentalAutoDetectLongPolling: true, merge: true });
         } catch (settingsErr) {
           console.warn("[AtithiBook] Firestore settings:", settingsErr.message);
         }
