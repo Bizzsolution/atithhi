@@ -44,6 +44,24 @@
           appId:"1:851231850636:web:1168ddb738e1d7f41a7ba9"
         });
         window._db=firebase.firestore();
+        // Real-time listeners (onSnapshot) use a persistent WebChannel
+        // "Listen" stream under the hood — DIFFERENT from the simple HTTP
+        // requests used by one-time get()/set() calls. Some networks
+        // (corporate/hotel WiFi, certain mobile carriers, VPNs/proxies)
+        // block or destabilize this specific long-lived streaming
+        // connection while still allowing normal requests through — which
+        // exactly matches what was seen: writes reaching Firestore
+        // correctly (visible in Firebase Console), but other devices'
+        // real-time listeners never receiving the update, plus a
+        // "WebChannelConnection RPC 'Listen' stream ... transport errored"
+        // warning in the console. This setting makes the SDK detect that
+        // condition and automatically fall back to plain HTTP long-polling
+        // for the Listen stream too, which is far more firewall-friendly.
+        try {
+          window._db.settings({ experimentalAutoDetectLongPolling: true });
+        } catch (settingsErr) {
+          console.warn("[AtithiBook] Firestore settings:", settingsErr.message);
+        }
         // NOTE: We deliberately do NOT call enablePersistence() here.
         // Firestore's own IndexedDB-based multi-tab persistence has a
         // known SDK issue that throws recurring uncaught
@@ -7029,9 +7047,9 @@ function StorageSettingsView({
     }
   }, /*#__PURE__*/React.createElement("strong", null, "📡 Multi-Device Sync Check"), /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 6, color: "var(--muted)" }
-  }, "Agar dusre device (Owner/Manager) ke saath data sync nahi ho raha, dono phones pe yeh section kholo aur dono ki values COMPARE karo — agar License Key match NAHI karta, dono devices alag-alag data mein save kar rahe hain."), /*#__PURE__*/React.createElement("div", {
+  }, "Agar dusre device (Owner/Manager) ke saath data sync nahi ho raha, dono phones pe yeh section kholo aur dono ki values COMPARE karo — agar 'Computed Hotel ID' match NAHI karta (chahe License Key upar se same lagе), dono devices alag-alag data mein save kar rahe hain (invisible character difference ho sakta hai)."), /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, fontFamily: "monospace", fontSize: 12, background: "#fff", padding: "10px 12px", borderRadius: 8, border: "1px solid #e2e8f0" }
-  }, "Firebase: ", window._db ? "🟢 Connected" : "🔴 NOT Connected", /*#__PURE__*/React.createElement("br", null), "License Key: ", /*#__PURE__*/React.createElement("b", null, localStorage.getItem("ab_license_key") || "(not set)"))), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
+  }, "Firebase: ", window._db ? "🟢 Connected" : "🔴 NOT Connected", /*#__PURE__*/React.createElement("br", null), "License Key: ", /*#__PURE__*/React.createElement("b", null, localStorage.getItem("ab_license_key") || "(not set)"), /*#__PURE__*/React.createElement("br", null), "Key Length: ", /*#__PURE__*/React.createElement("b", null, (localStorage.getItem("ab_license_key") || "").length, " characters"), /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", { style: { color: "#7c3aed", fontWeight: 700 } }, "Computed Hotel ID: ", WS._hid(), " ← COMPARE THIS EXACT VALUE ON BOTH DEVICES"))), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
 }
 
 /* ── BOTTOM NAV ───────────────────────────────────────────────── */
