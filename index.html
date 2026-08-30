@@ -43,19 +43,33 @@
        best-effort accelerant — so a transient internal SDK hiccup should
        never be allowed to disrupt the app itself. -->
   <script>
-    window.addEventListener('error', function(e) {
-      const msg = e.message || '';
-      if (msg.includes('INTERNAL ASSERTION FAILED') || msg.includes('Target ID already exists')) {
-        console.warn('[AtithiBook] Known Firestore SDK issue (non-fatal, Firebase-side, see code comments):', msg);
-        e.preventDefault();
+    // Firebase's OWN internal logger calls console.error() DIRECTLY for
+    // "Target ID already exists" (visible as logger.ts:115 in the actual
+    // stack trace) — this is Firebase choosing to log it itself, NOT a
+    // genuine uncaught browser exception, so window.addEventListener
+    // ('error') never sees it at all. Overriding console.error is the
+    // only way to actually filter this specific known-noisy, wontfix
+    // message out of the visible console.
+    const KNOWN_FIRESTORE_ISSUES = ['INTERNAL ASSERTION FAILED', 'Target ID already exists'];
+    const isKnownFirestoreNoise = (args) => {
+      const text = args.map(a => (a && a.message) || String(a)).join(' ');
+      return KNOWN_FIRESTORE_ISSUES.some(sig => text.includes(sig));
+    };
+    const originalConsoleError = console.error.bind(console);
+    console.error = function(...args) {
+      if (isKnownFirestoreNoise(args)) {
+        console.warn('[AtithiBook] Known Firestore SDK issue suppressed (non-fatal, Firebase-side, see index.html comments)');
+        return;
       }
+      originalConsoleError(...args);
+    };
+    // Backup coverage for the (less common) case where either issue DOES
+    // surface as a genuine uncaught error/rejection instead.
+    window.addEventListener('error', function(e) {
+      if (isKnownFirestoreNoise([e])) e.preventDefault();
     });
     window.addEventListener('unhandledrejection', function(e) {
-      const msg = (e.reason && e.reason.message) || String(e.reason || '');
-      if (msg.includes('INTERNAL ASSERTION FAILED') || msg.includes('Target ID already exists')) {
-        console.warn('[AtithiBook] Known Firestore SDK issue (non-fatal, Firebase-side, see code comments):', msg);
-        e.preventDefault();
-      }
+      if (isKnownFirestoreNoise([e.reason])) e.preventDefault();
     });
   </script>
 
@@ -7782,23 +7796,35 @@ function App() {
         return;
       }
       setSyncing(true);
+      // Small stagger between each listener registration — registering
+      // several onSnapshot listeners in the exact same tick is itself a
+      // form of concurrent Firestore SDK activity, which is the general
+      // pattern Firebase's own bug reports tie to the "Target ID already
+      // exists" issue. Spreading registration out costs a few hundred ms
+      // at boot but meaningfully reduces how much load hits the SDK at once.
       unsubRooms = WS.onSnapshot("rooms", data => {
         if (data) setRooms(data);
         setSyncing(false);
         setSyncErr(false);
       });
-      unsubBk = WS.onSnapshot("bookings", data => {
-        if (data) setBookings(prevLocal => mergeBookings(data, prevLocal));
-        setSyncing(false);
-      });
+      setTimeout(() => {
+        if (cancelled) return;
+        unsubBk = WS.onSnapshot("bookings", data => {
+          if (data) setBookings(prevLocal => mergeBookings(data, prevLocal));
+          setSyncing(false);
+        });
+      }, 300);
       // Profile (hotel name/address/GSTIN + GST pricing mode) — WITHOUT this,
       // a setting change (e.g. Owner switching GST Extra ↔ GST Included) would
       // only reach OTHER already-open devices on their next reload, meaning
       // Owner and Manager could briefly see different totals for the exact
       // same active booking. This makes it apply everywhere instantly.
-      unsubProfile = WS.onSnapshot("profile", data => {
-        if (data) setProfile(p => ({ ...p, ...data }));
-      });
+      setTimeout(() => {
+        if (cancelled) return;
+        unsubProfile = WS.onSnapshot("profile", data => {
+          if (data) setProfile(p => ({ ...p, ...data }));
+        });
+      }, 600);
       // Connection state monitor
       window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
     };
@@ -7818,16 +7844,18 @@ function App() {
     const pollInterval = setInterval(async () => {
       if (cancelled || !window._db) return;
       try {
-        const [freshRooms, freshBookings] = await Promise.all([
-          window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get(),
-          window._db.collection("hotels").doc(WS._hid()).collection("data").doc("bookings").get()
-        ]);
-        if (!cancelled) {
-          if (freshRooms.exists) setRooms(freshRooms.data().value);
-          if (freshBookings.exists) setBookings(prevLocal => mergeBookings(freshBookings.data().value, prevLocal));
-        }
+        // Sequential (NOT Promise.all) — concurrent Firestore calls are
+        // exactly what triggers the "Target ID already exists" bug this
+        // polling exists to work around. Doing two at once here would
+        // undermine the whole point and add to the load on the listeners
+        // above. One at a time, with a small gap between them.
+        const freshRooms = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get();
+        if (!cancelled && freshRooms.exists) setRooms(freshRooms.data().value);
+        await new Promise(r => setTimeout(r, 500));
+        const freshBookings = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("bookings").get();
+        if (!cancelled && freshBookings.exists) setBookings(prevLocal => mergeBookings(freshBookings.data().value, prevLocal));
       } catch (e) { /* silent — this is a best-effort backup, live listener is primary */ }
-    }, 8000);
+    }, 10000);
 
     return () => {
       cancelled = true;
