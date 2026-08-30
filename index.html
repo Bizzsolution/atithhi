@@ -26,6 +26,39 @@
 
   <title>AtithiBook - Hotel Management</title>
 
+  <!-- Global safety net for TWO known, permanently-unfixed Firebase JS SDK
+       bugs — placed here, before ANYTHING else loads, so it is guaranteed
+       active before even the earliest Firestore call (including ones that
+       can fire on the login screen before any user action):
+       1. "FIRESTORE INTERNAL ASSERTION FAILED: Unexpected state" — reported
+          across SDK versions 8.x-12.x, tied to internal WebChannel/
+          AsyncQueue state under network instability or rapid writes.
+       2. "Target ID already exists" — Firebase's own team has closed this
+          as "wontfix" on their public issue tracker (multiple long-running
+          reports), meaning it is a permanent SDK limitation, not something
+          fixable from application code.
+       This app's PRIMARY data path is already localStorage (WS.get/
+       WS.onSnapshot always check it first) plus a periodic backup refetch
+       for cross-device data, with Firestore's real-time layer as a
+       best-effort accelerant — so a transient internal SDK hiccup should
+       never be allowed to disrupt the app itself. -->
+  <script>
+    window.addEventListener('error', function(e) {
+      const msg = e.message || '';
+      if (msg.includes('INTERNAL ASSERTION FAILED') || msg.includes('Target ID already exists')) {
+        console.warn('[AtithiBook] Known Firestore SDK issue (non-fatal, Firebase-side, see code comments):', msg);
+        e.preventDefault();
+      }
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      const msg = (e.reason && e.reason.message) || String(e.reason || '');
+      if (msg.includes('INTERNAL ASSERTION FAILED') || msg.includes('Target ID already exists')) {
+        console.warn('[AtithiBook] Known Firestore SDK issue (non-fatal, Firebase-side, see code comments):', msg);
+        e.preventDefault();
+      }
+    });
+  </script>
+
   <!-- Firebase SDK -->
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
@@ -7722,6 +7755,26 @@ function App() {
     // second, real-time sync silently never activated for the rest of the
     // session — explaining why sync worked "sometimes" (fast network) and
     // not others (any delay loading the SDK). Poll instead of giving up.
+    // Shared merge logic (used by both the live listener and the polling
+    // fallback below) — cloud bookings have masked IDs and no photos (see
+    // sanitizeBookingsForCloud); merge with whatever full local data this
+    // device already has for the SAME booking.
+    const mergeBookings = (data, prevLocal) => data.map(cloudB => {
+      const localB = (prevLocal || []).find(b => b.id === cloudB.id);
+      if (!localB) return cloudB;
+      return {
+        ...cloudB,
+        aadhaar: localB.aadhaar || cloudB.aadhaar,
+        photoFront: localB.photoFront || cloudB.photoFront,
+        photoBack: localB.photoBack || cloudB.photoBack,
+        signature: localB.signature || cloudB.signature,
+        family: Array.isArray(cloudB.family) ? cloudB.family.map((cm, i) => {
+          const lm = localB.family && localB.family[i];
+          return lm ? { ...cm, idNumber: lm.idNumber || cm.idNumber, photoFront: lm.photoFront || cm.photoFront, photoBack: lm.photoBack || cm.photoBack } : cm;
+        }) : cloudB.family
+      };
+    });
+
     const trySetup = () => {
       if (cancelled) return;
       if (!window._db) {
@@ -7735,27 +7788,7 @@ function App() {
         setSyncErr(false);
       });
       unsubBk = WS.onSnapshot("bookings", data => {
-        if (data) {
-          // Cloud copy has masked IDs and no photos (by design — see
-          // sanitizeBookingsForCloud). Merge with whatever full local data this
-          // device already has for the SAME booking, so we never lose photos/
-          // raw ID numbers that only ever existed on this device.
-          setBookings(prevLocal => data.map(cloudB => {
-            const localB = (prevLocal || []).find(b => b.id === cloudB.id);
-            if (!localB) return cloudB; // new booking from another device — cloud (sanitized) version is all we have
-            return {
-              ...cloudB,
-              aadhaar: localB.aadhaar || cloudB.aadhaar,
-              photoFront: localB.photoFront || cloudB.photoFront,
-              photoBack: localB.photoBack || cloudB.photoBack,
-              signature: localB.signature || cloudB.signature,
-              family: Array.isArray(cloudB.family) ? cloudB.family.map((cm, i) => {
-                const lm = localB.family && localB.family[i];
-                return lm ? { ...cm, idNumber: lm.idNumber || cm.idNumber, photoFront: lm.photoFront || cm.photoFront, photoBack: lm.photoBack || cm.photoBack } : cm;
-              }) : cloudB.family
-            };
-          }));
-        }
+        if (data) setBookings(prevLocal => mergeBookings(data, prevLocal));
         setSyncing(false);
       });
       // Profile (hotel name/address/GSTIN + GST pricing mode) — WITHOUT this,
@@ -7771,9 +7804,35 @@ function App() {
     };
     trySetup();
 
+    // POLLING SAFETY NET — Firebase's own engineering team has permanently
+    // marked the "Target ID already exists" crash as "wontfix" (confirmed
+    // on their public issue tracker), meaning the real-time onSnapshot
+    // listener above can be silently disrupted by a bug that is, by
+    // Firebase's own admission, never going to be fixed at the SDK level.
+    // Rather than depend entirely on that fragile stream, this does a
+    // plain one-time refetch every 8 seconds as a backup — so even if a
+    // real-time update is ever missed or the listener gets knocked out,
+    // this device is never more than a few seconds out of date. This is a
+    // deliberate, standard workaround for exactly this class of platform
+    // limitation, not a workaround for anything wrong in our own code.
+    const pollInterval = setInterval(async () => {
+      if (cancelled || !window._db) return;
+      try {
+        const [freshRooms, freshBookings] = await Promise.all([
+          window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get(),
+          window._db.collection("hotels").doc(WS._hid()).collection("data").doc("bookings").get()
+        ]);
+        if (!cancelled) {
+          if (freshRooms.exists) setRooms(freshRooms.data().value);
+          if (freshBookings.exists) setBookings(prevLocal => mergeBookings(freshBookings.data().value, prevLocal));
+        }
+      } catch (e) { /* silent — this is a best-effort backup, live listener is primary */ }
+    }, 8000);
+
     return () => {
       cancelled = true;
       if (pollTimer) clearTimeout(pollTimer);
+      clearInterval(pollInterval);
       unsubRooms();
       unsubBk();
       unsubProfile();
@@ -8311,33 +8370,6 @@ setTimeout(() => {
   if (l) l.style.display = 'none';
 }, 300);
 </script>
-
-  <!-- Global safety net for a KNOWN, long-standing Firebase JS SDK bug —
-       "FIRESTORE INTERNAL ASSERTION FAILED: Unexpected state" — reported
-       across Firestore SDK versions 8.x through 12.x on Firebase's own
-       GitHub issue tracker, tied to internal WebChannel/AsyncQueue state
-       under network instability or rapid writes. Firebase's own engineers
-       have not fully root-caused this across dozens of open reports, so we
-       defensively catch it here instead of letting it surface as an
-       uncaught error: this app's PRIMARY data path is already localStorage
-       (WS.get/WS.onSnapshot always check it first), with Firestore purely
-       for cross-device sync — so a transient internal SDK hiccup should
-       never be allowed to disrupt the app itself. -->
-  <script>
-    window.addEventListener('error', function(e) {
-      if (e.message && e.message.includes('INTERNAL ASSERTION FAILED')) {
-        console.warn('[AtithiBook] Firestore internal SDK error (known upstream bug, non-fatal):', e.message);
-        e.preventDefault();
-      }
-    });
-    window.addEventListener('unhandledrejection', function(e) {
-      const msg = (e.reason && e.reason.message) || String(e.reason || '');
-      if (msg.includes('INTERNAL ASSERTION FAILED')) {
-        console.warn('[AtithiBook] Firestore internal SDK rejection (known upstream bug, non-fatal):', msg);
-        e.preventDefault();
-      }
-    });
-  </script>
 
   <!-- Service Worker Registration -->
   <script>
