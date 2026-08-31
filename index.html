@@ -2921,25 +2921,7 @@ function DashboardView({
       fontSize: 11,
       color: "var(--gold)"
     }
-  }, user.role, " · ", tagline)), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setModal({
-      type: "editProfile"
-    }),
-    style: {
-      position: "absolute",
-      top: 10,
-      right: 10,
-      padding: "6px 10px",
-      background: "rgba(255,255,255,.2)",
-      backdropFilter: "blur(8px)",
-      border: "1px solid rgba(255,255,255,.3)",
-      borderRadius: 8,
-      color: "#fff",
-      fontSize: 11,
-      fontWeight: 700,
-      cursor: "pointer"
-    }
-  }, "✏️ Edit")), !profile?.hotelBanner && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, user.role, " · ", tagline))), !profile?.hotelBanner && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "rgba(255,255,255,.6)",
@@ -2950,48 +2932,51 @@ function DashboardView({
   }, "GOOD ", new Date().getHours() < 12 ? "MORNING" : new Date().getHours() < 17 ? "AFTERNOON" : "EVENING"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center"
+      alignItems: "center",
+      gap: 12
     }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
     style: {
-      fontSize: 20,
+      width: 44,
+      height: 44,
+      borderRadius: "50%",
+      background: "rgba(255,255,255,.12)",
+      border: "1.5px solid var(--gold)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontFamily: "'Josefin Sans',sans-serif",
+      fontWeight: 700,
+      fontSize: 17,
+      color: "var(--gold)",
+      flexShrink: 0
+    }
+  }, (ownerName || "?").trim().split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase()), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 19,
       fontWeight: 700,
       color: "#fff",
-      fontFamily: "'Josefin Sans',sans-serif"
+      fontFamily: "'Josefin Sans',sans-serif",
+      lineHeight: 1.2
     }
   }, ownerName), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
-      color: "#d97706",
+      color: "var(--gold)",
       marginTop: 2
     }
   }, user.role, " · ", tagline), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "rgba(255,255,255,.5)",
-      marginTop: 6
+      marginTop: 4
     }
   }, new Date().toLocaleDateString("en-IN", {
     weekday: "long",
     day: "numeric",
     month: "long",
     year: "numeric"
-  }))), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setModal({
-      type: "editProfile"
-    }),
-    style: {
-      padding: "7px 12px",
-      background: "rgba(255,255,255,.15)",
-      border: "1px solid rgba(255,255,255,.25)",
-      borderRadius: 8,
-      color: "#fff",
-      fontSize: 11,
-      fontWeight: 700,
-      cursor: "pointer"
-    }
-  }, "✏️ Edit")))), /*#__PURE__*/React.createElement("div", {
+  })))))), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "0 14px",
       display: "flex",
@@ -6763,10 +6748,14 @@ function LocalRecordsSearch() {
   }))))))));
 }
 function StorageSettingsView({
-  user
+  user,
+  profile,
+  setModal
 }) {
   const [folderName, setFolderName] = useState(localStorage.getItem("ab_local_folder") || "");
   const [status, setStatus] = useState("");
+  const [exportStatus, setExportStatus] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [accessGranted, setAccessGranted] = useState(!!LocalFS._dirHandle);
   const isSupported = LocalFS.isSupported();
   useEffect(() => {
@@ -6796,6 +6785,43 @@ function StorageSettingsView({
     setFolderName("");
     setAccessGranted(false);
     setStatus("Local storage disabled");
+  };
+  const exportAllData = async () => {
+    setExportStatus("⏳ Fetching latest data from cloud...");
+    try {
+      if (!window._db) {
+        setExportStatus("❌ Firebase not connected — cannot export. Try again when online.");
+        return;
+      }
+      const hid = WS._hid();
+      const ref = k => window._db.collection("hotels").doc(hid).collection("data").doc(k);
+      const [rooms, bookings, users, audit, profile] = await Promise.all(
+        ["rooms", "bookings", "users", "audit", "profile"].map(k =>
+          ref(k).get({ source: "server" }).then(s => s.exists ? s.data().value : null).catch(() => null)
+        )
+      );
+      const backup = {
+        exportedAt: new Date().toISOString(),
+        hotelId: hid,
+        rooms: rooms || [],
+        bookings: bookings || [],
+        users: users || [],
+        auditLog: audit || [],
+        profile: profile || {}
+      };
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `atithibook-backup-${hid}-${todayStr()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setExportStatus("✅ Backup downloaded — " + (bookings || []).length + " bookings, " + (rooms || []).length + " rooms saved.");
+    } catch (e) {
+      setExportStatus("❌ Export failed: " + e.message);
+    }
   };
   const testSave = async () => {
     if (!LocalFS._dirHandle && !localStorage.getItem("ab_local_folder")) {
@@ -6842,6 +6868,36 @@ function StorageSettingsView({
       marginTop: 4
     }
   }, "Dual storage — Cloud + Local computer")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--border)",
+      borderRadius: 12,
+      padding: 14,
+      marginBottom: 14,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, color: "var(--navy)", fontSize: 14 }
+  }, "👤 Profile Settings"), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 12, color: "var(--muted)", marginTop: 2 }
+  }, "Hotel name, tagline, GSTIN, room pricing style")), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModal({ type: "editProfile" }),
+    style: {
+      padding: "8px 14px",
+      background: "var(--navy)",
+      color: "#fff",
+      border: "none",
+      borderRadius: 8,
+      fontSize: 12,
+      fontWeight: 700,
+      fontFamily: "'Josefin Sans',sans-serif",
+      cursor: "pointer",
+      flexShrink: 0
+    }
+  }, "✏️ Edit")), /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#f0fdf4",
       border: "1px solid #bbf7d0",
@@ -7072,6 +7128,24 @@ function StorageSettingsView({
       color: "var(--muted)"
     }
   }, "💡 Vault tab → Guest select karo → Download Record button")), /*#__PURE__*/React.createElement("div", {
+    style: { marginTop: 12 }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowAdvanced(v => !v),
+    style: {
+      width: "100%",
+      background: "none",
+      border: "none",
+      padding: "10px 0",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      cursor: "pointer",
+      color: "var(--muted)",
+      fontSize: 12,
+      fontWeight: 700,
+      fontFamily: "'Josefin Sans',sans-serif"
+    }
+  }, "🔧 Advanced / Troubleshooting Info", /*#__PURE__*/React.createElement("span", null, showAdvanced ? "▲" : "▼")), showAdvanced && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 12,
       padding: 14,
@@ -7096,7 +7170,35 @@ function StorageSettingsView({
     style: { marginTop: 6, color: "var(--muted)" }
   }, "Agar dusre device (Owner/Manager) ke saath data sync nahi ho raha, dono phones pe yeh section kholo aur dono ki values COMPARE karo — agar 'Computed Hotel ID' match NAHI karta (chahe License Key upar se same lagе), dono devices alag-alag data mein save kar rahe hain (invisible character difference ho sakta hai)."), /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, fontFamily: "monospace", fontSize: 12, background: "#fff", padding: "10px 12px", borderRadius: 8, border: "1px solid #e2e8f0" }
-  }, "Firebase: ", window._db ? "🟢 Connected" : "🔴 NOT Connected", /*#__PURE__*/React.createElement("br", null), "License Key: ", /*#__PURE__*/React.createElement("b", null, localStorage.getItem("ab_license_key") || "(not set)"), /*#__PURE__*/React.createElement("br", null), "Key Length: ", /*#__PURE__*/React.createElement("b", null, (localStorage.getItem("ab_license_key") || "").length, " characters"), /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", { style: { color: "#7c3aed", fontWeight: 700 } }, "Computed Hotel ID: ", WS._hid(), " ← COMPARE THIS EXACT VALUE ON BOTH DEVICES"))), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
+  }, "Firebase: ", window._db ? "🟢 Connected" : "🔴 NOT Connected", /*#__PURE__*/React.createElement("br", null), "License Key: ", /*#__PURE__*/React.createElement("b", null, localStorage.getItem("ab_license_key") || "(not set)"), /*#__PURE__*/React.createElement("br", null), "Key Length: ", /*#__PURE__*/React.createElement("b", null, (localStorage.getItem("ab_license_key") || "").length, " characters"), /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", { style: { color: "#7c3aed", fontWeight: 700 } }, "Computed Hotel ID: ", WS._hid(), " ← COMPARE THIS EXACT VALUE ON BOTH DEVICES"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--border)",
+      borderRadius: 12,
+      padding: 16,
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }
+  }, /*#__PURE__*/React.createElement("strong", null, "💾 Backup Karo")), /*#__PURE__*/React.createElement("div", {
+    style: { color: "var(--muted)", fontSize: 13, marginBottom: 10 }
+  }, "Poora hotel data (rooms, bookings, staff, audit log) ek JSON file mein download karo — safety copy ke liye rakh sakte ho."), /*#__PURE__*/React.createElement("button", {
+    onClick: exportAllData,
+    style: {
+      width: "100%",
+      padding: "13px",
+      border: "none",
+      borderRadius: 12,
+      background: "var(--navy)",
+      color: "#fff",
+      fontFamily: "'Josefin Sans',sans-serif",
+      fontWeight: 700,
+      fontSize: 14,
+      cursor: "pointer"
+    }
+  }, "⬇️ Export All Data"), exportStatus && /*#__PURE__*/React.createElement("div", {
+    style: { marginTop: 8, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
+  }, exportStatus)), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
 }
 
 /* ── BOTTOM NAV ───────────────────────────────────────────────── */
@@ -7836,13 +7938,21 @@ function App() {
     // listener above can be silently disrupted by a bug that is, by
     // Firebase's own admission, never going to be fixed at the SDK level.
     // Rather than depend entirely on that fragile stream, this does a
-    // plain one-time refetch every 8 seconds as a backup — so even if a
+    // plain one-time refetch every 20 seconds as a backup — so even if a
     // real-time update is ever missed or the listener gets knocked out,
-    // this device is never more than a few seconds out of date. This is a
+    // this device is never more than a short while out of date. This is a
     // deliberate, standard workaround for exactly this class of platform
     // limitation, not a workaround for anything wrong in our own code.
+    //
+    // IMPORTANT — only polls while the tab is actually visible/focused
+    // (document.hidden check). On the free Firestore plan (50k reads/day
+    // total, shared across every app on the project), polling around the
+    // clock even while a phone's screen is off or the tab is backgrounded
+    // would burn through the daily quota after only 2-3 hotels. Pausing
+    // when hidden cuts this dramatically for realistic usage, since staff
+    // don't keep the screen actively open every second of business hours.
     const pollInterval = setInterval(async () => {
-      if (cancelled || !window._db) return;
+      if (cancelled || !window._db || document.hidden) return;
       try {
         // Sequential (NOT Promise.all) — concurrent Firestore calls are
         // exactly what triggers the "Target ID already exists" bug this
@@ -7855,12 +7965,23 @@ function App() {
         const freshBookings = await window._db.collection("hotels").doc(WS._hid()).collection("data").doc("bookings").get({ source: 'server' });
         if (!cancelled && freshBookings.exists) setBookings(prevLocal => mergeBookings(freshBookings.data().value, prevLocal));
       } catch (e) { /* silent — this is a best-effort backup, live listener is primary */ }
-    }, 10000);
+    }, 20000);
+    // Also do one immediate poll whenever the tab becomes visible again
+    // (e.g. phone screen turned back on) — catches up right away instead
+    // of waiting up to 20s after someone returns to the app.
+    const onVisible = () => {
+      if (!document.hidden && !cancelled && window._db) {
+        window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get({ source: 'server' })
+          .then(s => { if (!cancelled && s.exists) setRooms(s.data().value); }).catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
     return () => {
       cancelled = true;
       if (pollTimer) clearTimeout(pollTimer);
       clearInterval(pollInterval);
+      document.removeEventListener("visibilitychange", onVisible);
       unsubRooms();
       unsubBk();
       unsubProfile();
@@ -8264,12 +8385,8 @@ function App() {
       gap: 10
     }
   }, /*#__PURE__*/React.createElement("div", {
-    onClick: () => setModal({
-      type: "editProfile"
-    }),
     style: {
-      textAlign: "right",
-      cursor: "pointer"
+      textAlign: "right"
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -8277,7 +8394,7 @@ function App() {
       color: "#fff",
       fontWeight: 600
     }
-  }, profile.ownerName || user.name, " ✏️"), /*#__PURE__*/React.createElement("div", {
+  }, profile.ownerName || user.name), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: "var(--gold)"
@@ -8346,7 +8463,9 @@ function App() {
     bookings: bookings,
     rooms: rooms
   }), view === "storage" && /*#__PURE__*/React.createElement(StorageSettingsView, {
-    user: user
+    user: user,
+    profile: profile,
+    setModal: setModal
   }), view === "access" && user?.role === "Owner" && hasFeature("roles") && /*#__PURE__*/React.createElement(AccessControlView, {
     permissions: permissions,
     savePermissions: savePermissions,
