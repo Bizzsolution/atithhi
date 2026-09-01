@@ -2925,7 +2925,7 @@ function DashboardView({
       fontSize: 11,
       color: "var(--gold)"
     }
-  }, user.role, " · ", tagline))), !profile?.hotelBanner && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, user.role))), !profile?.hotelBanner && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "rgba(255,255,255,.6)",
@@ -2969,7 +2969,7 @@ function DashboardView({
       color: "var(--gold)",
       marginTop: 2
     }
-  }, user.role, " · ", tagline), /*#__PURE__*/React.createElement("div", {
+  }, user.role), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "rgba(255,255,255,.5)",
@@ -8376,28 +8376,19 @@ function App() {
       color: "#fff",
       letterSpacing: .5
     }
-  }, profile.hotelName || HOTEL.name))), /*#__PURE__*/React.createElement("div", {
+  }, profile.hotelName || HOTEL.name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "var(--gold)",
+      marginTop: 1
+    }
+  }, profile?.hotelTagline || HOTEL.tagline))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
       gap: 10
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "right"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      color: "#fff",
-      fontWeight: 600
-    }
-  }, user.role === "Owner" ? (profile.ownerName || user.name) : user.name), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "var(--gold)"
-    }
-  }, user.role)), /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setUpdatePwd(true),
     style: {
       background: "rgba(255,255,255,.08)",
