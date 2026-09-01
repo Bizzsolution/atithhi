@@ -2863,7 +2863,11 @@ function DashboardView({
   const active = bookings.filter(b => b.status === "active");
   const todayOut = bookings.filter(b => b.checkOut === todayStr() && b.status === "active");
   const todayRev = bookings.filter(b => b.status === "checkedout" && b.checkOutActual === todayStr()).reduce((s, b) => s + (b.grandTotal || 0), 0);
-  const ownerName = profile?.ownerName || user.name;
+  // profile.ownerName is a hotel-level setting meant for the OWNER's own
+  // display name — it must NEVER override a different logged-in staff
+  // member's identity. Only use it as a fallback when the CURRENT user is
+  // actually the Owner; Manager/Receptionist always see their own name.
+  const ownerName = user.role === "Owner" ? (profile?.ownerName || user.name) : user.name;
   const tagline = profile?.hotelTagline || HOTEL.tagline;
   return /*#__PURE__*/React.createElement("div", {
     className: "scrollable hs",
@@ -8370,12 +8374,6 @@ function App() {
       fontWeight: 700,
       fontSize: 17,
       color: "#fff",
-      letterSpacing: 1
-    }
-  }, "ATITHIBOOK"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "rgba(255,255,255,.5)",
       letterSpacing: .5
     }
   }, profile.hotelName || HOTEL.name))), /*#__PURE__*/React.createElement("div", {
@@ -8394,7 +8392,7 @@ function App() {
       color: "#fff",
       fontWeight: 600
     }
-  }, profile.ownerName || user.name), /*#__PURE__*/React.createElement("div", {
+  }, user.role === "Owner" ? (profile.ownerName || user.name) : user.name), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: "var(--gold)"
