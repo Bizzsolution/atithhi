@@ -164,8 +164,9 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
         </div>
         <div class="gen-row" style="margin-top:8px">
           <input id="ownerName" placeholder="Owner/Contact Name (e.g. Rajesh Kumar)" maxlength="30"/>
-          <input id="ownerPhone" placeholder="Mobile Number (e.g. 9876543210)" maxlength="15" type="tel"/>
+          <input id="ownerPhone" placeholder="Phone(s) — comma se alag karo (Owner, Manager)" maxlength="60" type="tel"/>
         </div>
+        <div style="font-size:11px;color:#94a3b8;margin-top:-4px;margin-bottom:8px">💡 Owner aur Manager dono ke phone daal sakte ho: <code>9876543210,9123456780</code> — dono is key ko apने-apने device pe activate kar payenge</div>
         <button class="btn btn-success" onclick="generateKey()" style="margin-top:10px">⚡ Generate Key</button>
         <div id="newKeyBox" style="display:none;margin-top:16px">
           <div style="font-size:12px;color:#64748b;margin-bottom:6px">Generated Key — Send this to customer:</div>
@@ -624,7 +625,8 @@ function saveEditHotel() {
   if (!l) return;
 
   const newOwner = document.getElementById("editOwner").value.replace(/<[^>]*>/g, "").trim().slice(0, 40);
-  const newPhone = document.getElementById("editPhone").value.replace(/[^\d+\s-]/g, "").trim().slice(0, 15);
+  let newPhone = document.getElementById("editPhone").value.replace(/[^\d+,\s-]/g, "").trim().slice(0, 60);
+  newPhone = newPhone.split(",").map(p => p.trim()).filter(Boolean).join(",");
   const selectedPill = document.querySelector("#planPills .radio-pill.selected");
   const newPlan = selectedPill ? selectedPill.dataset.plan : l.plan;
   const newExpiry = document.getElementById("editExpiry").value.trim() || null;
@@ -717,24 +719,51 @@ function qrImageUrl(upiString) {
   return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(upiString)}`;
 }
 
+// Cryptographically secure random key — uses crypto.getRandomValues()
+// (Web Crypto API), NOT derived from hotel name/plan/sequence at all.
+// Character set deliberately excludes visually-ambiguous characters
+// (0/O, 1/I/L) since owners have to type this key manually on their
+// phone during setup. 12 random chars from a 32-char alphabet gives a
+// keyspace of 32^12 (~2^60) — brute-forcing this is computationally
+// infeasible, unlike the old "hotel-name + sequential-number" pattern
+// which could be guessed in at most ~100 tries per hotel.
+// IMPORTANT: pure alphanumeric, no extra hyphens/separators — the
+// Firestore security rules require hotelId to match ATITHI-[A-Za-z0-9]+,
+// so any additional punctuation here would break read/write access.
+function generateRandomKeySuffix() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (let i = 0; i < 12; i++) out += chars[bytes[i] % chars.length];
+  return out;
+}
 function generateKey() {
   let hotel = document.getElementById("hotelName").value.trim();
   const plan = document.getElementById("planType").value;
   let owner = document.getElementById("ownerName").value.trim();
   let phone = document.getElementById("ownerPhone").value.trim();
   if (!hotel) { alert("Hotel naam daalo!"); return; }
+  if (!phone) { alert("Kam se kam ek phone number daalna zaroori hai — isी number(s) se hotel ke devices is key ko activate kar payenge, security ke liye."); return; }
 
   // Strip any HTML/script tags — defense in depth
   hotel = hotel.replace(/<[^>]*>/g, "").slice(0, 40);
   owner = owner.replace(/<[^>]*>/g, "").slice(0, 40);
-  phone = phone.replace(/[^\d+\s-]/g, "").slice(0, 15);
+  phone = phone.replace(/[^\d+,\s-]/g, "").slice(0, 60);
   if (!hotel) { alert("Invalid hotel name!"); return; }
-  if (phone && phone.replace(/\D/g,"").length < 10) { alert("Mobile number 10 digit ka hona chahiye!"); return; }
+  const phoneList = phone.split(",").map(p => p.trim()).filter(Boolean);
+  if (phoneList.length === 0 || phoneList.some(p => p.replace(/\D/g,"").length < 10)) {
+    alert("Har phone number 10 digit ka hona chahiye! (Comma se alag karके multiple daал sakते ho)");
+    return;
+  }
+  phone = phoneList.join(",");
 
-  // Generate unique key
-  const code = hotel.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6).padEnd(4, "0");
-  const num = String(licenses.filter(l=>l.plan===plan).length + 1).padStart(2, "0");
-  const key = `ATITHI-${plan.slice(0,4)}${code.slice(0,4)}${num}`;
+  // Generate a cryptographically random, unguessable key — retry on the
+  // astronomically unlikely chance of a collision with an existing key.
+  let key;
+  do {
+    key = `ATITHI-${generateRandomKeySuffix()}`;
+  } while (licenses.some(l => l.key === key));
 
   const today = new Date().toISOString().split("T")[0];
   // TRIAL plans auto-expire after 7 days — paid plans (Basic/Pro/Premium)
@@ -1008,8 +1037,8 @@ async function refreshKeyStatus(){
       <input id="editOwner" placeholder="e.g. Rajesh Kumar"/>
     </div>
     <div class="field-group">
-      <label class="field-label">Mobile Number</label>
-      <input id="editPhone" placeholder="e.g. 9876543210" type="tel"/>
+      <label class="field-label">Phone(s) — comma se alag (Owner, Manager)</label>
+      <input id="editPhone" placeholder="9876543210,9123456780" type="tel"/>
     </div>
     <div class="field-group">
       <label class="field-label">Plan</label>

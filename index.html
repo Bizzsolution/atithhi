@@ -283,6 +283,12 @@ const OTHER_SERVICES_GST_RATE = 0.18;
 // booking" dropdown — covers typical budget through premium Indian hotel
 // room pricing so reception can quick-pick, or fall through to Custom.
 const RATE_PRESETS = [500, 600, 700, 800, 900, 1000, 1200, 1500, 1800, 2000, 2500, 3000, 4000, 5000, 7500, 10000];
+// Valid ID document types for guest registration — Aadhaar is the default
+// since it's most common in India, but other government IDs are equally
+// valid for hotel check-in. Only "Aadhaar Card" triggers the automatic
+// number-masking behaviour, since UIDAI's specific storage restriction
+// applies to Aadhaar, not to these other documents.
+const DOCUMENT_TYPES = ["Aadhaar Card", "Voter ID (EPIC)", "Driving Licence", "Passport", "PAN Card"];
 
 // ── SHARED OCR SCAN ENGINE ───────────────────────────────────────
 // Used by BOTH the primary guest scan AND family member scans, so both
@@ -1167,6 +1173,51 @@ const TYPE_META = {
 
 // ── UTILS ──────────────────────────────────────────────────────
 const uid = () => `BK${Date.now().toString(36).toUpperCase().slice(-6)}`;
+
+// Client-side Aadhaar number masking — zero cost, uses only the browser's
+// built-in Canvas API (no library, no external API call, no paid SDK).
+// UIDAI guidance discourages storing an unmasked Aadhaar image anywhere,
+// even locally — this ensures the ONLY copy that ever gets saved to
+// state/localStorage/local-folder has the 12-digit number blacked out.
+// The raw (unmasked) photo is used only transiently, in-memory, for the
+// OCR read itself, and is discarded right after this function returns.
+// On a standard Aadhaar front card, the 12-digit number sits in the
+// bottom band of the card — blacking out the bottom ~24% robustly covers
+// it across the minor layout variations seen in practice (physical card
+// photos, e-Aadhaar PDF screenshots, mAadhaar app screenshots).
+function maskAadhaarNumberInImage(dataUrl) {
+  return new Promise((resolve) => {
+    if (!dataUrl) { resolve(dataUrl); return; }
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          const bandHeight = img.height * 0.24;
+          ctx.fillStyle = "#000000";
+          ctx.fillRect(0, img.height - bandHeight, img.width, bandHeight);
+          ctx.fillStyle = "#ffffff";
+          ctx.font = `${Math.max(12, Math.round(img.height * 0.035))}px sans-serif`;
+          ctx.textAlign = "center";
+          ctx.fillText("Aadhaar number masked for privacy", img.width / 2, img.height - bandHeight / 2);
+          resolve(canvas.toDataURL("image/jpeg", 0.85));
+        } catch (e) {
+          // If canvas processing fails for any reason (e.g. tainted
+          // canvas), fail safe by NOT returning the unmasked image.
+          resolve(null);
+        }
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUrl;
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const tomorrowStr = () => new Date(Date.now() + 86400000).toISOString().slice(0, 10);
 const fmtDate = d => d ? new Date(`${d}T12:00:00`).toLocaleDateString("en-IN", {
@@ -1507,18 +1558,43 @@ function LicenseSetup({
   onDone
 }) {
   const [key, setKey] = useState(localStorage.getItem("ab_license_key") || "");
+  const [phone, setPhone] = useState(localStorage.getItem("ab_verified_phone") || "");
   const [groqKey, setGroqKey] = useState(localStorage.getItem("ab_groq_key") || "");
   const [err, setErr] = useState("");
   const [checking, setChecking] = useState(false);
-  const verify = () => {
+  const verify = async () => {
     const k = key.trim().toUpperCase();
     if (!k.startsWith("ATITHI-") || k.length < 12) {
       setErr("Invalid key format. Key should be like: ATITHI-HOTEL001\nGet your key from the person who sold you AtithiBook.");
       return;
     }
-    localStorage.setItem("ab_license_key", k);
-    if (groqKey.trim().startsWith("gsk_")) localStorage.setItem("ab_groq_key", groqKey.trim());
-    onDone(k);
+    const p = phone.trim();
+    if (!p) {
+      setErr("Phone number daalo — yehi number hotel setup ke waqt register kiya gaya tha, security ke liye zaroori hai.");
+      return;
+    }
+    setErr("");
+    setChecking(true);
+    try {
+      const res = await fetch("/api/verify-access", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ licenseKey: k, phone: p })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        setErr(data.error || "Verification failed — key ya phone number check karo.");
+        setChecking(false);
+        return;
+      }
+      localStorage.setItem("ab_license_key", k);
+      localStorage.setItem("ab_verified_phone", p);
+      if (groqKey.trim().startsWith("gsk_")) localStorage.setItem("ab_groq_key", groqKey.trim());
+      onDone(k);
+    } catch (e) {
+      setErr("Connection issue — internet check karके dobara try karo.");
+      setChecking(false);
+    }
   };
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1604,7 +1680,38 @@ function LicenseSetup({
       letterSpacing: 2,
       textAlign: "center"
     }
-  })), err && /*#__PURE__*/React.createElement("div", {
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 12,
+      fontWeight: 700,
+      color: "#475569",
+      display: "block",
+      marginBottom: 6
+    }
+  }, "REGISTERED PHONE NUMBER"), /*#__PURE__*/React.createElement("input", {
+    value: phone,
+    onChange: e => setPhone(e.target.value),
+    placeholder: "+91 98765 43210",
+    type: "tel",
+    style: {
+      width: "100%",
+      boxSizing: "border-box",
+      padding: "12px 14px",
+      border: "1.5px solid #e2e8f0",
+      borderRadius: 10,
+      fontSize: 15
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: "#94a3b8",
+      marginTop: 4
+    }
+  }, "Isी number se yeh key generate hui thी — dusra koi number kaam nahi karegа")), err && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#fff1f2",
       borderRadius: 8,
@@ -1615,20 +1722,20 @@ function LicenseSetup({
     }
   }, err), /*#__PURE__*/React.createElement("button", {
     onClick: verify,
-    disabled: checking || !key.trim(),
+    disabled: checking || !key.trim() || !phone.trim(),
     style: {
       width: "100%",
       padding: "14px",
       border: "none",
       borderRadius: 12,
-      background: key.trim() ? "#1e3a5f" : "#e2e8f0",
-      color: key.trim() ? "#fff" : "#94a3b8",
+      background: (key.trim() && phone.trim()) ? "#1e3a5f" : "#e2e8f0",
+      color: (key.trim() && phone.trim()) ? "#fff" : "#94a3b8",
       fontFamily: "'Josefin Sans',sans-serif",
       fontWeight: 700,
       fontSize: 15,
-      cursor: key.trim() ? "pointer" : "not-allowed"
+      cursor: (key.trim() && phone.trim() && !checking) ? "pointer" : "not-allowed"
     }
-  }, "\"✅ Activate & Start\""), /*#__PURE__*/React.createElement("div", {
+  }, checking ? "⏳ Verifying..." : "✅ Activate & Start"), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 16,
       textAlign: "center",
@@ -2909,6 +3016,12 @@ function DashboardView({
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "flex-end"
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
       fontSize: 10,
       color: "rgba(255,255,255,.85)",
       fontFamily: "'Josefin Sans',sans-serif",
@@ -2925,7 +3038,20 @@ function DashboardView({
       fontSize: 11,
       color: "var(--gold)"
     }
-  }, user.role))), !profile?.hotelBanner && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, user.role)), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModal({ type: "editProfile" }),
+    style: {
+      background: "rgba(255,255,255,.15)",
+      border: "1px solid rgba(255,255,255,.25)",
+      borderRadius: 8,
+      width: 32,
+      height: 32,
+      color: "#fff",
+      fontSize: 13,
+      cursor: "pointer",
+      flexShrink: 0
+    }
+  }, "✏️")))), !profile?.hotelBanner && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "rgba(255,255,255,.6)",
@@ -2934,6 +3060,13 @@ function DashboardView({
       letterSpacing: 1
     }
   }, "GOOD ", new Date().getHours() < 12 ? "MORNING" : new Date().getHours() < 17 ? "AFTERNOON" : "EVENING"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -2980,7 +3113,20 @@ function DashboardView({
     day: "numeric",
     month: "long",
     year: "numeric"
-  })))))), /*#__PURE__*/React.createElement("div", {
+  })))), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModal({ type: "editProfile" }),
+    style: {
+      background: "rgba(255,255,255,.1)",
+      border: "1px solid rgba(255,255,255,.2)",
+      borderRadius: 8,
+      width: 34,
+      height: 34,
+      color: "#fff",
+      fontSize: 14,
+      cursor: "pointer",
+      flexShrink: 0
+    }
+  }, "✏️")))), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "0 14px",
       display: "flex",
@@ -3656,6 +3802,7 @@ function CheckInView({
     roomId: checkInRoom?.id || empty[0]?.id || "",
     name: "",
     mobile: "",
+    docType: "Aadhaar Card",
     aadhaar: "",
     address: "",
     dob: "",
@@ -3677,12 +3824,27 @@ function CheckInView({
   const [done, setDone] = useState(false);
   const [signature, setSignature] = useState(null);
   const [photoF, setPhotoF] = useState(null);
+  // Raw (unmasked) front photo — used for OCR and QR scanning (both need
+  // to read the actual card, including a QR code some newer Aadhaar
+  // cards print on the front). Held only in a ref, never persisted —
+  // `photoF` state (which DOES get saved to the booking/localStorage/
+  // local-folder) always holds the masked version instead.
+  const rawFrontRef = useRef(null);
+  // Same idea for the back photo — Aadhaar's number is commonly printed
+  // on BOTH sides of the standard card, so back needs masking too.
+  const rawBackRef = useRef(null);
   const [photoB, setPhotoB] = useState(null);
   const [scanning, setScanning] = useState(null);
   // Family members / other occupants — travelling together under ONE booking,
   // so hotel doesn't need to create separate transactions per person while
   // still keeping every occupant's ID on record for police compliance.
   const [family, setFamily] = useState([]);
+  // Raw (unmasked) photo copies for family members, keyed by
+  // "{memberId}_front" / "{memberId}_back" — held ONLY in a ref (never
+  // persisted to state/localStorage/local folder) so OCR/QR can read the
+  // actual card while the PERSISTED photoFront/photoBack in `family`
+  // state always holds the masked version.
+  const familyRawFrontRef = useRef({});
   const [famScanning, setFamScanning] = useState(null);
 
   const addFamilyMember = () => {
@@ -3702,12 +3864,14 @@ function CheckInView({
     const reader = new FileReader();
     reader.onload = async () => {
       const compressed = await compressImg(reader.result).catch(() => reader.result);
-      updateFamilyMember(id, side === "front" ? "photoFront" : "photoBack", compressed);
+      familyRawFrontRef.current[id + "_" + side] = compressed; // raw copy for OCR/QR only, never persisted
+      const masked = await maskAadhaarNumberInImage(compressed);
+      updateFamilyMember(id, side === "front" ? "photoFront" : "photoBack", masked || compressed);
     };
     reader.readAsDataURL(file);
   };
   const scanFamilyId = async (member, side) => {
-    const photo = side === "front" ? member.photoFront : member.photoBack;
+    const photo = familyRawFrontRef.current[member._id + "_" + side] || (side === "front" ? member.photoFront : member.photoBack);
     if (!photo) { alert("Pehle " + (side === "front" ? "front" : "back") + " photo lo"); return; }
     const license = localStorage.getItem("ab_license_key");
     if (!license) { alert("License not found. Reload app."); return; }
@@ -3836,11 +4000,22 @@ function CheckInView({
     // would eat browser storage 5-10x faster than uploaded photos.
     const dataUrl = await compressImg(rawDataUrl).catch(() => rawDataUrl);
     closeCam();
+    const isAadhaar = form.docType === "Aadhaar Card";
     if (camSide === "f") {
-      setPhotoF(dataUrl);
+      // Store the MASKED version (what persists to state/localStorage/
+      // local-folder) — ONLY when the document is an Aadhaar Card, since
+      // that's the specific document UIDAI's storage restriction covers.
+      // Other ID types are stored as-is, unmasked.
+      rawFrontRef.current = dataUrl;
+      const masked = isAadhaar ? await maskAadhaarNumberInImage(dataUrl) : dataUrl;
+      setPhotoF(masked || dataUrl);
       setTimeout(() => scanAadhaar("f", dataUrl), 200);
     } else if (camSide === "b") {
-      setPhotoB(dataUrl);
+      // Back also gets masked for Aadhaar — the standard card layout
+      // prints the 12-digit number on both sides, not just the front.
+      rawBackRef.current = dataUrl;
+      const maskedBack = isAadhaar ? await maskAadhaarNumberInImage(dataUrl) : dataUrl;
+      setPhotoB(maskedBack || dataUrl);
       setTimeout(() => scanAadhaar("b", dataUrl), 200);
     } else if (camSide.startsWith("fam:")) {
       // Family member camera capture — same front/back flow as primary
@@ -3850,7 +4025,9 @@ function CheckInView({
       const famId = parts[1];
       const side = parts[2] || "front";
       const field = side === "front" ? "photoFront" : "photoBack";
-      updateFamilyMember(famId, field, dataUrl);
+      familyRawFrontRef.current[famId + "_" + side] = dataUrl;
+      const maskedFam = isAadhaar ? await maskAadhaarNumberInImage(dataUrl) : dataUrl;
+      updateFamilyMember(famId, field, maskedFam || dataUrl);
       setTimeout(() => {
         const m = family.find(x => x._id === famId);
         if (m) scanFamilyId({ ...m, [field]: dataUrl }, side);
@@ -3868,12 +4045,14 @@ function CheckInView({
   const [rawOcr, setRawOcr] = useState(""); // Raw OCR text for debug
   const [qrScanning, setQrScanning] = useState(false);
   const tryQRScan = async () => {
-    const photo = photoF || photoB;
+    const rawFront = rawFrontRef.current || photoF;
+    const rawBack = rawBackRef.current || photoB;
+    const photo = rawFront || rawBack;
     if (!photo) { alert("Pehle photo lo (front ya back)"); return; }
     setQrScanning(true);
     setScanMsg("⏳ QR code dhundh rahe hain...");
     try {
-      const qrText = await decodeQRFromImage(photoF || photoB) || (photoF && photoB ? await decodeQRFromImage(photoB) : null);
+      const qrText = await decodeQRFromImage(rawFront || rawBack) || (rawFront && rawBack ? await decodeQRFromImage(rawBack) : null);
       if (!qrText) {
         setScanMsg("⚠️ QR code nahi mila is photo mein. \"🔍 Auto-fill from photo\" (AI scan) try karo.");
         return;
@@ -3899,9 +4078,16 @@ function CheckInView({
     [k]: v
   }));
   const fldAadhaar = v => {
-    const digits = v.replace(/\D/g, "").slice(0, 12);
-    const f = digits.match(/.{1,4}/g)?.join(" ") || "";
-    fld("aadhaar", f);
+    if (form.docType === "Aadhaar Card") {
+      const digits = v.replace(/\D/g, "").slice(0, 12);
+      const f = digits.match(/.{1,4}/g)?.join(" ") || "";
+      fld("aadhaar", f);
+    } else {
+      // Other ID types (Passport, Driving Licence, Voter ID, PAN) are
+      // alphanumeric, not purely numeric — accept as typed, just cap
+      // length and strip stray whitespace-only input.
+      fld("aadhaar", v.toUpperCase().slice(0, 20));
+    }
   };
   const onPhoto = (e, side) => {
     const file = e.target.files && e.target.files[0];
@@ -3955,13 +4141,14 @@ function CheckInView({
       return;
     }
     setScanning(side);
-    setScanMsg("⏳ Scanning Aadhaar...");
+    setScanMsg(`⏳ Scanning ${form.docType}...`);
     try {
-      const prompt = side === "f" ? `This is the FRONT of an Indian Aadhaar card. Extract all details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
-{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","aadhaar":"XXXX XXXX XXXX","fatherName":"father or husband name","address":"address if visible on front"}` : `This is the BACK of an Indian Aadhaar card. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+      const docLabel = form.docType === "Aadhaar Card" ? "Indian Aadhaar card" : `Indian ${form.docType}`;
+      const prompt = side === "f" ? `This is the FRONT of an ${docLabel}. Extract all details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","aadhaar":"ID number exactly as printed","fatherName":"father or husband name if visible","address":"address if visible on front"}` : `This is the BACK of an ${docLabel}. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
 {"address":"complete address","pin":"6 digit pincode","district":"","state":""}`;
 
-      AuditLog.add("AADHAAR_SCAN", "OCR initiated");
+      AuditLog.add("ID_SCAN", form.docType + " OCR initiated");
       setScanMsg("⏳ Connecting to scan server...");
       const result = await performOCRScan(photo, prompt, license);
       if (result.rawText) setRawOcr(result.rawText);
@@ -4222,20 +4409,41 @@ function CheckInView({
       display: "flex",
       justifyContent: "space-between",
       alignItems: "center",
-      marginBottom: 14
+      marginBottom: 10
     }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
     style: {
       fontWeight: 700,
       fontSize: 15,
       color: "var(--navy)"
     }
-  }, "🪪 Aadhaar Details"), /*#__PURE__*/React.createElement("div", {
+  }, "🪪 ID Details"), /*#__PURE__*/React.createElement("select", {
+    value: form.docType,
+    onChange: e => fld("docType", e.target.value),
+    style: {
+      padding: "6px 10px",
+      borderRadius: 8,
+      border: "1.5px solid var(--border)",
+      fontSize: 12,
+      fontWeight: 600,
+      color: "var(--navy)",
+      background: "#fff"
+    }
+  }, DOCUMENT_TYPES.map(dt => /*#__PURE__*/React.createElement("option", { key: dt, value: dt }, dt)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "var(--muted)"
     }
-  }, "Upload photo + auto-scan OR fill manually below"), (photoF || photoB) && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
+  }, form.docType === "Aadhaar Card" ? "📱 QR scan recommended (fastest, no number stored) — ya photo lekе auto-scan karo" : "Photo lekе auto-scan karo, ya manually neeche fill karo"), form.docType === "Aadhaar Card" && /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 10, color: "#16a34a", marginTop: 2 }
+  }, "🔒 Aadhaar number photo mein automatically mask ho jaata hai"), form.docType === "Aadhaar Card" && (photoF || photoB) && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
     onClick: tryQRScan,
     disabled: qrScanning,
     style: {
@@ -4249,7 +4457,7 @@ function CheckInView({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, qrScanning ? "⏳ Scanning QR..." : "📱 Try QR Scan (more accurate)")), scanMsg && /*#__PURE__*/React.createElement("div", {
+  }, qrScanning ? "⏳ Scanning QR..." : "📱 QR Scan (recommended)")), scanMsg && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       fontWeight: 700,
@@ -4675,7 +4883,7 @@ function CheckInView({
   }, "FULL NAME *"), /*#__PURE__*/React.createElement("input", {
     value: form.name,
     onChange: e => fld("name", e.target.value),
-    placeholder: "As on Aadhaar card"
+    placeholder: `As on ${form.docType}`
   })), /*#__PURE__*/React.createElement("div", {
     style: {
       gridColumn: "span 2"
@@ -4688,11 +4896,11 @@ function CheckInView({
       display: "block",
       marginBottom: 4
     }
-  }, "AADHAAR NUMBER *"), /*#__PURE__*/React.createElement("input", {
+  }, (form.docType === "Aadhaar Card" ? "AADHAAR NUMBER" : form.docType.toUpperCase() + " NUMBER") + " *"), /*#__PURE__*/React.createElement("input", {
     value: form.aadhaar,
     onChange: e => fldAadhaar(e.target.value),
-    placeholder: "XXXX XXXX XXXX",
-    inputMode: "numeric"
+    placeholder: form.docType === "Aadhaar Card" ? "XXXX XXXX XXXX" : "ID number",
+    inputMode: form.docType === "Aadhaar Card" ? "numeric" : "text"
   })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     style: {
       fontSize: 11,
@@ -6760,6 +6968,25 @@ function StorageSettingsView({
   const [status, setStatus] = useState("");
   const [exportStatus, setExportStatus] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // Hidden support-diagnostics unlock — tapping the "Storage Settings"
+  // title 7 times within 3 seconds reveals the Firebase/troubleshooting
+  // panel. Customers never see this in normal use; it stays available for
+  // us to walk them through if a sync issue ever needs debugging again.
+  const [secretTaps, setSecretTaps] = useState(0);
+  const [secretUnlocked, setSecretUnlocked] = useState(false);
+  const secretTapTimer = useRef(null);
+  const handleSecretTap = () => {
+    if (secretTapTimer.current) clearTimeout(secretTapTimer.current);
+    setSecretTaps(prev => {
+      const next = prev + 1;
+      if (next >= 7) {
+        setSecretUnlocked(true);
+        return 0;
+      }
+      secretTapTimer.current = setTimeout(() => setSecretTaps(0), 3000);
+      return next;
+    });
+  };
   const [accessGranted, setAccessGranted] = useState(!!LocalFS._dirHandle);
   const isSupported = LocalFS.isSupported();
   useEffect(() => {
@@ -6859,6 +7086,7 @@ function StorageSettingsView({
       marginBottom: 16
     }
   }, /*#__PURE__*/React.createElement("div", {
+    onClick: handleSecretTap,
     style: {
       fontFamily: "'Josefin Sans',sans-serif",
       fontWeight: 700,
@@ -6871,37 +7099,7 @@ function StorageSettingsView({
       color: "var(--muted)",
       marginTop: 4
     }
-  }, "Dual storage — Cloud + Local computer")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: "#fff",
-      border: "1px solid var(--border)",
-      borderRadius: 12,
-      padding: 14,
-      marginBottom: 14,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 10
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: { fontWeight: 700, color: "var(--navy)", fontSize: 14 }
-  }, "👤 Profile Settings"), /*#__PURE__*/React.createElement("div", {
-    style: { fontSize: 12, color: "var(--muted)", marginTop: 2 }
-  }, "Hotel name, tagline, GSTIN, room pricing style")), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setModal({ type: "editProfile" }),
-    style: {
-      padding: "8px 14px",
-      background: "var(--navy)",
-      color: "#fff",
-      border: "none",
-      borderRadius: 8,
-      fontSize: 12,
-      fontWeight: 700,
-      fontFamily: "'Josefin Sans',sans-serif",
-      cursor: "pointer",
-      flexShrink: 0
-    }
-  }, "✏️ Edit")), /*#__PURE__*/React.createElement("div", {
+  }, "Dual storage — Cloud + Local computer")), secretUnlocked && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#f0fdf4",
       border: "1px solid #bbf7d0",
@@ -7131,7 +7329,7 @@ function StorageSettingsView({
       fontSize: 11,
       color: "var(--muted)"
     }
-  }, "💡 Vault tab → Guest select karo → Download Record button")), /*#__PURE__*/React.createElement("div", {
+  }, "💡 Vault tab → Guest select karo → Download Record button")), secretUnlocked && /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 12 }
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowAdvanced(v => !v),
@@ -7667,6 +7865,39 @@ function App() {
     };
   }, [user]);
   const [licenseSet, setLicenseSet] = useState(() => !!localStorage.getItem("ab_license_key"));
+  // Silent re-verification on every boot — WITHOUT this, a phone that was
+  // once verified stays "trusted" on this device FOREVER, even after the
+  // Owner asks admin to remove that phone from the license (e.g. a stolen
+  // phone, or a Manager who left). This check runs quietly in the
+  // background using the ALREADY-STORED phone (never re-prompts the
+  // user) — if it still matches the admin's current records, nothing
+  // visible happens; if the phone was removed/replaced, this device gets
+  // logged out and sent back to the license screen on its next open. A
+  // network failure fails OPEN (stays logged in) — this is about
+  // deliberately revoked access, not punishing someone for being offline.
+  useEffect(() => {
+    if (!licenseSet) return;
+    const key = localStorage.getItem("ab_license_key");
+    const phone = localStorage.getItem("ab_verified_phone");
+    if (!key || !phone) return; // nothing to re-check (e.g. pre-dates this feature)
+    fetch("/api/verify-access", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ licenseKey: key, phone })
+    }).then(res => res.json().then(data => ({ status: res.status, data })))
+      .then(({ status, data }) => {
+        // Only actively-rejected (403) means "this phone is no longer on
+        // the list" — genuinely revoked. Any other failure (network,
+        // 404, 500, 429) fails open so a bad connection or a transient
+        // server hiccup never locks someone out of their own hotel.
+        if (status === 403 && data && data.ok === false) {
+          localStorage.removeItem("ab_license_key");
+          localStorage.removeItem("ab_verified_phone");
+          setLicenseSet(false);
+        }
+      })
+      .catch(() => {}); // network failure — fail open, stay logged in
+  }, [licenseSet]);
   const [view, setView] = useState("dash");
   // Defense-in-depth: bounce anyone (including Owner) away from a view
   // their PLAN doesn't include (e.g. "roles" or "history" disabled by

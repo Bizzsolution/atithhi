@@ -48,6 +48,11 @@
   status = 200
 
 [[redirects]]
+  from = "/api/verify-access"
+  to = "/.netlify/functions/verify-access"
+  status = 200
+
+[[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
