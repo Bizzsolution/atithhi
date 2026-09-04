@@ -76,7 +76,10 @@
   <!-- Firebase SDK -->
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-  <script src="https://unpkg.com/jsqr@1.4.0/dist/jsQR.js"></script>
+  <!-- Bundled locally, not from a CDN: this app runs in hotels with patchy
+       connectivity and as an installed PWA, where a CDN fetch can silently
+       fail and leave QR scanning permanently dead with no visible error. -->
+  <script src="/jsQR.js"></script>
   <script>
     // Crash-proof Firebase init — app works even if SDK fails to load
     window._db=null;
@@ -1565,8 +1568,117 @@ const LS = {
   }
 };
 
+// ── INVOICE PDF ────────────────────────────────────────────────
+// A small, dependency-free PDF writer. WhatsApp sharing previously sent
+// plain text; a real PDF is what guests and auditors actually want, and
+// pulling in a PDF library would add a CDN dependency this app can't rely
+// on. Uses the built-in Helvetica font, so nothing has to be embedded.
+// Note: WinAnsi has no rupee glyph, so amounts are written as "Rs."
+function buildSimplePDF(lines) {
+  const esc = t => String(t).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+  const toWinAnsi = t => String(t)
+    .replace(/[₹]/g, "Rs.")
+    .replace(/[^\x20-\x7E]/g, "");
+  let y = 800;
+  let content = "";
+  lines.forEach(ln => {
+    const text = toWinAnsi(ln.text || "");
+    const size = ln.size || 10;
+    const font = ln.bold ? "/F2" : "/F1";
+    if (ln.gap) { y -= ln.gap; }
+    if (text) {
+      const x = ln.x || 50;
+      if (ln.align === "right") {
+        // Helvetica average width ≈ 0.5em; good enough for column alignment
+        const w = text.length * size * 0.5;
+        content += `BT ${font} ${size} Tf ${Math.round(545 - w)} ${y} Td (${esc(text)}) Tj ET\n`;
+      } else {
+        content += `BT ${font} ${size} Tf ${x} ${y} Td (${esc(text)}) Tj ET\n`;
+      }
+    }
+    if (ln.rule) {
+      content += `0.8 w 50 ${y - 4} m 545 ${y - 4} l S\n`;
+    }
+    y -= (ln.lh || (ln.size ? ln.size + 5 : 15));
+    if (y < 50) y = 50;
+  });
+  const objs = [];
+  objs[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+  objs[2] = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+  objs[3] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>";
+  objs[4] = `<< /Length ${content.length} >>\nstream\n${content}endstream`;
+  objs[5] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+  objs[6] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>";
+  let pdf = "%PDF-1.4\n";
+  const offsets = [];
+  for (let i = 1; i < objs.length; i++) {
+    offsets[i] = pdf.length;
+    pdf += `${i} 0 obj\n${objs[i]}\nendobj\n`;
+  }
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objs.length}\n0000000000 65535 f \n`;
+  for (let i = 1; i < objs.length; i++) {
+    pdf += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
+  }
+  pdf += `trailer\n<< /Size ${objs.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  const bytes = new Uint8Array(pdf.length);
+  for (let i = 0; i < pdf.length; i++) bytes[i] = pdf.charCodeAt(i) & 0xFF;
+  return new Blob([bytes], { type: "application/pdf" });
+}
+
+function buildInvoicePDFBlob(b, roomObj) {
+  const n = nts(b.checkIn, b.checkOut);
+  const G = calcBillGST(b, roomObj, CURRENT_ROOMS);
+  const RH = {
+    name: CURRENT_PROFILE.hotelName || HOTEL.name,
+    addr: CURRENT_PROFILE.hotelAddr || HOTEL.addr,
+    phone: CURRENT_PROFILE.hotelPhone || HOTEL.phone,
+    gstin: CURRENT_PROFILE.hotelGstin || ""
+  };
+  const L = [];
+  L.push({ text: RH.name, size: 18, bold: true });
+  (RH.addr || "").split("\n").forEach(a => L.push({ text: a, size: 9 }));
+  L.push({ text: "Phone: " + RH.phone + (RH.gstin ? "   GSTIN: " + RH.gstin : ""), size: 9 });
+  L.push({ text: "", rule: true, gap: 6 });
+  L.push({ text: "TAX INVOICE", size: 13, bold: true, gap: 4 });
+  L.push({ text: "Invoice No: " + b.id, size: 10 });
+  L.push({ text: "Guest: " + (b.name || ""), size: 10 });
+  L.push({ text: "Mobile: " + (b.mobile || ""), size: 10 });
+  L.push({ text: "Room: " + b.roomId + (roomObj && roomObj.type ? " (" + roomObj.type + ")" : ""), size: 10 });
+  L.push({ text: "Check-In: " + b.checkIn + " " + (b.checkInTime || ""), size: 10 });
+  L.push({ text: "Check-Out: " + (b.checkOutActual || b.checkOut) + " " +
+    (b.checkOutActualTime || b.checkOutTime || "") + "   Nights: " + n, size: 10 });
+  L.push({ text: "", rule: true, gap: 6 });
+  L.push({ text: "Description", size: 10, bold: true });
+  L.push({ text: "Amount (Rs.)", size: 10, bold: true, align: "right", lh: 4 });
+  L.push({ text: "", rule: true, gap: 8 });
+  L.push({ text: "Room charges (" + n + " night" + (n > 1 ? "s" : "") + ")", size: 10, lh: 0 });
+  L.push({ text: String(b.roomTotal || 0), size: 10, align: "right" });
+  (b.charges || []).forEach(c => {
+    L.push({ text: c.name + "  x" + c.qty, size: 10, lh: 0 });
+    L.push({ text: String((c.price || 0) * (c.qty || 0)), size: 10, align: "right" });
+  });
+  L.push({ text: "", rule: true, gap: 4 });
+  L.push({ text: "Subtotal", size: 10, lh: 0 });
+  L.push({ text: String(G.subtotal), size: 10, align: "right" });
+  L.push({ text: "GST", size: 10, lh: 0 });
+  L.push({ text: String(G.totalGST), size: 10, align: "right" });
+  L.push({ text: "GRAND TOTAL", size: 12, bold: true, lh: 0 });
+  L.push({ text: String(G.grandTotal), size: 12, bold: true, align: "right" });
+  L.push({ text: "", rule: true, gap: 8 });
+  L.push({ text: "Thank you for staying with us!", size: 10, bold: true, gap: 6 });
+  L.push({ text: (CURRENT_PROFILE.hotelTagline || HOTEL.tagline || ""), size: 9 });
+  return buildSimplePDF(L);
+}
+
+// Rendering the invoice used to happen via window.open(), which on a phone
+// replaced the app with a blank-URL popup that has no back button — users
+// had to exit the app entirely. App registers a handler here so the
+// invoice opens as an in-app overlay instead.
+let OPEN_INVOICE_HANDLER = null;
+
 // ── INVOICE PRINTER ────────────────────────────────────────────
-const openInvoice = (b, roomObj) => {
+const buildInvoiceHTML = (b, roomObj) => {
   const n = nts(b.checkIn, b.checkOut);
   const G = calcBillGST(b, roomObj, CURRENT_ROOMS);
   const cSum = G.foodAmt + G.otherAmt;
@@ -1666,11 +1778,15 @@ function shareInvoice(){
 }
 <\/script>
 </body></html>`;
+  return html;
+};
+
+// Public entry point used across the app. Falls back to a popup only if no
+// in-app handler has been registered yet.
+const openInvoice = (b, roomObj) => {
+  if (OPEN_INVOICE_HANDLER) { OPEN_INVOICE_HANDLER(b, roomObj); return; }
   const w = window.open("", "_blank", "width=780,height=950");
-  if (w) {
-    w.document.write(html);
-    w.document.close();
-  }
+  if (w) { w.document.write(buildInvoiceHTML(b, roomObj)); w.document.close(); }
 };
 
 // ── GLOBAL CSS ─────────────────────────────────────────────────
@@ -3691,6 +3807,7 @@ function FamilyMembersSection({
   onFamilyPhoto,
   scanFamilyId,
   tryFamilyQRScan,
+  openQrLive,
   openCam
 }) {
   const renderSide = (m, side) => {
@@ -3853,7 +3970,14 @@ function FamilyMembersSection({
       gap: 8,
       marginBottom: 8
     }
-  }, renderSide(m, "front"), renderSide(m, "back")), (m._previewFront || m._previewBack || m.photoFront || m.photoBack) && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
+  }, renderSide(m, "front"), renderSide(m, "back")), hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
+    onClick: () => openQrLive(m._id),
+    style: {
+      marginTop: 6, marginRight: 6, padding: "6px 12px", border: "none",
+      borderRadius: 8, background: "#7c3aed", color: "#fff",
+      fontSize: 11, fontWeight: 700, cursor: "pointer"
+    }
+  }, "📷 Live QR"), (m._previewFront || m._previewBack || m.photoFront || m.photoBack) && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
     onClick: () => tryFamilyQRScan(m),
     disabled: famScanning === m._id + "_qr",
     style: {
@@ -4126,6 +4250,117 @@ function CheckInView({
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   let streamRef = useRef(null);
+  // ── LIVE QR SCANNER ────────────────────────────────────────────
+  // Decoding a QR out of a still photo of an Aadhaar card almost never
+  // works: the code is dense, it occupies a small part of the frame, and
+  // the card is usually held at an angle. (Verified against real card
+  // photos — both jsQR and ZXing fail on them.) A live scanner succeeds
+  // because it gets many autofocused frames per second and the user can
+  // move closer until it locks. Uses the platform BarcodeDetector when
+  // present (Chrome on Android — the main target) and falls back to jsQR.
+  const [qrLiveOpen, setQrLiveOpen] = useState(false);
+  const [qrLiveMsg, setQrLiveMsg] = useState("");
+  const [qrLiveTarget, setQrLiveTarget] = useState(null); // null = primary guest, else family member id
+  const qrVideoRef = useRef(null);
+  const qrStreamRef = useRef(null);
+  const qrLoopRef = useRef(null);
+
+  const stopQrLive = () => {
+    if (qrLoopRef.current) { cancelAnimationFrame(qrLoopRef.current); qrLoopRef.current = null; }
+    if (qrStreamRef.current) { qrStreamRef.current.getTracks().forEach(t => t.stop()); qrStreamRef.current = null; }
+    setQrLiveOpen(false);
+  };
+
+  const applyQrResult = (result, memberId) => {
+    if (memberId) {
+      setFamily(f => f.map(mm => mm._id === memberId ? {
+        ...mm,
+        name: result.name || mm.name,
+        dob: result.dob || mm.dob,
+        gender: result.gender || mm.gender,
+        idNumber: result.aadhaar || mm.idNumber,
+        address: result.address || mm.address
+      } : mm));
+    } else {
+      if (result.name) fld("name", result.name);
+      if (result.dob) fld("dob", result.dob);
+      if (result.gender) fld("gender", result.gender);
+      if (result.aadhaar) fld("aadhaar", result.aadhaar);
+      if (result.address) fld("address", result.address);
+    }
+  };
+
+  const openQrLive = async (memberId) => {
+    setQrLiveTarget(memberId || null);
+    setQrLiveMsg("📷 Card ka QR camera ke saamne lao — paas laake steady rakho");
+    setQrLiveOpen(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      });
+      qrStreamRef.current = stream;
+      const v = qrVideoRef.current;
+      if (!v) { stream.getTracks().forEach(t => t.stop()); return; }
+      v.srcObject = stream;
+      v.setAttribute("playsinline", "true");
+      await v.play().catch(() => {});
+
+      let detector = null;
+      try {
+        if (typeof window.BarcodeDetector !== "undefined") {
+          const fmts = await window.BarcodeDetector.getSupportedFormats().catch(() => []);
+          if (fmts.includes("qr_code")) detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+        }
+      } catch (e) { detector = null; }
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      let busy = false;
+
+      const tick = async () => {
+        if (!qrStreamRef.current) return;
+        if (!busy && v.readyState >= 2 && v.videoWidth) {
+          busy = true;
+          let text = null;
+          try {
+            if (detector) {
+              const codes = await detector.detect(v);
+              if (codes && codes.length) text = codes[0].rawValue;
+            }
+            if (!text && window.jsQR) {
+              canvas.width = v.videoWidth;
+              canvas.height = v.videoHeight;
+              ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+              const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              const c = window.jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
+              if (c && c.data) text = c.data;
+            }
+          } catch (e) { /* keep scanning */ }
+          busy = false;
+
+          if (text) {
+            setQrLiveMsg("⏳ QR mil gaya — padh rahe hain...");
+            let result = parseAadhaarQRText(text);
+            if (result.format === "maybe_secure") result = await parseAadhaarSecureQR(result.raw);
+            if (result.format === "unsupported") {
+              setQrLiveMsg("⚠️ Yeh QR padha nahi ja saka. Photo se AI scan try karo.");
+            } else {
+              applyQrResult(result, qrLiveTarget);
+              stopQrLive();
+              setScanMsg("✅ QR se details bhar di gayi — verify karke aage badho.");
+              return;
+            }
+          }
+        }
+        qrLoopRef.current = requestAnimationFrame(tick);
+      };
+      qrLoopRef.current = requestAnimationFrame(tick);
+    } catch (e) {
+      setQrLiveMsg("❌ Camera nahi khul paaya: " + e.message);
+    }
+  };
+  useEffect(() => () => stopQrLive(), []);
+
   const openCam = async side => {
     setCamSide(side);
     setCamOpen(true);
@@ -4677,9 +4912,23 @@ function CheckInView({
       fontSize: 11,
       color: "var(--muted)"
     }
-  }, form.docType === "Aadhaar Card" ? "📱 QR scan recommended (fastest, no number stored) — ya photo lekе auto-scan karo" : "Photo lekе auto-scan karo, ya manually neeche fill karo"), form.docType === "Aadhaar Card" && /*#__PURE__*/React.createElement("div", {
+  }, form.docType === "Aadhaar Card" ? "📷 Live QR Scan sabse tez aur bharosemand hai — card ka QR camera ke saamne lao. Photo se QR aksar nahi padha jaata." : "Photo lekе auto-scan karo, ya manually neeche fill karo"), form.docType === "Aadhaar Card" && /*#__PURE__*/React.createElement("div", {
     style: { fontSize: 10, color: "#16a34a", marginTop: 2 }
-  }, "🔒 Aadhaar number photo mein automatically mask ho jaata hai"), form.docType === "Aadhaar Card" && (photoFPreview || photoBPreview) && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
+  }, "🔒 Aadhaar number photo mein automatically mask ho jaata hai"), form.docType === "Aadhaar Card" && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
+    onClick: () => openQrLive(null),
+    style: {
+      marginTop: 6,
+      marginRight: 6,
+      padding: "8px 14px",
+      border: "none",
+      borderRadius: 8,
+      background: "#7c3aed",
+      color: "#fff",
+      fontSize: 12,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "📷 Live QR Scan"), form.docType === "Aadhaar Card" && (photoFPreview || photoBPreview) && hasFeature("qr") && /*#__PURE__*/React.createElement("button", {
     onClick: tryQRScan,
     disabled: qrScanning,
     style: {
@@ -4916,7 +5165,45 @@ function CheckInView({
       cursor: "pointer",
       fontWeight: 700
     }
-  }, "📸 Use Camera")))), camOpen && /*#__PURE__*/React.createElement("div", {
+  }, "📸 Use Camera")))), qrLiveOpen && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed", inset: 0, background: "#000", zIndex: 3000,
+      display: "flex", flexDirection: "column"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "12px 16px", display: "flex", alignItems: "center",
+      justifyContent: "space-between", background: "#111", color: "#fff"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, fontSize: 14 }
+  }, "📷 Live QR Scan"), /*#__PURE__*/React.createElement("button", {
+    onClick: stopQrLive,
+    style: {
+      background: "rgba(255,255,255,.15)", border: "none", borderRadius: 8,
+      color: "#fff", padding: "8px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer"
+    }
+  }, "✕ Band karo")), /*#__PURE__*/React.createElement("div", {
+    style: { flex: 1, position: "relative", overflow: "hidden" }
+  }, /*#__PURE__*/React.createElement("video", {
+    ref: qrVideoRef,
+    playsInline: true,
+    muted: true,
+    style: { width: "100%", height: "100%", objectFit: "cover" }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute", top: "50%", left: "50%",
+      transform: "translate(-50%,-50%)",
+      width: "68%", aspectRatio: "1",
+      border: "3px solid rgba(255,255,255,.85)", borderRadius: 16,
+      boxShadow: "0 0 0 9999px rgba(0,0,0,.45)"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "14px 18px 22px", background: "#111", color: "#fff",
+      fontSize: 13, textAlign: "center", lineHeight: 1.6
+    }
+  }, qrLiveMsg)), camOpen && /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed",
       inset: 0,
@@ -5341,6 +5628,7 @@ function CheckInView({
     onFamilyPhoto: onFamilyPhoto,
     scanFamilyId: scanFamilyId,
     tryFamilyQRScan: tryFamilyQRScan,
+    openQrLive: openQrLive,
     openCam: openCam
   }), /*#__PURE__*/React.createElement(SignaturePad, {
     onSign: setSignature
@@ -7340,6 +7628,106 @@ function StorageSettingsView({
     setAccessGranted(false);
     setStatus("Local storage disabled");
   };
+  // CSV escaping: Excel needs quotes doubled and any field containing a
+  // comma/quote/newline wrapped. Leading "=+-@" are prefixed with a quote
+  // so a guest name like "=cmd" can't become a spreadsheet formula.
+  const csvCell = v => {
+    let t = v === null || v === undefined ? "" : String(v);
+    if (/^[=+\-@]/.test(t)) t = "'" + t;
+    return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+  };
+  const csvDownload = (rows, filename) => {
+    // BOM so Excel opens UTF-8 (Hindi names, ₹) correctly
+    const csv = "\uFEFF" + rows.map(r => r.map(csvCell).join(",")).join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const fetchBookings = async () => {
+    if (!window._db) throw new Error("Firebase not connected — try again when online.");
+    const hid = WS._hid();
+    const snap = await window._db.collection("hotels").doc(hid)
+      .collection("data").doc("bookings").get({ source: "server" });
+    return snap.exists ? (snap.data().value || []) : [];
+  };
+
+  // Guest register (Form B style) — every guest, with arrival AND departure
+  // times, which the JSON backup was omitting.
+  const exportGuestRegisterCSV = async () => {
+    setExportStatus("⏳ Guest register tayaar kar rahe hain...");
+    try {
+      const bookings = await fetchBookings();
+      const head = ["S.No", "Booking ID", "Room", "Guest Name", "Father/Husband Name",
+        "Gender", "DOB", "Mobile", "ID Type", "ID Number (masked)", "Address",
+        "Purpose", "Adults", "Children", "Check-In Date", "Check-In Time",
+        "Check-Out Date", "Check-Out Time", "Actual Check-Out Date",
+        "Actual Check-Out Time", "Status", "Nationality", "Amount (Rs)"];
+      const rows = [head];
+      bookings.forEach((b, i) => {
+        rows.push([i + 1, b.id, b.roomId, b.name, b.fatherName, b.gender, b.dob,
+          b.mobile, b.docType || "Aadhaar Card",
+          // Only Aadhaar is masked — UIDAI's restriction is Aadhaar-specific,
+          // and a masked passport/DL number is useless on a police register.
+          (b.docType && b.docType !== "Aadhaar Card") ? (b.aadhaar || "") : maskAadhaar(b.aadhaar),
+          b.address,
+          b.purpose, b.adults, b.children,
+          b.checkIn, b.checkInTime || "", b.checkOut, b.checkOutTime || "",
+          b.checkOutActual || "", b.checkOutActualTime || (b.status === "checkedout" ? b.checkOutTime || "" : ""),
+          b.status, b.isForeigner ? (b.nationality || "Foreign") : "Indian",
+          b.grandTotal || b.roomTotal || ""]);
+        (b.family || []).forEach((m, k) => {
+          rows.push([i + 1 + "." + (k + 1), b.id, b.roomId, m.name, "", m.gender, m.dob,
+            "", "", maskAadhaar(m.idNumber), m.address, "Accompanying (" + (m.relation || "") + ")",
+            "", "", b.checkIn, b.checkInTime || "", b.checkOut, b.checkOutTime || "",
+            b.checkOutActual || "", b.checkOutActualTime || "", b.status, "", ""]);
+        });
+      });
+      csvDownload(rows, `guest-register-${WS._hid()}-${todayStr()}.csv`);
+      setExportStatus("✅ Guest register download ho gaya — " + bookings.length + " bookings. Excel mein khol sakte ho.");
+    } catch (e) {
+      setExportStatus("❌ Export failed: " + e.message);
+    }
+  };
+
+  // Form III (formerly Form C) — foreign guests only. This is the data the
+  // FRRO portal asks for; the portal itself has no API, so this sheet is
+  // meant to be filled in alongside it and kept as the hotel's own record.
+  const exportFormIIICSV = async () => {
+    setExportStatus("⏳ Form III data nikaal rahe hain...");
+    try {
+      const bookings = await fetchBookings();
+      const foreign = bookings.filter(b => b.isForeigner);
+      if (!foreign.length) {
+        setExportStatus("ℹ️ Koi foreign guest record nahi mila. Check-in ke waqt 'Foreign National Guest' tick karo.");
+        return;
+      }
+      const head = ["S.No", "Booking ID", "Room", "Full Name", "Nationality",
+        "Passport Number", "Visa Number", "Visa Type", "Date of Arrival in India",
+        "Date of Birth", "Gender", "Mobile", "Address (as given)",
+        "Check-In Date", "Check-In Time", "Check-Out Date", "Check-Out Time",
+        "Actual Check-Out Date", "Actual Check-Out Time", "Purpose of Visit",
+        "Form III Filed (Arrival)", "Form III Filed (Departure)"];
+      const rows = [head];
+      foreign.forEach((b, i) => {
+        rows.push([i + 1, b.id, b.roomId, b.name, b.nationality, b.aadhaar,
+          b.visaNumber, b.visaType, b.arrivalDateIndia, b.dob, b.gender, b.mobile,
+          b.address, b.checkIn, b.checkInTime || "", b.checkOut, b.checkOutTime || "",
+          b.checkOutActual || "", b.checkOutActualTime || "", b.purpose, "", ""]);
+      });
+      csvDownload(rows, `form-III-foreign-guests-${WS._hid()}-${todayStr()}.csv`);
+      setExportStatus("✅ Form III sheet download ho gayi — " + foreign.length + " foreign guest(s). indianfrro.gov.in par file karte waqt use karo.");
+    } catch (e) {
+      setExportStatus("❌ Export failed: " + e.message);
+    }
+  };
+
   const exportAllData = async () => {
     setExportStatus("⏳ Fetching latest data from cloud...");
     try {
@@ -7453,7 +7841,7 @@ function StorageSettingsView({
     style: {
       color: "#92400e"
     }
-  }, "⚠️ Photos — abhi sirf device mein (Firebase Storage coming soon)"))), /*#__PURE__*/React.createElement("div", {
+  }, "⚠️ Photos — abhi sirf device mein (Firebase Storage coming soon)"))), secretUnlocked && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "var(--card)",
       border: "1px solid var(--border)",
@@ -7721,9 +8109,33 @@ function StorageSettingsView({
       fontSize: 14,
       cursor: "pointer"
     }
-  }, "⬇️ Export All Data"), exportStatus && /*#__PURE__*/React.createElement("div", {
-    style: { marginTop: 8, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
-  }, exportStatus)), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
+  }, "⬇️ Export All Data (JSON backup)"), /*#__PURE__*/React.createElement("div", {
+    style: { height: 1, background: "var(--border)", margin: "14px 0" }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, fontSize: 13, color: "var(--navy)", marginBottom: 4 }
+  }, "📋 Compliance Registers (Excel)"), /*#__PURE__*/React.createElement("div", {
+    style: { color: "var(--muted)", fontSize: 12, marginBottom: 10 }
+  }, "Police inspection aur FRRO filing ke liye — Excel mein seedha khulti hain."), /*#__PURE__*/React.createElement("button", {
+    onClick: exportGuestRegisterCSV,
+    style: {
+      width: "100%", padding: "12px", border: "1.5px solid var(--navy)",
+      borderRadius: 12, background: "#fff", color: "var(--navy)",
+      fontFamily: "'Josefin Sans',sans-serif", fontWeight: 700, fontSize: 13,
+      cursor: "pointer", marginBottom: 8
+    }
+  }, "📗 Guest Register (Form B) — sab guests"), /*#__PURE__*/React.createElement("button", {
+    onClick: exportFormIIICSV,
+    style: {
+      width: "100%", padding: "12px", border: "1.5px solid #7c3aed",
+      borderRadius: 12, background: "#fff", color: "#7c3aed",
+      fontFamily: "'Josefin Sans',sans-serif", fontWeight: 700, fontSize: 13,
+      cursor: "pointer"
+    }
+  }, "🌍 Form III (Form C) — foreign guests"), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }
+  }, "Form III khud portal (indianfrro.gov.in) par file karna hota hai — koi bhi software apne aap submit nahi kar sakta. Yeh sheet wahan bharne aur apne record ke liye hai."), exportStatus && /*#__PURE__*/React.createElement("div", {
+    style: { marginTop: 10, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
+  }, exportStatus)), secretUnlocked && /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
 }
 
 /* ── BOTTOM NAV ───────────────────────────────────────────────── */
@@ -8188,33 +8600,57 @@ function App() {
     };
   }, [user]);
   const [licenseSet, setLicenseSet] = useState(() => !!localStorage.getItem("ab_license_key"));
-  // Local-folder permission is re-granted per browser session. Previously
-  // it was only requested when someone opened the Storage tab (or when a
-  // save silently failed), so staff got interrupted repeatedly during the
-  // day. Instead we piggy-back on the FIRST tap anywhere in the app — the
-  // browser needs a user gesture, and this way it happens once, early,
-  // instead of mid-check-in.
+  // In-app invoice viewer (replaces the old blank popup window)
+  const [invoiceView, setInvoiceView] = useState(null); // {b, room, html}
+  const invoiceFrameRef = useRef(null);
   useEffect(() => {
-    if (!localStorage.getItem("ab_local_folder")) return;
-    if (LocalFS._dirHandle) return;
-    let done = false;
-    const ask = async () => {
-      if (done) return;
-      done = true;
-      window.removeEventListener("pointerdown", ask, true);
+    OPEN_INVOICE_HANDLER = (b, room) => {
       try {
-        const already = await LocalFS.restoreHandle();
-        if (!already) await LocalFS.requestPermissionOnClick();
-      } catch (e) { console.warn("Folder permission:", e.message); }
+        setInvoiceView({ b, room, html: buildInvoiceHTML(b, room) });
+      } catch (e) {
+        alert("Invoice banane mein problem: " + e.message);
+      }
     };
-    // Try silently first — if the browser already remembers the grant,
-    // no prompt appears at all and we never touch the listener.
-    LocalFS.restoreHandle().then(ok => {
-      if (ok) { done = true; return; }
-      window.addEventListener("pointerdown", ask, true);
-    }).catch(() => window.addEventListener("pointerdown", ask, true));
-    return () => window.removeEventListener("pointerdown", ask, true);
+    return () => { OPEN_INVOICE_HANDLER = null; };
   }, []);
+  const printInvoice = () => {
+    const f = invoiceFrameRef.current;
+    if (!f || !f.contentWindow) return;
+    f.contentWindow.focus();
+    f.contentWindow.print();
+  };
+  const shareInvoicePDF = async () => {
+    if (!invoiceView) return;
+    try {
+      const blob = buildInvoicePDFBlob(invoiceView.b, invoiceView.room);
+      const file = new File([blob], `invoice-${invoiceView.b.id}.pdf`, { type: "application/pdf" });
+      // Share the actual PDF where supported (WhatsApp appears in the sheet
+      // and sends the file). Older browsers just get a download.
+      if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+        await navigator.share({ files: [file], title: "Invoice " + invoiceView.b.id });
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      alert("PDF download ho gaya — ab WhatsApp mein attach karke bhej sakte ho.");
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // user dismissed the sheet
+      alert("PDF share nahi ho paaya: " + e.message);
+    }
+  };
+  // NOTE: the local-folder feature deliberately does NOT prompt for
+  // permission on its own any more. The File System Access API re-asks for
+  // permission every browser session, which meant staff were interrupted
+  // repeatedly during the day. It is now an opt-in advanced feature; the
+  // permission is only requested from the Storage tab when someone
+  // explicitly uses it. Everyday backups use plain downloads instead,
+  // which need no permission at all.
   // Silent re-verification on every boot — WITHOUT this, a phone that was
   // once verified stays "trusted" on this device FOREVER, even after the
   // Owner asks admin to remove that phone from the license (e.g. a stolen
@@ -8768,7 +9204,11 @@ function App() {
       ...b,
       status: "checkedout",
       checkOutActual: todayStr(),
-      checkOutTime: now.toTimeString().slice(0, 5),
+      // Record the REAL departure time in its own field. Previously this
+      // overwrote checkOutTime (the time the guest was *booked* to leave),
+      // so the register lost the planned time and had no true departure
+      // timestamp — which is exactly what a police register needs.
+      checkOutActualTime: now.toTimeString().slice(0, 5),
       grandTotal: grand,
       subTotal: sub,
       gstAmt: gst,
@@ -9040,7 +9480,42 @@ function App() {
   }), view === "docs" && /*#__PURE__*/React.createElement(DocumentsView, {
     bookings: bookings,
     rooms: rooms
-  }), view === "storage" && /*#__PURE__*/React.createElement(StorageSettingsView, {
+  }), invoiceView && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed", inset: 0, zIndex: 4000, background: "#fff",
+      display: "flex", flexDirection: "column"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex", alignItems: "center", gap: 8,
+      padding: "10px 12px", background: "var(--navy)", flexShrink: 0
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setInvoiceView(null),
+    style: {
+      background: "rgba(255,255,255,.15)", border: "none", borderRadius: 8,
+      color: "#fff", padding: "9px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer"
+    }
+  }, "← Back"), /*#__PURE__*/React.createElement("div", {
+    style: { flex: 1, color: "#fff", fontWeight: 700, fontSize: 13 }
+  }, "Invoice"), /*#__PURE__*/React.createElement("button", {
+    onClick: printInvoice,
+    style: {
+      background: "rgba(255,255,255,.15)", border: "none", borderRadius: 8,
+      color: "#fff", padding: "9px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer"
+    }
+  }, "🖨️ Print"), /*#__PURE__*/React.createElement("button", {
+    onClick: shareInvoicePDF,
+    style: {
+      background: "var(--gold)", border: "none", borderRadius: 8,
+      color: "#fff", padding: "9px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer"
+    }
+  }, "📄 Share PDF")), /*#__PURE__*/React.createElement("iframe", {
+    ref: invoiceFrameRef,
+    srcDoc: invoiceView.html,
+    title: "Invoice",
+    style: { flex: 1, width: "100%", border: "none" }
+  })), view === "storage" && /*#__PURE__*/React.createElement(StorageSettingsView, {
     user: user,
     profile: profile,
     setModal: setModal
