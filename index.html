@@ -1197,7 +1197,7 @@ function maskAadhaarNumberInImage(dataUrl) {
           canvas.height = img.height;
           const ctx = canvas.getContext("2d");
           ctx.drawImage(img, 0, 0);
-          const bandHeight = img.height * 0.24;
+          const bandHeight = img.height * 0.34;
           ctx.fillStyle = "#000000";
           ctx.fillRect(0, img.height - bandHeight, img.width, bandHeight);
           ctx.fillStyle = "#ffffff";
@@ -1217,6 +1217,19 @@ function maskAadhaarNumberInImage(dataUrl) {
       resolve(null);
     }
   });
+}
+// Single place where the hotel's Aadhaar-photo policy is enforced.
+// Returns the image to STORE, or null meaning "store no image".
+//   - non-Aadhaar document  -> store as-is (no UIDAI restriction applies)
+//   - policy "none"         -> store nothing (default; fully compliant)
+//   - policy "masked"       -> store a best-effort masked image; if masking
+//                              fails we return null rather than falling back
+//                              to the unmasked original.
+async function applyAadhaarPhotoPolicy(dataUrl, isAadhaarDoc) {
+  if (!isAadhaarDoc) return dataUrl;
+  const policy = (CURRENT_PROFILE && CURRENT_PROFILE.aadhaarPhotoPolicy) || "none";
+  if (policy === "none") return null;
+  return await maskAadhaarNumberInImage(dataUrl);
 }
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const tomorrowStr = () => new Date(Date.now() + 86400000).toISOString().slice(0, 10);
@@ -3814,7 +3827,12 @@ function CheckInView({
     checkOut: tomorrowStr(),
     checkInTime: "12:00",
     checkOutTime: "11:00",
-    purpose: "Leisure"
+    purpose: "Leisure",
+    isForeigner: false,
+    nationality: "",
+    visaNumber: "",
+    visaType: "",
+    arrivalDateIndia: ""
   });
   // Per-booking rate override — lets reception pick a different rate for
   // THIS specific stay (season/negotiation) without permanently changing
@@ -3865,8 +3883,9 @@ function CheckInView({
     reader.onload = async () => {
       const compressed = await compressImg(reader.result).catch(() => reader.result);
       familyRawFrontRef.current[id + "_" + side] = compressed; // raw copy for OCR/QR only, never persisted
-      const masked = await maskAadhaarNumberInImage(compressed);
-      updateFamilyMember(id, side === "front" ? "photoFront" : "photoBack", masked || compressed);
+      const isAadhaarDoc = form.docType === "Aadhaar Card";
+      const masked = await applyAadhaarPhotoPolicy(compressed, isAadhaarDoc);
+      updateFamilyMember(id, side === "front" ? "photoFront" : "photoBack", masked);
     };
     reader.readAsDataURL(file);
   };
@@ -4007,15 +4026,16 @@ function CheckInView({
       // that's the specific document UIDAI's storage restriction covers.
       // Other ID types are stored as-is, unmasked.
       rawFrontRef.current = dataUrl;
-      const masked = isAadhaar ? await maskAadhaarNumberInImage(dataUrl) : dataUrl;
-      setPhotoF(masked || dataUrl);
+      const masked = await applyAadhaarPhotoPolicy(dataUrl, isAadhaar);
+      if (isAadhaar && !masked) setScanMsg("🔒 Aadhaar photo save nahi ki gayi (hotel policy) — details bhar li gayi hain.");
+      setPhotoF(masked);
       setTimeout(() => scanAadhaar("f", dataUrl), 200);
     } else if (camSide === "b") {
       // Back also gets masked for Aadhaar — the standard card layout
       // prints the 12-digit number on both sides, not just the front.
       rawBackRef.current = dataUrl;
-      const maskedBack = isAadhaar ? await maskAadhaarNumberInImage(dataUrl) : dataUrl;
-      setPhotoB(maskedBack || dataUrl);
+      const maskedBack = await applyAadhaarPhotoPolicy(dataUrl, isAadhaar);
+      setPhotoB(maskedBack);
       setTimeout(() => scanAadhaar("b", dataUrl), 200);
     } else if (camSide.startsWith("fam:")) {
       // Family member camera capture — same front/back flow as primary
@@ -4026,8 +4046,8 @@ function CheckInView({
       const side = parts[2] || "front";
       const field = side === "front" ? "photoFront" : "photoBack";
       familyRawFrontRef.current[famId + "_" + side] = dataUrl;
-      const maskedFam = isAadhaar ? await maskAadhaarNumberInImage(dataUrl) : dataUrl;
-      updateFamilyMember(famId, field, maskedFam || dataUrl);
+      const maskedFam = await applyAadhaarPhotoPolicy(dataUrl, isAadhaar);
+      updateFamilyMember(famId, field, maskedFam);
       setTimeout(() => {
         const m = family.find(x => x._id === famId);
         if (m) scanFamilyId({ ...m, [field]: dataUrl }, side);
@@ -4113,14 +4133,21 @@ function CheckInView({
         img.onerror = rej;
         img.src = rawDu;
       });
-      // Save compressed (typically 150-300KB) to state and storage
-      (side === "f" ? setPhotoF : setPhotoB)(compressed);
+      // Save compressed (typically 150-300KB) to state and storage.
+      // For Aadhaar, mask the number FIRST — the raw copy is kept only in
+      // a ref for OCR/QR, never in state (state is what reaches
+      // localStorage, the booking record, and the local folder).
+      const isAadhaarDoc = form.docType === "Aadhaar Card";
+      if (side === "f") rawFrontRef.current = compressed; else rawBackRef.current = compressed;
+      let toStore = compressed;
+      toStore = await applyAadhaarPhotoPolicy(compressed, isAadhaarDoc);
+      (side === "f" ? setPhotoF : setPhotoB)(toStore);
       try {
-        localStorage.setItem("ph_" + side + "_" + tempId, compressed);
+        if (toStore) localStorage.setItem("ph_" + side + "_" + tempId, toStore);
       } catch (x) {
         console.warn("localStorage quota:", x.message);
       }
-      // Auto-scan with the same compressed image
+      // Auto-scan with the RAW compressed image (OCR needs the real number)
       await scanAadhaar(side, compressed);
     };
     r.readAsDataURL(file);
@@ -5039,7 +5066,60 @@ function CheckInView({
     onChange: e => fld("purpose", e.target.value)
   }, ["Leisure", "Business", "Medical", "Pilgrimage", "Family Visit", "Other"].map(p => /*#__PURE__*/React.createElement("option", {
     key: p
-  }, p)))))), hasFeature("family") && /*#__PURE__*/React.createElement(FamilyMembersSection, {
+  }, p)))))), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: { padding: "14px 16px", marginTop: 12 }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: form.isForeigner,
+    onChange: e => {
+      const checked = e.target.checked;
+      fld("isForeigner", checked);
+      if (checked && form.docType !== "Passport") fld("docType", "Passport");
+    },
+    style: { width: 18, height: 18 }
+  }), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, fontSize: 13, color: "var(--navy)" }
+  }, "🌍 Foreign National Guest"), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 11, color: "var(--muted)" }
+  }, "Form III / FRRO reporting zaroori hai (check-in ke 24 ghante ke andar)"))), form.isForeigner && /*#__PURE__*/React.createElement("div", {
+    style: { marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: { fontSize: 11, fontWeight: 700, color: "var(--muted)", display: "block", marginBottom: 4 }
+  }, "NATIONALITY *"), /*#__PURE__*/React.createElement("input", {
+    value: form.nationality,
+    onChange: e => fld("nationality", e.target.value),
+    placeholder: "e.g. British, American"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: { fontSize: 11, fontWeight: 700, color: "var(--muted)", display: "block", marginBottom: 4 }
+  }, "VISA TYPE"), /*#__PURE__*/React.createElement("select", {
+    value: form.visaType,
+    onChange: e => fld("visaType", e.target.value)
+  }, ["", "Tourist", "Business", "Employment", "Student", "Medical", "e-Visa", "Other"].map(v => /*#__PURE__*/React.createElement("option", {
+    key: v || "none",
+    value: v
+  }, v || "Select...")))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: { fontSize: 11, fontWeight: 700, color: "var(--muted)", display: "block", marginBottom: 4 }
+  }, "VISA NUMBER"), /*#__PURE__*/React.createElement("input", {
+    value: form.visaNumber,
+    onChange: e => fld("visaNumber", e.target.value.toUpperCase()),
+    placeholder: "Visa number"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: { fontSize: 11, fontWeight: 700, color: "var(--muted)", display: "block", marginBottom: 4 }
+  }, "DATE OF ARRIVAL IN INDIA *"), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: form.arrivalDateIndia,
+    onChange: e => fld("arrivalDateIndia", e.target.value)
+  })), (form.nationality.trim().toLowerCase() === "nepal" || form.nationality.trim().toLowerCase() === "nepali" || form.nationality.trim().toLowerCase() === "bhutan" || form.nationality.trim().toLowerCase() === "bhutanese") && /*#__PURE__*/React.createElement("div", {
+    style: { gridColumn: "span 2", background: "#eff6ff", borderRadius: 8, padding: "8px 12px", fontSize: 11, color: "#1d4ed8" }
+  }, "ℹ️ Nepal/Bhutan citizens ke liye Form III exempt hai — koi FRRO reporting zaroori nahi."))), hasFeature("family") && /*#__PURE__*/React.createElement(FamilyMembersSection, {
     family: family,
     famScanning: famScanning,
     addFamilyMember: addFamilyMember,
@@ -5126,6 +5206,7 @@ function ProfileEditModal({
   const [hotelEmail, setHotelEmail] = useState(profile.hotelEmail || "");
   const [hotelGstin, setHotelGstin] = useState(profile.hotelGstin || "");
   const [gstMode, setGstMode] = useState(profile.gstMode || "exclusive");
+  const [aadhaarPhotoPolicy, setAadhaarPhotoPolicy] = useState(profile.aadhaarPhotoPolicy || "none");
   const onImg = (e, kind) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
@@ -5162,7 +5243,8 @@ function ProfileEditModal({
       hotelPhone: hotelPhone.trim(),
       hotelEmail: hotelEmail.trim(),
       hotelGstin: hotelGstin.trim().toUpperCase(),
-      gstMode
+      gstMode,
+      aadhaarPhotoPolicy
     });
   };
   return /*#__PURE__*/React.createElement("div", {
@@ -5339,7 +5421,35 @@ function ProfileEditModal({
     }
   }, /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: gstMode === "inclusive" ? "var(--navy)" : "var(--muted)" } }, "GST Included"), /*#__PURE__*/React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 2 } }, "₹1200 room → guest pays ₹1200 hi (GST usी mein shamil)"))), /*#__PURE__*/React.createElement("div", {
     style: { fontSize: 10, color: "var(--muted)", marginTop: 6 }
-  }, "Yeh decide karta hai ki jo rate aap Room mein set karте ho, woh final guest price hai ya GST alag se lagegi")), /*#__PURE__*/React.createElement("div", {
+  }, "Yeh decide karta hai ki jo rate aap Room mein set karте ho, woh final guest price hai ya GST alag se lagegi")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: "var(--muted)",
+      display: "block",
+      marginBottom: 5
+    }
+  }, "AADHAAR PHOTO STORAGE"), /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", gap: 8 }
+  }, /*#__PURE__*/React.createElement("div", {
+    onClick: () => setAadhaarPhotoPolicy("none"),
+    style: {
+      flex: 1, padding: "10px", borderRadius: 10, cursor: "pointer",
+      border: "1.5px solid " + (aadhaarPhotoPolicy === "none" ? "#16a34a" : "var(--border)"),
+      background: aadhaarPhotoPolicy === "none" ? "#f0fdf4" : "#fff"
+    }
+  }, /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: aadhaarPhotoPolicy === "none" ? "#15803d" : "var(--muted)" } }, "Save mat karo"), /*#__PURE__*/React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 2 } }, "Sirf details save hongi, card ki photo kahin nahi (UIDAI-safe)")), /*#__PURE__*/React.createElement("div", {
+    onClick: () => setAadhaarPhotoPolicy("masked"),
+    style: {
+      flex: 1, padding: "10px", borderRadius: 10, cursor: "pointer",
+      border: "1.5px solid " + (aadhaarPhotoPolicy === "masked" ? "#d97706" : "var(--border)"),
+      background: aadhaarPhotoPolicy === "masked" ? "#fffbeb" : "#fff"
+    }
+  }, /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: aadhaarPhotoPolicy === "masked" ? "#b45309" : "var(--muted)" } }, "Masked photo"), /*#__PURE__*/React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 2 } }, "Number black karke photo save hogi"))), aadhaarPhotoPolicy === "masked" && /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 10, color: "#b45309", marginTop: 6, background: "#fffbeb", borderRadius: 8, padding: "8px 10px" }
+  }, "⚠️ Masking best-effort hai — card ka photo tirchha ya crop hua ho to number chhoot sakta hai. UIDAI photocopy store karne se mana karta hai, isliye 'Save mat karo' safest hai."), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 10, color: "var(--muted)", marginTop: 6 }
+  }, "Doosre ID (Passport, DL, Voter ID, PAN) par yeh rule lagu nahi — unki photo normally save hoti hai")), /*#__PURE__*/React.createElement("div", {
     style: {
       borderTop: "1px solid var(--border)",
       paddingTop: 12,
@@ -7962,7 +8072,13 @@ function App() {
         hotelPhone: localStorage.getItem("hotelPhone") || "",
         hotelEmail: localStorage.getItem("hotelEmail") || "",
         hotelGstin: localStorage.getItem("hotelGstin") || "",
-        gstMode: localStorage.getItem("gstMode") || "exclusive"
+        gstMode: localStorage.getItem("gstMode") || "exclusive",
+        // "none" (default) = Aadhaar card images are never stored anywhere,
+        // only the extracted text + masked number. This is the only fully
+        // reliable way to satisfy UIDAI guidance, since pixel-level masking
+        // can't guarantee it covers the number on every card photo angle.
+        // "masked" = store a best-effort masked image (hotel's own choice).
+        aadhaarPhotoPolicy: localStorage.getItem("aadhaarPhotoPolicy") || "none"
       };
     } catch {
       return {
@@ -7975,7 +8091,8 @@ function App() {
         hotelPhone: "",
         hotelEmail: "",
         hotelGstin: "",
-        gstMode: "exclusive"
+        gstMode: "exclusive",
+        aadhaarPhotoPolicy: "none"
       };
     }
   });
@@ -7998,6 +8115,7 @@ function App() {
       localStorage.setItem("hotelEmail", p.hotelEmail || "");
       localStorage.setItem("hotelGstin", p.hotelGstin || "");
       localStorage.setItem("gstMode", p.gstMode || "exclusive");
+      localStorage.setItem("aadhaarPhotoPolicy", p.aadhaarPhotoPolicy || "none");
       if (p.hotelLogo) localStorage.setItem("hotelLogo", p.hotelLogo);else localStorage.removeItem("hotelLogo");
       if (p.hotelBanner) localStorage.setItem("hotelBanner", p.hotelBanner);else localStorage.removeItem("hotelBanner");
     } catch {}
