@@ -1633,41 +1633,91 @@ function buildInvoicePDFBlob(b, roomObj) {
     name: CURRENT_PROFILE.hotelName || HOTEL.name,
     addr: CURRENT_PROFILE.hotelAddr || HOTEL.addr,
     phone: CURRENT_PROFILE.hotelPhone || HOTEL.phone,
-    gstin: CURRENT_PROFILE.hotelGstin || ""
+    email: CURRENT_PROFILE.hotelEmail || HOTEL.email,
+    gstin: CURRENT_PROFILE.hotelGstin || "",
+    tagline: CURRENT_PROFILE.hotelTagline || HOTEL.tagline || ""
   };
   const L = [];
-  L.push({ text: RH.name, size: 18, bold: true });
-  (RH.addr || "").split("\n").forEach(a => L.push({ text: a, size: 9 }));
-  L.push({ text: "Phone: " + RH.phone + (RH.gstin ? "   GSTIN: " + RH.gstin : ""), size: 9 });
-  L.push({ text: "", rule: true, gap: 6 });
-  L.push({ text: "TAX INVOICE", size: 13, bold: true, gap: 4 });
-  L.push({ text: "Invoice No: " + b.id, size: 10 });
-  L.push({ text: "Guest: " + (b.name || ""), size: 10 });
-  L.push({ text: "Mobile: " + (b.mobile || ""), size: 10 });
-  L.push({ text: "Room: " + b.roomId + (roomObj && roomObj.type ? " (" + roomObj.type + ")" : ""), size: 10 });
-  L.push({ text: "Check-In: " + b.checkIn + " " + (b.checkInTime || ""), size: 10 });
-  L.push({ text: "Check-Out: " + (b.checkOutActual || b.checkOut) + " " +
-    (b.checkOutActualTime || b.checkOutTime || "") + "   Nights: " + n, size: 10 });
-  L.push({ text: "", rule: true, gap: 6 });
-  L.push({ text: "Description", size: 10, bold: true });
-  L.push({ text: "Amount (Rs.)", size: 10, bold: true, align: "right", lh: 4 });
-  L.push({ text: "", rule: true, gap: 8 });
-  L.push({ text: "Room charges (" + n + " night" + (n > 1 ? "s" : "") + ")", size: 10, lh: 0 });
-  L.push({ text: String(b.roomTotal || 0), size: 10, align: "right" });
+  const row = (label, amount, opts) => {
+    const o = opts || {};
+    L.push({ text: label, size: o.size || 10, bold: o.bold, lh: 0 });
+    L.push({ text: amount, size: o.size || 10, bold: o.bold, align: "right", lh: o.lh || 15 });
+  };
+
+  L.push({ text: RH.name, size: 18, bold: true, lh: 20 });
+  String(RH.addr || "").split("\n").forEach(a => L.push({ text: a, size: 9, lh: 11 }));
+  L.push({ text: "Phone: " + RH.phone + (RH.email ? "  |  " + RH.email : ""), size: 9, lh: 11 });
+  if (RH.gstin) L.push({ text: "GSTIN: " + RH.gstin, size: 9, lh: 11 });
+  L.push({ text: "", rule: true, gap: 4, lh: 14 });
+
+  L.push({ text: "TAX INVOICE", size: 14, bold: true, lh: 18 });
+  L.push({ text: "Invoice No: " + b.id, size: 10, lh: 0 });
+  L.push({ text: "Date: " + (b.checkOutActual || b.checkOut || ""), size: 10, align: "right" });
+
+  L.push({ text: "", gap: 4, lh: 10 });
+  L.push({ text: "GUEST DETAILS", size: 10, bold: true, lh: 14 });
+  L.push({ text: "Name: " + (b.name || ""), size: 10, lh: 13 });
+  if (b.mobile) L.push({ text: "Mobile: " + b.mobile, size: 10, lh: 13 });
+  if (b.address) L.push({ text: "Address: " + b.address, size: 9, lh: 13 });
+  const idLabel = b.docType || "Aadhaar Card";
+  const idVal = (b.docType && b.docType !== "Aadhaar Card") ? (b.aadhaar || "") : maskAadhaar(b.aadhaar);
+  if (idVal) L.push({ text: idLabel + ": " + idVal, size: 9, lh: 13 });
+  if (b.isForeigner) {
+    L.push({ text: "Nationality: " + (b.nationality || "") +
+      (b.visaNumber ? "   Visa: " + b.visaNumber : "") +
+      (b.visaType ? " (" + b.visaType + ")" : ""), size: 9, lh: 13 });
+  }
+  if (Array.isArray(b.family) && b.family.length) {
+    L.push({ text: "Accompanying: " + b.family.map(m => (m.name || "") +
+      (m.relation ? " (" + m.relation + ")" : "")).join(", "), size: 9, lh: 13 });
+  }
+
+  L.push({ text: "", gap: 4, lh: 10 });
+  L.push({ text: "STAY DETAILS", size: 10, bold: true, lh: 14 });
+  L.push({ text: "Room: " + b.roomId + (roomObj && roomObj.type ? "  (" + roomObj.type + ")" : "") +
+    "   Guests: " + (b.adults || 1) + " adult(s)" +
+    (Number(b.children) ? ", " + b.children + " child" : ""), size: 10, lh: 13 });
+  L.push({ text: "Check-In:  " + (b.checkIn || "") + "  " + (b.checkInTime || ""), size: 10, lh: 13 });
+  L.push({ text: "Check-Out: " + (b.checkOutActual || b.checkOut || "") + "  " +
+    (b.checkOutActualTime || b.checkOutTime || "") + "   |   Nights: " + n, size: 10, lh: 13 });
+  if (b.purpose) L.push({ text: "Purpose: " + b.purpose, size: 9, lh: 13 });
+
+  L.push({ text: "", rule: true, gap: 6, lh: 16 });
+  L.push({ text: "PARTICULARS", size: 10, bold: true, lh: 0 });
+  L.push({ text: "AMOUNT (Rs.)", size: 10, bold: true, align: "right", lh: 6 });
+  L.push({ text: "", rule: true, gap: 0, lh: 14 });
+
+  row("Room charges  (" + n + " night" + (n > 1 ? "s" : "") + " @ Rs." +
+      ((roomObj && roomObj.rate) || 0) + "/night)", String(b.roomTotal || 0));
   (b.charges || []).forEach(c => {
-    L.push({ text: c.name + "  x" + c.qty, size: 10, lh: 0 });
-    L.push({ text: String((c.price || 0) * (c.qty || 0)), size: 10, align: "right" });
+    row((c.name || "") + "   x" + (c.qty || 0) + " @ Rs." + (c.price || 0),
+        String((c.price || 0) * (c.qty || 0)));
   });
-  L.push({ text: "", rule: true, gap: 4 });
-  L.push({ text: "Subtotal", size: 10, lh: 0 });
-  L.push({ text: String(G.subtotal), size: 10, align: "right" });
-  L.push({ text: "GST", size: 10, lh: 0 });
-  L.push({ text: String(G.totalGST), size: 10, align: "right" });
-  L.push({ text: "GRAND TOTAL", size: 12, bold: true, lh: 0 });
-  L.push({ text: String(G.grandTotal), size: 12, bold: true, align: "right" });
-  L.push({ text: "", rule: true, gap: 8 });
-  L.push({ text: "Thank you for staying with us!", size: 10, bold: true, gap: 6 });
-  L.push({ text: (CURRENT_PROFILE.hotelTagline || HOTEL.tagline || ""), size: 9 });
+
+  L.push({ text: "", rule: true, gap: 2, lh: 14 });
+  row("Subtotal", String(G.subtotal));
+  if (G.roomAmt > 0 || G.roomGST > 0) {
+    row("Room GST @ " + Math.round(G.roomGSTRate * 100) + "%  (SAC 9963)", String(G.roomGST), { size: 9 });
+  } else {
+    row("Room GST (Nil-rated, tariff up to Rs.1000)", "0", { size: 9 });
+  }
+  if (G.foodAmt > 0) row("Food / Beverage GST @ " + Math.round(G.foodGSTRate * 100) + "%", String(G.foodGST), { size: 9 });
+  if (G.otherAmt > 0) row("Other Services GST @ 18%", String(G.otherGST), { size: 9 });
+  L.push({ text: "", rule: true, gap: 2, lh: 16 });
+  row("GRAND TOTAL", "Rs. " + G.grandTotal, { size: 13, bold: true, lh: 18 });
+  L.push({ text: "", rule: true, gap: 2, lh: 14 });
+
+  L.push({ text: (G.gstMode === "inclusive"
+    ? "Displayed rate is inclusive of GST."
+    : "GST charged in addition to displayed rate.") +
+    " Rates as per 56th GST Council (eff. 22 Sept 2025).", size: 8, lh: 11 });
+  L.push({ text: b.status === "checkedout"
+    ? "This bill is final — GST locked at the rate/mode active at checkout."
+    : "Guest still checked in — amounts use current pricing and lock at checkout.", size: 8, lh: 14 });
+
+  L.push({ text: "Thank you for staying with " + RH.name + "!", size: 11, bold: true, gap: 6, lh: 14 });
+  if (RH.tagline) L.push({ text: RH.tagline, size: 9, lh: 12 });
+  L.push({ text: "Computer-generated invoice.", size: 8, lh: 12 });
   return buildSimplePDF(L);
 }
 
@@ -4192,9 +4242,14 @@ function CheckInView({
       // stored at capture, so decide here now that we know where the
       // number sits.
       const isAadhaarDoc = form.docType === "Aadhaar Card";
-      const famStored = isAadhaarDoc
-        ? await applyAadhaarPhotoPolicy(photo, true, Array.isArray(parsed.numberBoxes) ? parsed.numberBoxes : [])
-        : photo;
+      const famPolicy = (CURRENT_PROFILE && CURRENT_PROFILE.aadhaarPhotoPolicy) || "none";
+      if (isAadhaarDoc && famPolicy !== "none") {
+        const fb = (Array.isArray(parsed.numberBoxes) ? parsed.numberBoxes : [])
+          .filter(b => b && Number.isFinite(Number(b.x)) && Number(b.w) > 0 && Number(b.h) > 0)
+          .map(b => ({ x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h) }));
+        setRedact({ dataUrl: photo, side, memberId: member._id, boxes: fb, draft: null });
+      }
+      const famStored = isAadhaarDoc ? null : photo;
       const famField = side === "front" ? "photoFront" : "photoBack";
       const addrParts = [parsed.address, parsed.district, parsed.state, parsed.pin ? `PIN ${parsed.pin}` : ""].filter(v => v && String(v).trim());
       setFamily(f => f.map(mm => mm._id === member._id ? {
@@ -4290,37 +4345,127 @@ function CheckInView({
     }
   };
 
-  const openQrLive = async (memberId) => {
+  // ── MANUAL REDACTION EDITOR ───────────────────────────────────
+  // Asking a vision model for the number's pixel coordinates was tried and
+  // failed repeatedly on real card photos — the boxes landed on the photo
+  // or missed a number sitting at the frame edge. Vision models are simply
+  // not dependable at precise bounding boxes. Letting the person drag a box
+  // over the digits takes two seconds and is right every single time, so
+  // that is now the mechanism; any model-suggested boxes are only used to
+  // pre-fill it, and the person confirms before anything is stored.
+  const [redact, setRedact] = useState(null); // {dataUrl, side, memberId, boxes, natW, natH}
+  const redactImgRef = useRef(null);
+  const dragRef = useRef(null);
+
+  const relPoint = (e) => {
+    const img = redactImgRef.current;
+    if (!img) return null;
+    const r = img.getBoundingClientRect();
+    const p = e.touches && e.touches[0] ? e.touches[0] : e;
+    return {
+      x: Math.min(1, Math.max(0, (p.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (p.clientY - r.top) / r.height))
+    };
+  };
+  const redactStart = (e) => {
+    const p = relPoint(e);
+    if (!p) return;
+    dragRef.current = p;
+    setRedact(r => r ? { ...r, draft: { x: p.x, y: p.y, w: 0, h: 0 } } : r);
+  };
+  const redactMove = (e) => {
+    if (!dragRef.current) return;
+    if (e.cancelable) e.preventDefault();
+    const p = relPoint(e);
+    if (!p) return;
+    const a = dragRef.current;
+    setRedact(r => r ? { ...r, draft: {
+      x: Math.min(a.x, p.x), y: Math.min(a.y, p.y),
+      w: Math.abs(p.x - a.x), h: Math.abs(p.y - a.y)
+    } } : r);
+  };
+  const redactEnd = () => {
+    dragRef.current = null;
+    setRedact(r => {
+      if (!r || !r.draft) return r;
+      // Ignore accidental taps; a real redaction is at least a few percent
+      if (r.draft.w < 0.02 || r.draft.h < 0.01) return { ...r, draft: null };
+      return { ...r, boxes: [...r.boxes, r.draft], draft: null };
+    });
+  };
+  const saveRedaction = async () => {
+    if (!redact) return;
+    if (!redact.boxes.length) {
+      alert("Aadhaar number ke upar ungli se ek box banao — tabhi photo save hogi.");
+      return;
+    }
+    const out = await maskRegionsInImage(redact.dataUrl, redact.boxes);
+    if (!out) { alert("Photo mask nahi ho paayi — dobara try karo."); return; }
+    if (redact.memberId) {
+      updateFamilyMember(redact.memberId, redact.side === "front" ? "photoFront" : "photoBack", out);
+    } else {
+      (redact.side === "f" ? setPhotoF : setPhotoB)(out);
+    }
+    setRedact(null);
+    setScanMsg("🔒 Number chhupa kar photo save ho gayi.");
+  };
+
+  const openQrLive = (memberId) => {
     setQrLiveTarget(memberId || null);
-    setQrLiveMsg("📷 Card ka QR camera ke saamne lao — paas laake steady rakho");
+    setQrLiveMsg("📷 Camera shuru ho raha hai...");
     setQrLiveOpen(true);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-      });
-      qrStreamRef.current = stream;
+  };
+
+  // Camera start MUST happen after the overlay has rendered, otherwise
+  // qrVideoRef.current is still null and the stream gets torn down again
+  // immediately — which is why the scanner appeared to do nothing.
+  useEffect(() => {
+    if (!qrLiveOpen) return;
+    let cancelled = false;
+    let localStream = null;
+
+    (async () => {
       const v = qrVideoRef.current;
-      if (!v) { stream.getTracks().forEach(t => t.stop()); return; }
-      v.srcObject = stream;
+      if (!v) { setQrLiveMsg("❌ Camera view load nahi hua. Overlay band karke dobara try karo."); return; }
+      try {
+        setQrLiveMsg("📷 Card ka QR camera ke saamne lao — paas laake steady rakho");
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+        });
+      } catch (e) {
+        setQrLiveMsg("❌ Camera nahi khul paaya: " + (e && e.message ? e.message : e) +
+          ". Browser settings mein camera permission allow karo.");
+        return;
+      }
+      if (cancelled) { localStream.getTracks().forEach(t => t.stop()); return; }
+      qrStreamRef.current = localStream;
+      v.srcObject = localStream;
       v.setAttribute("playsinline", "true");
-      await v.play().catch(() => {});
+      v.muted = true;
+      try { await v.play(); } catch (e) { /* some browsers autoplay anyway */ }
 
       let detector = null;
       try {
         if (typeof window.BarcodeDetector !== "undefined") {
           const fmts = await window.BarcodeDetector.getSupportedFormats().catch(() => []);
-          if (fmts.includes("qr_code")) detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+          if (fmts && fmts.indexOf("qr_code") !== -1) detector = new window.BarcodeDetector({ formats: ["qr_code"] });
         }
       } catch (e) { detector = null; }
+      if (!detector && !window.jsQR) {
+        setQrLiveMsg("❌ Is browser mein QR scanning support nahi hai. Photo se AI scan use karo.");
+        return;
+      }
 
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
       let busy = false;
+      let frames = 0;
 
       const tick = async () => {
-        if (!qrStreamRef.current) return;
+        if (cancelled || !qrStreamRef.current) return;
         if (!busy && v.readyState >= 2 && v.videoWidth) {
           busy = true;
+          frames++;
           let text = null;
           try {
             if (detector) {
@@ -4338,6 +4483,10 @@ function CheckInView({
           } catch (e) { /* keep scanning */ }
           busy = false;
 
+          if (frames === 60 && !text) {
+            setQrLiveMsg("🔎 Dhoondh rahe hain... QR ko frame ke beech mein aur paas laao (10-15 cm), roshni theek rakho.");
+          }
+
           if (text) {
             setQrLiveMsg("⏳ QR mil gaya — padh rahe hain...");
             let result = parseAadhaarQRText(text);
@@ -4346,8 +4495,8 @@ function CheckInView({
               setQrLiveMsg("⚠️ Yeh QR padha nahi ja saka. Photo se AI scan try karo.");
             } else {
               applyQrResult(result, qrLiveTarget);
-              stopQrLive();
               setScanMsg("✅ QR se details bhar di gayi — verify karke aage badho.");
+              stopQrLive();
               return;
             }
           }
@@ -4355,10 +4504,16 @@ function CheckInView({
         qrLoopRef.current = requestAnimationFrame(tick);
       };
       qrLoopRef.current = requestAnimationFrame(tick);
-    } catch (e) {
-      setQrLiveMsg("❌ Camera nahi khul paaya: " + e.message);
-    }
-  };
+    })();
+
+    return () => {
+      cancelled = true;
+      if (qrLoopRef.current) { cancelAnimationFrame(qrLoopRef.current); qrLoopRef.current = null; }
+      if (qrStreamRef.current) { qrStreamRef.current.getTracks().forEach(t => t.stop()); qrStreamRef.current = null; }
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+    };
+  }, [qrLiveOpen]);
+
   useEffect(() => () => stopQrLive(), []);
 
   const openCam = async side => {
@@ -4639,14 +4794,13 @@ function CheckInView({
         if (policy === "none") {
           msg += " 🔒 Card ki photo save nahi ki gayi (hotel setting).";
         } else {
-          const boxes = Array.isArray(parsed.numberBoxes) ? parsed.numberBoxes : [];
-          const stored = await applyAadhaarPhotoPolicy(photo, true, boxes);
-          if (stored) {
-            (side === "f" ? setPhotoF : setPhotoB)(stored);
-            msg += " 🔒 Number mask karke photo save ho gayi.";
-          } else {
-            msg += " ⚠️ Number ki jagah pata nahi chali — photo save nahi ki gayi (unmasked save nahi karte).";
-          }
+          // Pre-fill with whatever the model suggested, but always let the
+          // person confirm/correct it before anything is written.
+          const boxes = (Array.isArray(parsed.numberBoxes) ? parsed.numberBoxes : [])
+            .filter(b => b && Number.isFinite(Number(b.x)) && Number(b.w) > 0 && Number(b.h) > 0)
+            .map(b => ({ x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h) }));
+          setRedact({ dataUrl: photo, side, memberId: null, boxes, draft: null });
+          msg += " 👉 Ab Aadhaar number ke upar box banakar photo save karo.";
         }
       } else {
         (side === "f" ? setPhotoF : setPhotoB)(photo);
@@ -5165,7 +5319,44 @@ function CheckInView({
       cursor: "pointer",
       fontWeight: 700
     }
-  }, "📸 Use Camera")))), qrLiveOpen && /*#__PURE__*/React.createElement("div", {
+  }, "📸 Use Camera")))), redact && /*#__PURE__*/React.createElement("div", {
+    style: { position: "fixed", inset: 0, background: "#000", zIndex: 3500, display: "flex", flexDirection: "column" }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { padding: "12px 16px", background: "#111", color: "#fff", fontSize: 13, lineHeight: 1.5 }
+  }, /*#__PURE__*/React.createElement("b", null, "Aadhaar number chhupao"), /*#__PURE__*/React.createElement("div", {
+    style: { color: "#bbb", marginTop: 2 }
+  }, "Number ke upar ungli se kheench kar box banao. Ek se zyada jagah number ho to har jagah box banao.")),
+    /*#__PURE__*/React.createElement("div", {
+    style: { flex: 1, position: "relative", overflow: "auto", display: "flex", alignItems: "center", justifyContent: "center" }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { position: "relative", touchAction: "none", maxWidth: "100%" },
+    onMouseDown: redactStart, onMouseMove: redactMove, onMouseUp: redactEnd, onMouseLeave: redactEnd,
+    onTouchStart: redactStart, onTouchMove: redactMove, onTouchEnd: redactEnd
+  }, /*#__PURE__*/React.createElement("img", {
+    ref: redactImgRef,
+    src: redact.dataUrl,
+    draggable: false,
+    style: { display: "block", maxWidth: "100%", maxHeight: "70vh", userSelect: "none" }
+  }), [...redact.boxes, ...(redact.draft ? [redact.draft] : [])].map((b, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      position: "absolute",
+      left: (b.x * 100) + "%", top: (b.y * 100) + "%",
+      width: (b.w * 100) + "%", height: (b.h * 100) + "%",
+      background: "#000", border: "1px solid #f43f5e", pointerEvents: "none"
+    }
+  })))), /*#__PURE__*/React.createElement("div", {
+    style: { padding: "12px 16px 20px", background: "#111", display: "flex", gap: 8 }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setRedact(r => r ? { ...r, boxes: [], draft: null } : r),
+    style: { flex: 1, padding: "12px", borderRadius: 10, border: "1px solid #555", background: "transparent", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }
+  }, "↺ Boxes hatao"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => { setRedact(null); setScanMsg("🔒 Photo save nahi ki gayi — details bhar li gayi hain."); },
+    style: { flex: 1, padding: "12px", borderRadius: 10, border: "1px solid #555", background: "transparent", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }
+  }, "Photo mat rakho"), /*#__PURE__*/React.createElement("button", {
+    onClick: saveRedaction,
+    style: { flex: 1.4, padding: "12px", borderRadius: 10, border: "none", background: "var(--gold)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }
+  }, "✅ Save"))), qrLiveOpen && /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed", inset: 0, background: "#000", zIndex: 3000,
       display: "flex", flexDirection: "column"
@@ -7619,7 +7810,13 @@ function StorageSettingsView({
     setStatus("⏳ Re-confirming access...");
     const ok = await LocalFS.requestPermissionOnClick();
     setAccessGranted(ok);
-    setStatus(ok ? "✅ Access restored — no need to re-select the folder" : "❌ Permission denied — try 'Change Folder' instead");
+    // Chrome re-asks for folder access once per session unless the person
+    // picks the "every visit" option in its prompt. We can't suppress that
+    // from code — the API is built that way — so the honest fix is to tell
+    // them exactly which option removes the repeat prompt for good.
+    setStatus(ok
+      ? "✅ Access restored. Tip: agli baar Chrome ka prompt aaye to 'Allow on every visit' chuno — phir dobara nahi poochhega."
+      : "❌ Permission denied — 'Change Folder' se dobara select karo.");
   };
   const disableLocal = () => {
     localStorage.removeItem("ab_local_folder");
@@ -7841,7 +8038,7 @@ function StorageSettingsView({
     style: {
       color: "#92400e"
     }
-  }, "⚠️ Photos — abhi sirf device mein (Firebase Storage coming soon)"))), secretUnlocked && /*#__PURE__*/React.createElement("div", {
+  }, "⚠️ Photos — abhi sirf device mein (Firebase Storage coming soon)"))), /*#__PURE__*/React.createElement("div", {
     style: {
       background: "var(--card)",
       border: "1px solid var(--border)",
@@ -8135,7 +8332,7 @@ function StorageSettingsView({
     style: { fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }
   }, "Form III khud portal (indianfrro.gov.in) par file karna hota hai — koi bhi software apne aap submit nahi kar sakta. Yeh sheet wahan bharne aur apne record ke liye hai."), exportStatus && /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
-  }, exportStatus)), secretUnlocked && /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
+  }, exportStatus)), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
 }
 
 /* ── BOTTOM NAV ───────────────────────────────────────────────── */
