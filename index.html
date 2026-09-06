@@ -5885,10 +5885,15 @@ function CheckInView({
 /* ── PROFILE EDIT MODAL (Owner name + Hotel logo/banner) ──────── */
 function ProfileEditModal({
   profile,
+  user,
   onSave,
   onClose
 }) {
-  const [name, setName] = useState(profile.ownerName || "");
+  const isOwner = !user || user.role === "Owner";
+  // Owner edits the hotel-level owner name; everyone else edits their own
+  // staff account name (which is what their greeting actually shows).
+  const [name, setName] = useState(() =>
+    (!user || user.role === "Owner") ? (profile.ownerName || "") : (user.name || ""));
   const [tagline, setTagline] = useState(profile.hotelTagline || "");
   const [logo, setLogo] = useState(profile.hotelLogo || null);
   const [banner, setBanner] = useState(profile.hotelBanner || null);
@@ -5926,7 +5931,9 @@ function ProfileEditModal({
       return;
     }
     onSave({
-      ownerName: name.trim(),
+      // Non-Owners must not overwrite the hotel's owner name
+      ownerName: isOwner ? name.trim() : (profile.ownerName || ""),
+      _selfName: isOwner ? undefined : name.trim(),
       hotelTagline: tagline.trim(),
       hotelLogo: logo,
       hotelBanner: banner,
@@ -6155,7 +6162,7 @@ function ProfileEditModal({
       display: "block",
       marginBottom: 5
     }
-  }, "OWNER/MANAGER NAME"), /*#__PURE__*/React.createElement("input", {
+  }, isOwner ? "OWNER NAME (hotel ka maalik)" : "AAPKA NAAM (" + (user.role || "Staff") + ")"), /*#__PURE__*/React.createElement("input", {
     value: name,
     onChange: e => setName(e.target.value),
     placeholder: "Aapka naam"
@@ -8517,6 +8524,10 @@ function AccessControlView({
   user
 }) {
   const [local, setLocal] = useState(permissions);
+  // permissions now arrives live from the cloud listener, and useState only
+  // takes its initial value — without this the Owner could be editing a
+  // stale copy and save it back, silently undoing a change made elsewhere.
+  useEffect(() => { setLocal(permissions); }, [permissions]);
   const [saved, setSaved] = useState(false);
   const toggle = (role, featureId) => {
     setLocal(p => {
@@ -9086,6 +9097,7 @@ function App() {
     let unsubRooms = () => {};
     let unsubBk = () => {};
     let unsubProfile = () => {};
+    let unsubPerms = () => {};
     let cancelled = false;
     let pollTimer = null;
 
@@ -9153,6 +9165,18 @@ function App() {
           if (data) setProfile(p => ({ ...p, ...data }));
         });
       }, 600);
+      // Access-control permissions need a live listener too. Without one,
+      // WS.get("permissions") returns the device's cached localStorage copy
+      // and never re-checks the server — so once a staff device had cached
+      // a permission set, ANY later change by the Owner (including turning
+      // a tab back ON) never reached that device. Re-enabling appeared
+      // permanently broken for exactly this reason.
+      setTimeout(() => {
+        if (cancelled) return;
+        unsubPerms = WS.onSnapshot("permissions", data => {
+          if (data) setPermissions(data);
+        });
+      }, 900);
       // Connection state monitor
       window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
     };
@@ -9211,6 +9235,7 @@ function App() {
       unsubRooms();
       unsubBk();
       unsubProfile();
+      unsubPerms();
     };
   }, []);
 
@@ -9751,8 +9776,29 @@ function App() {
     onClose: () => setModal(null)
   }), modal?.type === "editProfile" && /*#__PURE__*/React.createElement(ProfileEditModal, {
     profile: profile,
+    user: user,
     onSave: p => {
-      saveProfile(p);
+      // profile.ownerName is a HOTEL-level field — it is the owner's display
+      // name and is shared by every device. When a non-Owner edits the name
+      // field they mean THEIR OWN name, so write it to their staff account
+      // instead; otherwise their edit silently did nothing, because the
+      // greeting shows user.name for non-Owners.
+      if (user && user.role !== "Owner" && p._selfName !== undefined) {
+        const newName = String(p._selfName || "").trim();
+        if (newName && newName !== user.name) {
+          try {
+            const list = JSON.parse(localStorage.getItem("ab_users") || "[]");
+            const updated = list.map(x => x.u === user.u ? { ...x, name: newName } : x);
+            localStorage.setItem("ab_users", JSON.stringify(updated));
+            CloudSync.users(updated);
+          } catch (e) { console.warn("Update staff name:", e.message); }
+          const nu = { ...user, name: newName };
+          setUser(nu);
+          WS.set("cu", nu).catch(() => {});
+        }
+      }
+      const { _selfName, ...rest } = p;
+      saveProfile(rest);
       setModal(null);
     },
     onClose: () => setModal(null)
