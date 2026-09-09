@@ -272,15 +272,171 @@ const maskAadhaar = num => {
 //   Room tariff (per night):  ≤ ₹1,000 → 0% | ₹1,001–7,500 → 5% (no ITC) | > ₹7,500 → 18% (ITC)
 //   Restaurant/food/beverage: 5% (no ITC) at "non-specified premises",
 //                             18% (ITC) at "specified premises"
-//   "Specified premises" = a hotel where any room tariff exceeds ₹7,500.
-//   We approximate this using the hotel's CURRENTLY configured room rates
-//   (exact rule is "in the preceding financial year" — for precise annual
-//   determination consult your CA; this auto-updates as room rates change).
-//   Other services (laundry, extra bed, cab, etc.): flat 18%, same as
-//   general hotel ancillary services.
-const roomGSTRate = nightlyRate => nightlyRate <= 1000 ? 0 : nightlyRate <= 7500 ? 0.05 : 0.18;
+// ── GST RULE MASTER ──────────────────────────────────────────────
+// Single source of truth for every GST rate this app applies. Nothing
+// elsewhere hard-codes a rate — everything resolves through
+// resolveGSTRule() below, keyed by (category, supply date, and for
+// accommodation, the nightly tariff). This exists so that:
+//   1. A rate change (GST Council notification) is ONE new entry here,
+//      not a hunt through billing code.
+//   2. A booking is taxed using the rule that was in force on ITS supply
+//      date — not today's rate — even if viewed/printed much later.
+//   3. Every invoice can cite which rule (and government notification)
+//      it used, which is what "rule_id" / "source reference" means on a
+//      real GST audit trail.
+// "Specified premises" = a hotel where any room's tariff exceeded ₹7,500
+// in the preceding financial year. We approximate this from the hotel's
+// CURRENTLY configured room rates (see isSpecifiedPremises) unless the
+// Owner has explicitly set it via Profile Settings — exact determination
+// needs your CA's confirmation for the relevant financial year.
+//
+// Each rule: { id, category, sac, rate, effectiveFrom, effectiveTo,
+//              condition(ctx), reference }
+// condition(ctx) receives { nightlyRate, specifiedPremises } and returns
+// true if this rule applies to the given supply. Rules are matched by
+// (a) category, (b) effectiveFrom <= supplyDate <= effectiveTo, (c) the
+// first whose condition() returns true — so order matters within a date
+// band; keep more specific conditions first.
+// ── PLACE OF SUPPLY / STATE CODES ────────────────────────────────
+// Official 2-digit GST state/UT codes (the first 2 digits of every
+// GSTIN). Used to (a) derive the hotel's own state from its GSTIN for
+// display, and (b) determine CGST+SGST vs IGST.
+//
+// For a hotel: accommodation, restaurant/room-service, laundry, extra
+// bed, and cab-arranged-by-the-hotel are all services tied to the
+// hotel's own premises. Under Section 12(3) of the IGST Act, the place
+// of supply for services related to immovable property (and for
+// restaurant/catering services) is the LOCATION OF THE PROPERTY ITSELF —
+// not the guest's home state, billing address, or GSTIN. Since the
+// hotel's own registration is ALSO in that same state, the supplier's
+// state and the place of supply are structurally always identical for
+// these services. This means CGST+SGST is not a simplification for a
+// single-property hotel — it is what the law actually requires,
+// regardless of where the guest is travelling from.
+// IGST would only become relevant for something NOT tied to the
+// property's location (e.g. a shippable retail item sent to another
+// state) — nothing in this app's current feature set falls into that
+// category, so IGST resolves to zero everywhere below. The fields exist
+// so a future feature (or a specific transaction your CA identifies)
+// can switch it on without a schema change.
+const GST_STATE_CODES = {
+  "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh",
+  "05": "Uttarakhand", "06": "Haryana", "07": "Delhi", "08": "Rajasthan", "09": "Uttar Pradesh",
+  "10": "Bihar", "11": "Sikkim", "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+  "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam", "19": "West Bengal",
+  "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+  "25": "Daman and Diu", "26": "Dadra and Nagar Haveli", "27": "Maharashtra", "28": "Andhra Pradesh (Old)",
+  "29": "Karnataka", "30": "Goa", "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu",
+  "34": "Puducherry", "35": "Andaman and Nicobar Islands", "36": "Telangana", "37": "Andhra Pradesh",
+  "38": "Ladakh"
+};
+function deriveStateFromGSTIN(gstin) {
+  const code = String(gstin || "").slice(0, 2);
+  return GST_STATE_CODES[code] ? { code, name: GST_STATE_CODES[code] } : null;
+}
+// Resolves whether a supply is intra-state (CGST+SGST) or inter-state
+// (IGST) given the hotel's own state code and the place-of-supply state
+// code for this line. For every category this app currently taxes
+// (accommodation/restaurant/laundry/extra-bed/transport), placeOfSupplyCode
+// defaults to the hotel's OWN state code per the immovable-property rule
+// explained above — so this resolves to intra-state in every real case,
+// but is written generically so it stays correct if that ever changes.
+function resolveTaxSplit(totalGST, hotelStateCode, placeOfSupplyStateCode) {
+  const interState = hotelStateCode && placeOfSupplyStateCode && hotelStateCode !== placeOfSupplyStateCode;
+  if (interState) return { cgst: 0, sgst: 0, igst: totalGST, interState: true };
+  const half = Math.floor(totalGST / 2);
+  return { cgst: half, sgst: totalGST - half, igst: 0, interState: false };
+}
+
+const GST_RULE_MASTER = [
+  // Accommodation — 56th GST Council meeting, effective 22 Sept 2025.
+  // Tariff ≤ ₹1,000/night: Nil. ₹1,001–7,500: 5% (no ITC). > ₹7,500: 18%.
+  { id: "ACC-NIL-2025", category: "accommodation", sac: "9963", rate: 0,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: ctx => ctx.nightlyRate <= 1000,
+    reference: "56th GST Council meeting, Notification eff. 22 Sept 2025" },
+  { id: "ACC-5-2025", category: "accommodation", sac: "9963", rate: 0.05,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: ctx => ctx.nightlyRate > 1000 && ctx.nightlyRate <= 7500,
+    reference: "56th GST Council meeting, Notification eff. 22 Sept 2025" },
+  { id: "ACC-18-2025", category: "accommodation", sac: "9963", rate: 0.18,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: ctx => ctx.nightlyRate > 7500,
+    reference: "56th GST Council meeting, Notification eff. 22 Sept 2025" },
+
+  // Restaurant / food service — rate depends on whether the PREMISES is
+  // "specified" (any room > ₹7,500), not the price of the food itself.
+  { id: "REST-5-2025", category: "restaurant", sac: "996331", rate: 0.05,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: ctx => !ctx.specifiedPremises,
+    reference: "56th GST Council meeting, Notification eff. 22 Sept 2025 — non-specified premises, no ITC" },
+  { id: "REST-18-2025", category: "restaurant", sac: "996331", rate: 0.18,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: ctx => ctx.specifiedPremises,
+    reference: "56th GST Council meeting, Notification eff. 22 Sept 2025 — specified premises, with ITC" },
+
+  // Laundry — standard rate for laundry/dry-cleaning services.
+  { id: "LNDY-18-2025", category: "laundry", sac: "999721", rate: 0.18,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: () => true,
+    reference: "Standard rate, laundry and dry-cleaning services" },
+
+  // Extra bed — treated as part of the accommodation supply (same room,
+  // additional occupant), so it follows the room's own slab rather than
+  // a flat rate. Configurable per hotel if their CA classifies it as a
+  // separate service instead (see GST profile note in Storage settings).
+  { id: "XBED-ACC-2025", category: "extra_bed", sac: "9963", rate: null,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: () => true, followsAccommodation: true,
+    reference: "Treated as part of accommodation supply (SAC 9963)" },
+
+  // Cab / local transport arranged by the hotel for guests.
+  { id: "CAB-18-2025", category: "transport", sac: "996601", rate: 0.18,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: () => true,
+    reference: "Standard rate, rental services of passenger vehicles with operator" },
+
+  // Catch-all for anything not explicitly classified (misc services).
+  { id: "OTHER-18-2025", category: "other_services", sac: "9997", rate: 0.18,
+    effectiveFrom: "2025-09-22", effectiveTo: null,
+    condition: () => true,
+    reference: "Standard rate, other services not elsewhere classified" }
+];
+
+// Finds the applicable rule for a category on a given supply date. If a
+// hotel-level override is active for this exact rule id (see GST override
+// below), that rate is substituted but the rule's SAC/reference are kept
+// for the audit trail.
+function resolveGSTRule(category, ctx, supplyDate, overrides) {
+  const date = supplyDate || todayStr();
+  const candidates = GST_RULE_MASTER.filter(r =>
+    r.category === category &&
+    r.effectiveFrom <= date &&
+    (!r.effectiveTo || date <= r.effectiveTo)
+  );
+  let rule = candidates.find(r => r.condition(ctx || {})) || candidates[0];
+  if (!rule) {
+    // Nothing configured for this category/date — this must be visible,
+    // not silently taxed at some guessed rate.
+    return { id: null, category, sac: "", rate: 0, reference: "", unresolved: true };
+  }
+  if (rule.followsAccommodation) {
+    const accRule = resolveGSTRule("accommodation", ctx, date, overrides);
+    rule = { ...rule, rate: accRule.rate, _followedRuleId: accRule.id };
+  }
+  const ov = overrides && overrides[rule.id];
+  if (ov && typeof ov.rate === "number") {
+    return { ...rule, rate: ov.rate, overridden: true, overrideReason: ov.reason, overrideBy: ov.by };
+  }
+  return rule;
+}
+
 const isSpecifiedPremises = allRooms => (allRooms || []).some(r => (r.rate || 0) > 7500);
-const foodGSTRate = specified => specified ? 0.18 : 0.05;
+// Backward-compatible thin wrappers — several places outside calcBillGST
+// display an isolated rate (e.g. the check-in rate preview) without needing
+// the full rule object.
+const roomGSTRate = nightlyRate => resolveGSTRule("accommodation", { nightlyRate }).rate;
+const foodGSTRate = specified => resolveGSTRule("restaurant", { specifiedPremises: specified }).rate;
 const OTHER_SERVICES_GST_RATE = 0.18;
 // Common per-night rate points for the check-in "different rate for this
 // booking" dropdown — covers typical budget through premium Indian hotel
@@ -462,7 +618,11 @@ async function performOCRScan(photo, prompt, license, scanContext) {
       body: JSON.stringify({ image: b64, prompt, license, scanContext })
     });
     const sd = await sr.json();
-    if (sr.status === 403) {
+    if (sr.status === 503 && sd.error === "VERIFICATION_UNAVAILABLE") {
+      // Server genuinely could not verify (connectivity issue on its
+      // side), NOT a real license problem — must not be shown as one.
+      serverErrorMsg = sd.message || "License verify nahi ho paayi (network issue) — thodi der baad phir try karo.";
+    } else if (sr.status === 403) {
       licenseError = true;
       if (sd.error === "FEATURE_NOT_ENABLED") featureError = true;
     } else if (sr.ok && (sd.candidates || sd._groq)) {
@@ -550,19 +710,84 @@ async function performOCRScan(photo, prompt, license, scanContext) {
 // If not explicitly passed, reads the hotel's own saved preference — so
 // every existing call site keeps working unchanged and just picks up
 // whatever that hotel has configured in Profile settings.
+// Splits a combined GST amount into CGST+SGST halves (intra-state, the
+// default for a guest booking directly with a hotel in their own state)
+// paisa-accurately — SGST gets any odd rupee so CGST/SGST never mismatch
+// by more than the smallest currency unit, and CGST+SGST always sums back
+// to the original total exactly.
+// ── AMOUNT IN WORDS ──────────────────────────────────────────────
+// Indian numbering (lakh/crore, not million/billion) — required on a
+// proper GST tax invoice per Rule 46. Pure function, no dependency.
+const _ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+  "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+const _TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+function _threeDigitsToWords(n) {
+  let s = "";
+  if (n >= 100) { s += _ONES[Math.floor(n / 100)] + " Hundred "; n %= 100; }
+  if (n >= 20) { s += _TENS[Math.floor(n / 10)] + " "; n %= 10; }
+  if (n > 0) s += _ONES[n] + " ";
+  return s.trim();
+}
+function amountInWords(amount) {
+  let n = Math.round(Math.abs(amount || 0));
+  if (n === 0) return "Zero Rupees Only";
+  const crore = Math.floor(n / 10000000); n %= 10000000;
+  const lakh = Math.floor(n / 100000); n %= 100000;
+  const thousand = Math.floor(n / 1000); n %= 1000;
+  const hundred = n;
+  const parts = [];
+  if (crore) parts.push(_threeDigitsToWords(crore) + " Crore");
+  if (lakh) parts.push(_threeDigitsToWords(lakh) + " Lakh");
+  if (thousand) parts.push(_threeDigitsToWords(thousand) + " Thousand");
+  if (hundred) parts.push(_threeDigitsToWords(hundred));
+  return "Rupees " + parts.join(" ") + " Only";
+}
+
+function splitCgstSgst(totalGST) {
+  const half = Math.floor(totalGST / 2);
+  return { cgst: half, sgst: totalGST - half };
+}
+
 function calcBillGST(booking, roomObj, allRooms, gstMode) {
   // A COMPLETED (checked-out) booking's bill is a finalized financial
   // record — it must never change just because the hotel later flips its
-  // GST Extra ↔ GST Included setting, or a room's rate/category changes.
-  // Use exactly what was calculated and frozen at the moment of checkout.
+  // GST Extra ↔ GST Included setting, a room's rate/category changes, or
+  // the GST Rule Master gains a new rate. Use exactly what was calculated
+  // and frozen at the moment of checkout, citing the SAME rule ids that
+  // were resolved back then.
   if (booking.status === "checkedout" && booking.gstBreakdown && booking.grandTotal !== undefined) {
     const gb = booking.gstBreakdown;
+    const roomSplit2 = splitCgstSgst(gb.roomGST || 0);
+    const foodSplit2 = splitCgstSgst(gb.foodGST || 0);
+    const otherSplit2 = splitCgstSgst(gb.otherGST || 0);
     return {
       gstMode: gb.gstMode || "exclusive",
       roomAmt: gb.roomAmt ?? (booking.roomTotal || 0), roomGST: gb.roomGST || 0, roomGSTRate: gb.roomGSTRate || 0,
+      roomCGST: gb.roomCGST ?? roomSplit2.cgst, roomSGST: gb.roomSGST ?? roomSplit2.sgst, roomSAC: gb.roomSAC || "9963", roomRuleId: gb.roomRuleId || null,
       foodAmt: gb.foodAmt || 0, foodGST: gb.foodGST || 0, foodGSTRate: gb.foodGSTRate || 0,
+      foodCGST: gb.foodCGST ?? foodSplit2.cgst, foodSGST: gb.foodSGST ?? foodSplit2.sgst, foodSAC: gb.foodSAC || "996331", foodRuleId: gb.foodRuleId || null,
+      // Laundry/transport/extra-bed are frozen the same way. Bookings
+      // checked out BEFORE this split existed have no gb.laundryAmt etc,
+      // so they read as 0 here — their charges are still fully accounted
+      // for inside the (unchanged) otherAmt aggregate below, they're just
+      // not broken out into their own GST-summary line for old bills.
+      laundryAmt: gb.laundryAmt || 0, laundryGST: gb.laundryGST || 0, laundryGSTRate: gb.laundryGSTRate ?? 0.18,
+      laundryCGST: gb.laundryCGST || 0, laundrySGST: gb.laundrySGST || 0, laundrySAC: gb.laundrySAC || "999721", laundryRuleId: gb.laundryRuleId || null,
+      transportAmt: gb.transportAmt || 0, transportGST: gb.transportGST || 0, transportGSTRate: gb.transportGSTRate ?? 0.18,
+      transportCGST: gb.transportCGST || 0, transportSGST: gb.transportSGST || 0, transportSAC: gb.transportSAC || "996601", transportRuleId: gb.transportRuleId || null,
+      extraBedAmt: gb.extraBedAmt || 0, extraBedGST: gb.extraBedGST || 0, extraBedGSTRate: gb.extraBedGSTRate ?? 0,
+      extraBedCGST: gb.extraBedCGST || 0, extraBedSGST: gb.extraBedSGST || 0, extraBedSAC: gb.extraBedSAC || "9963", extraBedRuleId: gb.extraBedRuleId || null,
       otherAmt: gb.otherAmt || 0, otherGST: gb.otherGST || 0, otherGSTRate: gb.otherGSTRate ?? OTHER_SERVICES_GST_RATE,
-      subtotal: booking.subTotal ?? 0, totalGST: booking.gstAmt ?? 0, grandTotal: booking.grandTotal,
+      otherCGST: gb.otherCGST ?? otherSplit2.cgst, otherSGST: gb.otherSGST ?? otherSplit2.sgst, otherRuleId: gb.otherRuleId || null,
+      otherMiscAmt: gb.otherMiscAmt ?? gb.otherAmt ?? 0, otherMiscGST: gb.otherMiscGST ?? gb.otherGST ?? 0, otherMiscSAC: gb.otherMiscSAC || "9997",
+      subtotal: booking.subTotal ?? 0, totalGST: booking.gstAmt ?? 0,
+      totalCGST: gb.totalCGST ?? (roomSplit2.cgst + foodSplit2.cgst + otherSplit2.cgst),
+      totalSGST: gb.totalSGST ?? (roomSplit2.sgst + foodSplit2.sgst + otherSplit2.sgst),
+      totalIGST: gb.totalIGST || 0,
+      placeOfSupply: gb.placeOfSupply || null,
+      placeOfSupplyCode: gb.placeOfSupplyCode || null,
+      grandTotal: booking.grandTotal,
+      invoiceNo: booking.invoiceNo || null,
       specifiedPremises: isSpecifiedPremises(allRooms)
     };
   }
@@ -574,16 +799,44 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
   // reflects what the guest is really being charged.
   const nights = booking.checkIn && booking.checkOut ? nts(booking.checkIn, booking.checkOut) : 1;
   const nightlyRate = nights > 0 ? roomAmtRaw / nights : (roomObj?.rate || 0);
-  const rGstRate = roomGSTRate(nightlyRate);
-
   const specified = isSpecifiedPremises(allRooms);
-  const fGstRate = foodGSTRate(specified);
+  const supplyDate = booking.checkIn || todayStr();
+  const overrides = (CURRENT_PROFILE && CURRENT_PROFILE.gstOverrides) || null;
+  const hotelState = deriveStateFromGSTIN(CURRENT_PROFILE && CURRENT_PROFILE.hotelGstin);
+  const ruleCtx = { nightlyRate, specifiedPremises: specified };
 
-  let foodAmtRaw = 0, otherAmtRaw = 0;
+  const roomRule = resolveGSTRule("accommodation", ruleCtx, supplyDate, overrides);
+  const foodRule = resolveGSTRule("restaurant", ruleCtx, supplyDate, overrides);
+  const laundryRule = resolveGSTRule("laundry", ruleCtx, supplyDate, overrides);
+  const transportRule = resolveGSTRule("transport", ruleCtx, supplyDate, overrides);
+  const extraBedRule = resolveGSTRule("extra_bed", ruleCtx, supplyDate, overrides);
+  const otherRule = resolveGSTRule("other_services", ruleCtx, supplyDate, overrides);
+
+  let foodAmtRaw = 0, laundryAmtRaw = 0, transportAmtRaw = 0, extraBedAmtRaw = 0, otherAmtRaw = 0;
   (booking.charges || []).forEach(c => {
     const lineTotal = (c.price || 0) * (c.qty || 0);
-    if (c.cat === "🍛 Food" || c.cat === "☕ Beverages") foodAmtRaw += lineTotal;
-    else otherAmtRaw += lineTotal; // 🛎️ Services (laundry, extra bed, cab, etc.)
+    // Charges saved by older builds (and any future path that forgets to
+    // copy the category) carry no `cat`. Without a fallback those lines
+    // silently fell into "other services" and were taxed at 18% instead of
+    // the restaurant rate — the totals still added up, so the mistake was
+    // invisible on the bill while over-stating GST in the returns. Match
+    // the item name against the menu to recover the correct category.
+    let cat = c.cat;
+    if (cat !== "🍛 Food" && cat !== "☕ Beverages" && cat !== "🛎️ Services") {
+      const m = MENU.find(x => x.name === c.name);
+      if (m) cat = m.cat;
+    }
+    if (cat === "🍛 Food" || cat === "☕ Beverages") { foodAmtRaw += lineTotal; return; }
+    // Within "🛎️ Services", split further so each gets its OWN SAC/rate
+    // instead of everything being lumped into one "Other Services @ 18%"
+    // line — laundry, cab, and extra-bed each have their own GST
+    // treatment per the rule master, and a real GST audit expects them
+    // reported separately.
+    const sub = ITEM_SUBCATEGORY[c.name];
+    if (sub === "laundry") laundryAmtRaw += lineTotal;
+    else if (sub === "transport") transportAmtRaw += lineTotal;
+    else if (sub === "extra_bed") extraBedAmtRaw += lineTotal;
+    else otherAmtRaw += lineTotal; // genuinely uncategorized (e.g. Newspaper)
   });
 
   const splitInclusive = (amtRaw, rate) => {
@@ -593,23 +846,111 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
   const splitExclusive = (amtRaw, rate) => ({ base: amtRaw, gst: Math.round(amtRaw * rate) });
   const split = gstMode === "inclusive" ? splitInclusive : splitExclusive;
 
-  const roomSplit = split(roomAmtRaw, rGstRate);
-  const foodSplit = split(foodAmtRaw, fGstRate);
-  const otherSplit = split(otherAmtRaw, OTHER_SERVICES_GST_RATE);
+  const roomSplit = split(roomAmtRaw, roomRule.rate);
+  const foodSplit = split(foodAmtRaw, foodRule.rate);
+  const laundrySplit = split(laundryAmtRaw, laundryRule.rate);
+  const transportSplit = split(transportAmtRaw, transportRule.rate);
+  const extraBedSplit = split(extraBedAmtRaw, extraBedRule.rate);
+  const otherSplit = split(otherAmtRaw, otherRule.rate);
 
-  const subtotal = roomSplit.base + foodSplit.base + otherSplit.base;
-  const totalGST = roomSplit.gst + foodSplit.gst + otherSplit.gst;
+  const roomCgstSgst = splitCgstSgst(roomSplit.gst);
+  const foodCgstSgst = splitCgstSgst(foodSplit.gst);
+  const laundryCgstSgst = splitCgstSgst(laundrySplit.gst);
+  const transportCgstSgst = splitCgstSgst(transportSplit.gst);
+  const extraBedCgstSgst = splitCgstSgst(extraBedSplit.gst);
+  const otherCgstSgst = splitCgstSgst(otherSplit.gst);
+
+  // "otherAmt"/"otherGST"/etc are kept as the AGGREGATE of every non-room,
+  // non-food ancillary charge (laundry+transport+extra-bed+misc) — this is
+  // what older UI (and any future code) reading G.otherAmt still sees, so
+  // nothing that summed "food + other" for a total breaks. The granular
+  // per-service fields below are what the itemised GST summary uses.
+  const otherAmtAgg = laundrySplit.base + transportSplit.base + extraBedSplit.base + otherSplit.base;
+  const otherGSTAgg = laundrySplit.gst + transportSplit.gst + extraBedSplit.gst + otherSplit.gst;
+  const otherCgstAgg = laundryCgstSgst.cgst + transportCgstSgst.cgst + extraBedCgstSgst.cgst + otherCgstSgst.cgst;
+  const otherSgstAgg = laundryCgstSgst.sgst + transportCgstSgst.sgst + extraBedCgstSgst.sgst + otherCgstSgst.sgst;
+
+  const subtotal = roomSplit.base + foodSplit.base + otherAmtAgg;
+  const totalGST = roomSplit.gst + foodSplit.gst + otherGSTAgg;
   const grandTotal = subtotal + totalGST;
 
   return {
     gstMode,
-    roomAmt: roomSplit.base, roomGST: roomSplit.gst, roomGSTRate: rGstRate,
-    foodAmt: foodSplit.base, foodGST: foodSplit.gst, foodGSTRate: fGstRate,
-    otherAmt: otherSplit.base, otherGST: otherSplit.gst, otherGSTRate: OTHER_SERVICES_GST_RATE,
-    subtotal, totalGST, grandTotal,
+    roomAmt: roomSplit.base, roomGST: roomSplit.gst, roomGSTRate: roomRule.rate,
+    roomCGST: roomCgstSgst.cgst, roomSGST: roomCgstSgst.sgst, roomSAC: roomRule.sac, roomRuleId: roomRule.id,
+    foodAmt: foodSplit.base, foodGST: foodSplit.gst, foodGSTRate: foodRule.rate,
+    foodCGST: foodCgstSgst.cgst, foodSGST: foodCgstSgst.sgst, foodSAC: foodRule.sac, foodRuleId: foodRule.id,
+    laundryAmt: laundrySplit.base, laundryGST: laundrySplit.gst, laundryGSTRate: laundryRule.rate,
+    laundryCGST: laundryCgstSgst.cgst, laundrySGST: laundryCgstSgst.sgst, laundrySAC: laundryRule.sac, laundryRuleId: laundryRule.id,
+    transportAmt: transportSplit.base, transportGST: transportSplit.gst, transportGSTRate: transportRule.rate,
+    transportCGST: transportCgstSgst.cgst, transportSGST: transportCgstSgst.sgst, transportSAC: transportRule.sac, transportRuleId: transportRule.id,
+    extraBedAmt: extraBedSplit.base, extraBedGST: extraBedSplit.gst, extraBedGSTRate: extraBedRule.rate,
+    extraBedCGST: extraBedCgstSgst.cgst, extraBedSGST: extraBedCgstSgst.sgst, extraBedSAC: extraBedRule.sac, extraBedRuleId: extraBedRule.id,
+    otherAmt: otherAmtAgg, otherGST: otherGSTAgg, otherGSTRate: otherRule.rate,
+    otherCGST: otherCgstAgg, otherSGST: otherSgstAgg, otherRuleId: otherRule.id,
+    otherMiscAmt: otherSplit.base, otherMiscGST: otherSplit.gst, otherMiscSAC: otherRule.sac,
+    subtotal, totalGST,
+    totalCGST: roomCgstSgst.cgst + foodCgstSgst.cgst + otherCgstAgg,
+    totalSGST: roomCgstSgst.sgst + foodCgstSgst.sgst + otherSgstAgg,
+    // IGST is always 0 for the categories this app taxes — see the note
+    // above GST_STATE_CODES for why (place-of-supply = the hotel's own
+    // premises for accommodation/restaurant/ancillary services, which is
+    // always the same state the hotel itself is registered in). Kept as
+    // an explicit field, not omitted, so an invoice's tax table always has
+    // a place to show IGST if a future line item genuinely needs it.
+    totalIGST: 0,
+    placeOfSupply: hotelState ? hotelState.name : null,
+    placeOfSupplyCode: hotelState ? hotelState.code : null,
+    grandTotal,
     specifiedPremises: specified
   };
 }
+
+// ── GST INVOICE NUMBERING ────────────────────────────────────────
+// Format: INV/{FY-start}-{FY-end}/{6-digit sequence}, e.g. INV/25-26/000001.
+// Indian financial year runs 1 April – 31 March.
+function currentFinancialYear(d) {
+  const dt = d || new Date();
+  const y = dt.getFullYear();
+  const startY = (dt.getMonth() + 1) >= 4 ? y : y - 1; // month is 0-indexed
+  return `${String(startY).slice(-2)}-${String(startY + 1).slice(-2)}`;
+}
+
+// Generates the next sequential document number for the current financial
+// year under the given series prefix (e.g. "INV", "CN", "DN"). Uses a
+// Firestore transaction (not a plain read-then-write) so two staff acting
+// at the same moment on different devices can never receive the same
+// number — a read-then-write via the normal WS.get/set path has no such
+// guarantee. Each series (invoice/credit-note/debit-note) gets its own
+// independent counter. Falls back to a timestamp-suffixed number when
+// offline; still unique, just not perfectly sequential — matching how
+// offline POS systems generally behave, and far better than a collision.
+async function generateDocumentNumber(seriesPrefix) {
+  const fy = currentFinancialYear();
+  const counterKey = seriesPrefix.toLowerCase() + "Counter_" + fy;
+  if (window._db) {
+    try {
+      const ref = WS._ref(counterKey);
+      const next = await window._db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const current = (snap.exists && snap.data().value) || 0;
+        const n = current + 1;
+        tx.set(ref, { value: n });
+        return n;
+      });
+      try { localStorage.setItem(`ab_${counterKey}`, JSON.stringify(next)); } catch {}
+      return `${seriesPrefix}/${fy}/${String(next).padStart(6, "0")}`;
+    } catch (e) {
+      console.warn(seriesPrefix + " number transaction failed, using offline fallback:", e.message);
+    }
+  }
+  // Offline fallback — last 6 digits of the epoch-ms timestamp keeps it
+  // short while still being effectively unique per device.
+  const fallbackSeq = String(Date.now()).slice(-6);
+  return `${seriesPrefix}/${fy}/${fallbackSeq}*`; // trailing * marks an offline-issued number for later reconciliation
+}
+const generateInvoiceNumber = () => generateDocumentNumber("INV");
+const generateCreditNoteNumber = () => generateDocumentNumber("CN");
 
 // ── LICENSE EXPIRY CHECK — in-app reminder ──────────────────────
 // Reads this hotel's own license entry directly from Firestore (same
@@ -1247,6 +1588,18 @@ const MENU = [{
   name: "Newspaper",
   price: 10
 }];
+// Maps a "🛎️ Services" menu item's exact name to its GST sub-category, so
+// calcBillGST can tax each at ITS OWN rate/SAC instead of one blended
+// "Other Services @ 18%" line. Any item NOT listed here (including any
+// custom item a hotel adds later) falls through to "other_services" —
+// unclassified is always safer than mis-classified.
+const ITEM_SUBCATEGORY = {
+  "Laundry/piece": "laundry",
+  "Iron Service": "laundry", // pressing/ironing — same SAC family as laundry
+  "Cab (Local)": "transport",
+  "Extra Bed": "extra_bed"
+  // "Newspaper" deliberately absent — falls through to other_services.
+};
 const TYPE_META = {
   "Standard": {
     emoji: "🛏️",
@@ -1648,11 +2001,13 @@ function buildInvoicePDFBlob(b, roomObj) {
   String(RH.addr || "").split("\n").forEach(a => L.push({ text: a, size: 9, lh: 11 }));
   L.push({ text: "Phone: " + RH.phone + (RH.email ? "  |  " + RH.email : ""), size: 9, lh: 11 });
   if (RH.gstin) L.push({ text: "GSTIN: " + RH.gstin, size: 9, lh: 11 });
+  if (G.placeOfSupply) L.push({ text: "Place of Supply: " + G.placeOfSupply + (G.placeOfSupplyCode ? " (" + G.placeOfSupplyCode + ")" : ""), size: 9, lh: 11 });
   L.push({ text: "", rule: true, gap: 4, lh: 14 });
 
   L.push({ text: "TAX INVOICE", size: 14, bold: true, lh: 18 });
-  L.push({ text: "Invoice No: " + b.id, size: 10, lh: 0 });
+  L.push({ text: (b.invoiceNo ? "Invoice No: " + b.invoiceNo : "Booking Ref: " + b.id), size: 10, lh: 0 });
   L.push({ text: "Date: " + (b.checkOutActual || b.checkOut || ""), size: 10, align: "right" });
+  if (b.invoiceNo) L.push({ text: "Booking Ref: " + b.id, size: 8, lh: 12 });
 
   L.push({ text: "", gap: 4, lh: 10 });
   L.push({ text: "GUEST DETAILS", size: 10, bold: true, lh: 14 });
@@ -1696,14 +2051,25 @@ function buildInvoicePDFBlob(b, roomObj) {
 
   L.push({ text: "", rule: true, gap: 2, lh: 14 });
   row("Subtotal", String(G.subtotal));
-  if (G.roomAmt > 0 || G.roomGST > 0) {
-    row("Room GST @ " + Math.round(G.roomGSTRate * 100) + "%  (SAC 9963)", String(G.roomGST), { size: 9 });
-  } else {
-    row("Room GST (Nil-rated, tariff up to Rs.1000)", "0", { size: 9 });
-  }
-  if (G.foodAmt > 0) row("Food / Beverage GST @ " + Math.round(G.foodGSTRate * 100) + "%", String(G.foodGST), { size: 9 });
-  if (G.otherAmt > 0) row("Other Services GST @ 18%", String(G.otherGST), { size: 9 });
+  L.push({ text: "", rule: true, gap: 4, lh: 16 });
+
+  L.push({ text: "GST SUMMARY", size: 10, bold: true, lh: 14 });
+  const gstRow = (label, sac, taxable, cgst, sgst, total) => {
+    L.push({ text: label + "  (SAC " + sac + ")", size: 8.5, lh: 11 });
+    L.push({ text: "Taxable Rs." + taxable + "   CGST Rs." + cgst + "   SGST Rs." + sgst + "   Total Rs." + total,
+      size: 8.5, align: "right", lh: 13 });
+  };
+  if (G.roomAmt > 0) gstRow("Accommodation @ " + Math.round(G.roomGSTRate * 100) + "%", G.roomSAC, G.roomAmt, G.roomCGST, G.roomSGST, G.roomGST);
+  else L.push({ text: "Accommodation (Nil-rated, tariff up to Rs.1000)  (SAC " + G.roomSAC + ")", size: 8.5, lh: 13 });
+  if (G.foodAmt > 0) gstRow("Restaurant @ " + Math.round(G.foodGSTRate * 100) + "%", G.foodSAC, G.foodAmt, G.foodCGST, G.foodSGST, G.foodGST);
+  if (G.extraBedAmt > 0) gstRow("Extra Bed @ " + Math.round(G.extraBedGSTRate * 100) + "%", G.extraBedSAC, G.extraBedAmt, G.extraBedCGST, G.extraBedSGST, G.extraBedGST);
+  if (G.laundryAmt > 0) gstRow("Laundry @ " + Math.round(G.laundryGSTRate * 100) + "%", G.laundrySAC, G.laundryAmt, G.laundryCGST, G.laundrySGST, G.laundryGST);
+  if (G.transportAmt > 0) gstRow("Transport/Cab @ " + Math.round(G.transportGSTRate * 100) + "%", G.transportSAC, G.transportAmt, G.transportCGST, G.transportSGST, G.transportGST);
+  if (G.otherMiscAmt > 0) gstRow("Other Services @ " + Math.round(G.otherGSTRate * 100) + "%", G.otherMiscSAC, G.otherMiscAmt, G.otherCGST - (G.laundryCGST||0) - (G.transportCGST||0) - (G.extraBedCGST||0), G.otherSGST - (G.laundrySGST||0) - (G.transportSGST||0) - (G.extraBedSGST||0), G.otherMiscGST);
+  L.push({ text: "Total CGST Rs." + G.totalCGST + "   Total SGST Rs." + G.totalSGST + "   Total GST Rs." + G.totalGST,
+    size: 9, bold: true, lh: 14 });
   L.push({ text: "", rule: true, gap: 2, lh: 16 });
+  L.push({ text: "Amount in Words: " + amountInWords(G.grandTotal), size: 8.5, lh: 14 });
   row("GRAND TOTAL", "Rs. " + G.grandTotal, { size: 13, bold: true, lh: 18 });
   L.push({ text: "", rule: true, gap: 2, lh: 14 });
 
@@ -1781,9 +2147,9 @@ td{padding:9px 10px;border-bottom:1px solid #eee;font-size:13px}
   <button class="actbtn btn-share" onclick="shareInvoice()">📤 Share on WhatsApp</button>
 </div>
 <div class=top><div class=hn>🏨 ${escHtml(RH.name)}</div><div class=ht>${escHtml(RH.tagline)}</div>
-<div class=ha>${escHtml(RH.addr.replace(/\n/, " | "))} | ${escHtml(RH.phone)}<br>${RH.gstin ? "GSTIN: " + escHtml(RH.gstin) : ""}</div></div>
+<div class=ha>${escHtml(RH.addr.replace(/\n/, " | "))} | ${escHtml(RH.phone)}<br>${RH.gstin ? "GSTIN: " + escHtml(RH.gstin) : ""}${G.placeOfSupply ? "  |  Place of Supply: " + escHtml(G.placeOfSupply) + (G.placeOfSupplyCode ? " (" + escHtml(G.placeOfSupplyCode) + ")" : "") : ""}</div></div>
 <div class=meta><div><div class=it>TAX INVOICE</div>
-<div style="color:#888;font-size:12px;margin-top:4px">No: <b>${escHtml(b.id)}</b> | ${new Date().toLocaleString("en-IN")}</div></div>
+<div style="color:#888;font-size:12px;margin-top:4px">${b.invoiceNo ? `Invoice No: <b>${escHtml(b.invoiceNo)}</b><br>` : ""}Booking Ref: <b>${escHtml(b.id)}</b> | ${new Date().toLocaleString("en-IN")}</div></div>
 <div class=rb><div class=rbn>Room ${escHtml(b.roomId)}</div><div class=rbt>${escHtml(roomObj?.type || "")}</div></div></div>
 <div class=info>
 <div class=ib><div class=ibl>Guest</div><div class=ibv>${escHtml(b.name)}</div></div>
@@ -1802,11 +2168,19 @@ ${b.family.map((m, i) => `<div style="font-size:12px;color:#333;padding:3px 0">$
 <tr><td>Room ${escHtml(b.roomId)} — ${escHtml(roomObj?.type)} (${n} Night${n > 1 ? "s" : ""})</td><td align=center>${n}</td><td align=right>₹${escHtml(roomObj?.rate || 0)}/night</td><td align=right>₹${escHtml(b.roomTotal)}</td></tr>
 ${rows}
 <tr class=sr><td colspan=3>Subtotal</td><td align=right>₹${sub}</td></tr>
-${G.roomGST > 0 || G.roomAmt > 0 ? `<tr class=gr><td colspan=3>Room GST @ ${(G.roomGSTRate * 100).toFixed(0)}% (SAC 9963)</td><td align=right>₹${G.roomGST}</td></tr>` : `<tr class=gr><td colspan=3>Room GST (Nil-rated, tariff ≤ ₹1,000)</td><td align=right>₹0</td></tr>`}
-${G.foodAmt > 0 ? `<tr class=gr><td colspan=3>Food/Beverage GST @ ${(G.foodGSTRate * 100).toFixed(0)}%</td><td align=right>₹${G.foodGST}</td></tr>` : ""}
-${G.otherAmt > 0 ? `<tr class=gr><td colspan=3>Other Services GST @ 18%</td><td align=right>₹${G.otherGST}</td></tr>` : ""}
 <tr class=gt><td colspan=3>GRAND TOTAL</td><td align=right>₹${grand}</td></tr>
 </tbody></table>
+<div style="font-size:11px;color:#555;font-style:italic;margin:4px 0 10px">Amount in Words: ${escHtml(amountInWords(grand))}</div>
+<div style="margin:14px 0"><div style="font-size:11px;text-transform:uppercase;color:#888;font-weight:700;margin-bottom:6px">GST Summary</div>
+<table><thead><tr><th>Rate</th><th>SAC</th><th align=right>Taxable Value</th><th align=right>CGST</th><th align=right>SGST</th><th align=right>Total GST</th></tr></thead><tbody>
+${G.roomAmt > 0 ? `<tr><td>Accommodation @ ${(G.roomGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.roomSAC)}</td><td align=right>₹${G.roomAmt}</td><td align=right>₹${G.roomCGST}</td><td align=right>₹${G.roomSGST}</td><td align=right>₹${G.roomGST}</td></tr>` : ""}
+${G.foodAmt > 0 ? `<tr><td>Restaurant @ ${(G.foodGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.foodSAC)}</td><td align=right>₹${G.foodAmt}</td><td align=right>₹${G.foodCGST}</td><td align=right>₹${G.foodSGST}</td><td align=right>₹${G.foodGST}</td></tr>` : ""}
+${G.extraBedAmt > 0 ? `<tr><td>Extra Bed @ ${(G.extraBedGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.extraBedSAC)}</td><td align=right>₹${G.extraBedAmt}</td><td align=right>₹${G.extraBedCGST}</td><td align=right>₹${G.extraBedSGST}</td><td align=right>₹${G.extraBedGST}</td></tr>` : ""}
+${G.laundryAmt > 0 ? `<tr><td>Laundry @ ${(G.laundryGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.laundrySAC)}</td><td align=right>₹${G.laundryAmt}</td><td align=right>₹${G.laundryCGST}</td><td align=right>₹${G.laundrySGST}</td><td align=right>₹${G.laundryGST}</td></tr>` : ""}
+${G.transportAmt > 0 ? `<tr><td>Transport/Cab @ ${(G.transportGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.transportSAC)}</td><td align=right>₹${G.transportAmt}</td><td align=right>₹${G.transportCGST}</td><td align=right>₹${G.transportSGST}</td><td align=right>₹${G.transportGST}</td></tr>` : ""}
+${G.otherMiscAmt > 0 ? `<tr><td>Other Services @ ${(G.otherGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.otherMiscSAC)}</td><td align=right>₹${G.otherMiscAmt}</td><td align=right>₹${(G.otherCGST||0) - (G.laundryCGST||0) - (G.transportCGST||0) - (G.extraBedCGST||0)}</td><td align=right>₹${(G.otherSGST||0) - (G.laundrySGST||0) - (G.transportSGST||0) - (G.extraBedSGST||0)}</td><td align=right>₹${G.otherMiscGST}</td></tr>` : ""}
+<tr class=sr><td colspan=2>Total</td><td align=right>₹${sub}</td><td align=right>₹${G.totalCGST}</td><td align=right>₹${G.totalSGST}</td><td align=right>₹${gst}</td></tr>
+</tbody></table></div>
 <div style="font-size:10px;color:#999;margin-top:4px">GST as per rates effective 22 Sept 2025 (56th GST Council). Room slab based on ₹${roomObj?.rate || 0}/night tariff. ${G.gstMode === "inclusive" ? "Displayed rate is inclusive of GST." : "GST charged in addition to displayed rate."} ${b.status === "checkedout" ? "🔒 This is a completed bill — GST is locked at the rate/mode active when the guest checked out and will not change even if pricing settings are changed later." : "⏳ Guest still checked in — this bill uses your CURRENT pricing settings and will lock in only at checkout."}</div>
 <div class=ft><b style="font-size:16px;color:#1e3a5f">🙏 Thank you for staying with ${escHtml(RH.name)}!</b>
 <div>${escHtml(RH.phone)} | ${escHtml(RH.email)}</div>
@@ -1838,6 +2212,97 @@ const openInvoice = (b, roomObj) => {
   const w = window.open("", "_blank", "width=780,height=950");
   if (w) { w.document.write(buildInvoiceHTML(b, roomObj)); w.document.close(); }
 };
+
+// ── CREDIT NOTE ───────────────────────────────────────────────────
+// GST-compliant credit note: references the ORIGINAL invoice (never
+// modifies it), carries its own document number/series, and adjusts
+// taxable value + CGST/SGST proportionally to the amount being credited.
+// The proportional split uses the original bill's OWN GST-rate mix
+// (roomAmt/foodAmt/otherAmt proportions), not a single flat rate — a
+// partial credit on a mixed room+restaurant bill should reduce each
+// component in the same ratio it was originally taxed at, not silently
+// re-tax the credited amount at one rate.
+function computeCreditNoteSplit(booking, creditAmount) {
+  const gb = booking.gstBreakdown || {};
+  const grand = booking.grandTotal || 0;
+  if (grand <= 0) return { taxable: 0, cgst: 0, sgst: 0, ratio: 0 };
+  const ratio = Math.min(1, Math.max(0, creditAmount / grand));
+  const taxable = Math.round((booking.subTotal || 0) * ratio);
+  const cgst = Math.round((gb.totalCGST || 0) * ratio);
+  const sgst = Math.round((gb.totalSGST || 0) * ratio);
+  return { taxable, cgst, sgst, ratio };
+}
+
+async function createCreditNote(booking, roomObj, creditAmount, reason, issuedBy) {
+  if (!booking.invoiceNo) throw new Error("Is booking ka koi invoice number nahi hai — credit note sirf finalized (checked-out) invoice ke against issue ho sakta hai.");
+  if (!(creditAmount > 0) || creditAmount > booking.grandTotal) {
+    throw new Error("Credit amount ₹1 se ₹" + booking.grandTotal + " ke beech hona chahiye.");
+  }
+  if (!reason || !reason.trim()) throw new Error("Reason likhna zaroori hai — GST record ke liye.");
+
+  const split = computeCreditNoteSplit(booking, creditAmount);
+  const cnNumber = await generateCreditNoteNumber();
+  const note = {
+    id: "CN" + Date.now().toString(36).toUpperCase(),
+    cnNumber,
+    date: todayStr(),
+    originalBookingId: booking.id,
+    originalInvoiceNo: booking.invoiceNo,
+    originalInvoiceDate: booking.checkOutActual || booking.checkOut,
+    guestName: booking.name || "",
+    roomId: booking.roomId,
+    reason: reason.trim().slice(0, 300),
+    amount: creditAmount,
+    taxableValue: split.taxable,
+    cgst: split.cgst,
+    sgst: split.sgst,
+    issuedBy: issuedBy || "Owner",
+    createdAt: new Date().toISOString()
+  };
+  const existing = (await WS.get("creditNotes")) || [];
+  const updated = [...existing, note];
+  await WS.set("creditNotes", updated);
+  AuditLog.add("CREDIT_NOTE_ISSUED", cnNumber + " against " + booking.invoiceNo + " for Rs." + creditAmount + " — " + reason.trim().slice(0, 60));
+  return note;
+}
+
+function buildCreditNotePDFBlob(note, hotelProfile) {
+  const RH = {
+    name: (hotelProfile && hotelProfile.hotelName) || HOTEL.name,
+    addr: (hotelProfile && hotelProfile.hotelAddr) || HOTEL.addr,
+    phone: (hotelProfile && hotelProfile.hotelPhone) || HOTEL.phone,
+    gstin: (hotelProfile && hotelProfile.hotelGstin) || ""
+  };
+  const L = [];
+  const row = (label, amount, opts) => {
+    const o = opts || {};
+    L.push({ text: label, size: o.size || 10, bold: o.bold, lh: 0 });
+    L.push({ text: amount, size: o.size || 10, bold: o.bold, align: "right", lh: o.lh || 15 });
+  };
+  L.push({ text: RH.name, size: 18, bold: true, lh: 20 });
+  String(RH.addr || "").split("\n").forEach(a => L.push({ text: a, size: 9, lh: 11 }));
+  L.push({ text: "Phone: " + RH.phone + (RH.gstin ? "   GSTIN: " + RH.gstin : ""), size: 9, lh: 11 });
+  L.push({ text: "", rule: true, gap: 4, lh: 14 });
+  L.push({ text: "CREDIT NOTE", size: 14, bold: true, lh: 18 });
+  L.push({ text: "CN No: " + note.cnNumber, size: 10, lh: 0 });
+  L.push({ text: "Date: " + note.date, size: 10, align: "right" });
+  L.push({ text: "", gap: 6, lh: 10 });
+  L.push({ text: "Against Invoice: " + note.originalInvoiceNo, size: 10, lh: 13 });
+  L.push({ text: "Original Invoice Date: " + note.originalInvoiceDate, size: 10, lh: 13 });
+  L.push({ text: "Guest: " + note.guestName + "   Room: " + note.roomId, size: 10, lh: 13 });
+  L.push({ text: "Reason: " + note.reason, size: 9, lh: 16 });
+  L.push({ text: "", rule: true, gap: 4, lh: 16 });
+  row("Taxable Value Adjusted", String(note.taxableValue));
+  row("CGST Adjusted", String(note.cgst));
+  row("SGST Adjusted", String(note.sgst));
+  L.push({ text: "", rule: true, gap: 2, lh: 14 });
+  row("TOTAL CREDIT", "Rs. " + note.amount, { size: 13, bold: true, lh: 18 });
+  L.push({ text: "Amount in Words: " + amountInWords(note.amount), size: 8.5, lh: 14 });
+  L.push({ text: "", gap: 8 });
+  L.push({ text: "This credit note adjusts the original invoice named above. The original invoice itself remains unchanged.", size: 8, lh: 12 });
+  L.push({ text: "Issued by: " + note.issuedBy, size: 8, lh: 12 });
+  return buildSimplePDF(L);
+}
 
 // ── GLOBAL CSS ─────────────────────────────────────────────────
 const CSS = `
@@ -4281,7 +4746,7 @@ function CheckInView({
       let result = parseAadhaarQRText(qrText);
       if (result.format === "maybe_secure") result = await parseAadhaarSecureQR(result.raw);
       if (result.format === "unsupported") {
-        alert("Yeh naya \"Secure QR\" format hai — abhi support nahi hai. \"🔍 Read\" (AI scan) use karo.");
+        alert("QR mil gaya lekin data padha nahi gaya (corrupted ya browser support nahi karta). \"🔍 Read\" (AI scan) use karo.");
         return;
       }
       setFamily(f => f.map(mm => mm._id === member._id ? {
@@ -4644,7 +5109,7 @@ function CheckInView({
       let result = parseAadhaarQRText(qrText);
       if (result.format === "maybe_secure") result = await parseAadhaarSecureQR(result.raw);
       if (result.format === "unsupported") {
-        setScanMsg("⚠️ Yeh naya \"Secure QR\" format hai (2019+ cards) — abhi is format ka QR support nahi hai. \"🔍 Auto-fill from photo\" (AI scan) use karo.");
+        setScanMsg("⚠️ QR mil gaya lekin data padha nahi gaya (corrupted ya browser support nahi karta). \"🔍 Auto-fill from photo\" (AI scan) use karo.");
         return;
       }
       let count = 0;
@@ -7771,8 +8236,10 @@ function LocalRecordsSearch() {
 function StorageSettingsView({
   user,
   profile,
-  setModal
+  setModal,
+  saveProfile
 }) {
+  const [gstOverrideEdit, setGstOverrideEdit] = useState(null); // {ruleId, rate, reason}
   const [folderName, setFolderName] = useState(localStorage.getItem("ab_local_folder") || "");
   const [status, setStatus] = useState("");
   const [exportStatus, setExportStatus] = useState("");
@@ -8339,7 +8806,96 @@ function StorageSettingsView({
     style: { fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }
   }, "Form III khud portal (indianfrro.gov.in) par file karna hota hai — koi bhi software apne aap submit nahi kar sakta. Yeh sheet wahan bharne aur apne record ke liye hai."), exportStatus && /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
-  }, exportStatus)), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
+  }, exportStatus)), user?.role === "Owner" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff", border: "1px solid var(--border)", borderRadius: 12,
+      padding: 14, marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, fontSize: 13, color: "var(--navy)", marginBottom: 4 }
+  }, "⚖️ GST Rates"), /*#__PURE__*/React.createElement("div", {
+    style: { color: "var(--muted)", fontSize: 12, marginBottom: 10 }
+  }, "Har booking yehi rates automatically use karti hai. Sirf apne CA ki salah par yahan se badlo."),
+  /*#__PURE__*/React.createElement("div", null,
+    GST_RULE_MASTER
+      .filter(r => r.effectiveFrom <= todayStr() && (!r.effectiveTo || todayStr() <= r.effectiveTo) && !r.followsAccommodation)
+      .map(rule => {
+        const ov = (profile.gstOverrides || {})[rule.id];
+        const editing = gstOverrideEdit && gstOverrideEdit.ruleId === rule.id;
+        return /*#__PURE__*/React.createElement("div", {
+          key: rule.id,
+          style: { padding: "10px 0", borderBottom: "1px solid var(--border)" }
+        }, /*#__PURE__*/React.createElement("div", {
+          style: { display: "flex", justifyContent: "space-between", alignItems: "center" }
+        }, /*#__PURE__*/React.createElement("div", null,
+          /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, fontWeight: 700 } },
+            rule.category.replace("_", " "), " — SAC ", rule.sac),
+          /*#__PURE__*/React.createElement("div", { style: { fontSize: 10, color: "var(--muted)" } }, rule.reference)
+        ), /*#__PURE__*/React.createElement("div", {
+          style: { textAlign: "right" }
+        }, ov ? /*#__PURE__*/React.createElement("div", null,
+            /*#__PURE__*/React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: "#d97706" } },
+              (ov.rate * 100).toFixed(0) + "% (override)"),
+            /*#__PURE__*/React.createElement("div", { style: { fontSize: 9, color: "var(--muted)", textDecoration: "line-through" } },
+              (rule.rate * 100).toFixed(0) + "% default")
+          ) : /*#__PURE__*/React.createElement("div", { style: { fontSize: 13, fontWeight: 700 } },
+            (rule.rate * 100).toFixed(0) + "%"))),
+          !editing ? /*#__PURE__*/React.createElement("button", {
+            onClick: () => setGstOverrideEdit({ ruleId: rule.id, rate: String(((ov ? ov.rate : rule.rate) * 100)), reason: "" }),
+            style: { marginTop: 6, fontSize: 11, color: "#7c3aed", background: "none", border: "none", cursor: "pointer", padding: 0, fontWeight: 700 }
+          }, ov ? "✏️ Override edit karo" : "✏️ Override karo") : /*#__PURE__*/React.createElement("div", {
+            style: { marginTop: 8, background: "#fffbeb", borderRadius: 8, padding: 10 }
+          },
+            /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center", marginBottom: 6 } },
+              /*#__PURE__*/React.createElement("input", {
+                type: "number", step: "0.01", value: gstOverrideEdit.rate,
+                onChange: e => setGstOverrideEdit(v => ({ ...v, rate: e.target.value })),
+                style: { width: 70, padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)" }
+              }),
+              /*#__PURE__*/React.createElement("span", { style: { fontSize: 12 } }, "% rate")
+            ),
+            /*#__PURE__*/React.createElement("input", {
+              value: gstOverrideEdit.reason,
+              onChange: e => setGstOverrideEdit(v => ({ ...v, reason: e.target.value })),
+              placeholder: "Reason (zaroori — CA ka reference, waजह)",
+              style: { width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 6, border: "1px solid var(--border)", marginBottom: 8, fontSize: 12 }
+            }),
+            /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8 } },
+              /*#__PURE__*/React.createElement("button", {
+                onClick: () => setGstOverrideEdit(null),
+                style: { flex: 1, padding: "7px", borderRadius: 6, border: "1px solid var(--border)", background: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+              }, "Cancel"),
+              ov && /*#__PURE__*/React.createElement("button", {
+                onClick: async () => {
+                  const next = { ...(profile.gstOverrides || {}) };
+                  delete next[rule.id];
+                  await saveProfile({ ...profile, gstOverrides: next });
+                  AuditLog.add("GST_OVERRIDE_REMOVED", rule.id + " reverted to default " + (rule.rate * 100) + "%");
+                  setGstOverrideEdit(null);
+                },
+                style: { flex: 1, padding: "7px", borderRadius: 6, border: "1px solid #dc2626", background: "#fff", color: "#dc2626", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+              }, "Default pe wapas"),
+              /*#__PURE__*/React.createElement("button", {
+                onClick: async () => {
+                  const pct = parseFloat(gstOverrideEdit.rate);
+                  if (!Number.isFinite(pct) || pct < 0 || pct > 100) { alert("Valid rate (0-100) daalo."); return; }
+                  if (!gstOverrideEdit.reason.trim()) { alert("Reason likhna zaroori hai — audit ke liye."); return; }
+                  const newRate = pct / 100;
+                  const next = { ...(profile.gstOverrides || {}), [rule.id]: { rate: newRate, reason: gstOverrideEdit.reason.trim(), by: user?.name || "Owner", at: new Date().toISOString() } };
+                  await saveProfile({ ...profile, gstOverrides: next });
+                  AuditLog.add("GST_OVERRIDE_SET", rule.id + " " + (rule.rate * 100) + "%->" + (newRate * 100) + "% (" + gstOverrideEdit.reason.trim().slice(0, 60) + ")");
+                  setGstOverrideEdit(null);
+                },
+                style: { flex: 1.3, padding: "7px", borderRadius: 6, border: "none", background: "var(--gold)", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+              }, "Save")
+            )
+          )
+        );
+      })
+  ), /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 10, color: "var(--muted)", marginTop: 8, lineHeight: 1.5 }
+  }, "⚠️ Rate default se alag karna sirf tab karo jab aapke CA ne specifically bataya ho (jaise specified-premises declaration, ya koi notification jo abhi is app mein update nahi hui). Har change GST audit log mein record hoती hai.")
+  ), /*#__PURE__*/React.createElement(LocalRecordsSearch, null));
 }
 
 /* ── BOTTOM NAV ───────────────────────────────────────────────── */
@@ -8398,10 +8954,36 @@ function downloadCSV(csv, filename) {
 }
 
 // ── GUEST HISTORY — searchable across ALL bookings (checked-out too) ──
-function GuestHistoryView({ bookings, rooms }) {
+function GuestHistoryView({ bookings, rooms, profile, user }) {
   const [q, setQ] = useState("");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
+  const [cnFor, setCnFor] = useState(null); // booking id currently issuing a credit note against
+  const [cnAmount, setCnAmount] = useState("");
+  const [cnReason, setCnReason] = useState("");
+  const [cnBusy, setCnBusy] = useState(false);
+  const isOwner = !user || user.role === "Owner";
+
+  const submitCreditNote = async (booking, room) => {
+    setCnBusy(true);
+    try {
+      const amt = parseFloat(cnAmount);
+      if (!Number.isFinite(amt)) { alert("Valid amount daalo."); setCnBusy(false); return; }
+      const note = await createCreditNote(booking, room, amt, cnReason, user?.name);
+      const blob = buildCreditNotePDFBlob(note, profile);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = note.cnNumber.replace(/\//g, "-") + ".pdf";
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      alert("✅ Credit Note " + note.cnNumber + " issue ho gayi (Rs." + note.amount + "). PDF download ho gaya.");
+      setCnFor(null); setCnAmount(""); setCnReason("");
+    } catch (e) {
+      alert("❌ " + e.message);
+    } finally {
+      setCnBusy(false);
+    }
+  };
 
   const filtered = useMemo(() => {
     let list = bookings;
@@ -8511,6 +9093,42 @@ function GuestHistoryView({ bookings, rooms }) {
                 Array.isArray(b.family) && b.family.length > 0 && React.createElement("span", {
                   style: { background: "#eff6ff", color: "#3b82f6", padding: "2px 8px", borderRadius: 10, fontWeight: 700 }
                 }, "\uD83D\uDC65 +" + b.family.length + " (Total: " + (1 + b.family.length) + ")")
+              ),
+              isOwner && b.status === "checkedout" && b.invoiceNo && React.createElement("div", { style: { marginTop: 8 } },
+                cnFor !== b.id
+                  ? React.createElement("button", {
+                      onClick: () => { setCnFor(b.id); setCnAmount(String(grand)); setCnReason(""); },
+                      style: { fontSize: 11, fontWeight: 700, color: "#dc2626", background: "none", border: "none", cursor: "pointer", padding: 0 }
+                    }, "🧾 Credit Note issue karo")
+                  : React.createElement("div", { style: { background: "#fef2f2", borderRadius: 10, padding: 10, marginTop: 4 } },
+                      React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#dc2626", marginBottom: 6 } },
+                        "Credit Note against " + b.invoiceNo),
+                      React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 6 } },
+                        React.createElement("input", {
+                          type: "number", value: cnAmount, onChange: e => setCnAmount(e.target.value),
+                          placeholder: "Amount", max: grand,
+                          style: { width: 100, padding: "6px 8px", borderRadius: 6, border: "1px solid #fca5a5", fontSize: 12 }
+                        }),
+                        React.createElement("span", { style: { fontSize: 10, color: "var(--muted)", alignSelf: "center" } }, "of ₹" + grand + " max")
+                      ),
+                      React.createElement("input", {
+                        value: cnReason, onChange: e => setCnReason(e.target.value),
+                        placeholder: "Reason (zaroori — cancellation, discount, error correction, etc.)",
+                        style: { width: "100%", boxSizing: "border-box", padding: "6px 8px", borderRadius: 6, border: "1px solid #fca5a5", fontSize: 12, marginBottom: 8 }
+                      }),
+                      React.createElement("div", { style: { display: "flex", gap: 8 } },
+                        React.createElement("button", {
+                          onClick: () => { setCnFor(null); setCnAmount(""); setCnReason(""); },
+                          disabled: cnBusy,
+                          style: { flex: 1, padding: "7px", borderRadius: 6, border: "1px solid var(--border)", background: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+                        }, "Cancel"),
+                        React.createElement("button", {
+                          onClick: () => submitCreditNote(b, room),
+                          disabled: cnBusy,
+                          style: { flex: 1.4, padding: "7px", borderRadius: 6, border: "none", background: "#dc2626", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+                        }, cnBusy ? "⏳ Issuing..." : "✅ Confirm & Download")
+                      )
+                    )
               )
             );
           })
@@ -9422,6 +10040,7 @@ function App() {
     const gst = G.totalGST;
     const grand = G.grandTotal;
     const now = new Date();
+    const invoiceNo = await generateInvoiceNumber();
     const ub = {
       ...b,
       status: "checkedout",
@@ -9434,10 +10053,23 @@ function App() {
       grandTotal: grand,
       subTotal: sub,
       gstAmt: gst,
+      invoiceNo,
       gstBreakdown: {
         roomAmt: G.roomAmt, roomGST: G.roomGST, roomGSTRate: G.roomGSTRate,
+        roomCGST: G.roomCGST, roomSGST: G.roomSGST, roomSAC: G.roomSAC, roomRuleId: G.roomRuleId,
         foodAmt: G.foodAmt, foodGST: G.foodGST, foodGSTRate: G.foodGSTRate,
+        foodCGST: G.foodCGST, foodSGST: G.foodSGST, foodSAC: G.foodSAC, foodRuleId: G.foodRuleId,
+        laundryAmt: G.laundryAmt, laundryGST: G.laundryGST, laundryGSTRate: G.laundryGSTRate,
+        laundryCGST: G.laundryCGST, laundrySGST: G.laundrySGST, laundrySAC: G.laundrySAC, laundryRuleId: G.laundryRuleId,
+        transportAmt: G.transportAmt, transportGST: G.transportGST, transportGSTRate: G.transportGSTRate,
+        transportCGST: G.transportCGST, transportSGST: G.transportSGST, transportSAC: G.transportSAC, transportRuleId: G.transportRuleId,
+        extraBedAmt: G.extraBedAmt, extraBedGST: G.extraBedGST, extraBedGSTRate: G.extraBedGSTRate,
+        extraBedCGST: G.extraBedCGST, extraBedSGST: G.extraBedSGST, extraBedSAC: G.extraBedSAC, extraBedRuleId: G.extraBedRuleId,
         otherAmt: G.otherAmt, otherGST: G.otherGST, otherGSTRate: G.otherGSTRate,
+        otherCGST: G.otherCGST, otherSGST: G.otherSGST, otherRuleId: G.otherRuleId,
+        otherMiscAmt: G.otherMiscAmt, otherMiscGST: G.otherMiscGST, otherMiscSAC: G.otherMiscSAC,
+        totalCGST: G.totalCGST, totalSGST: G.totalSGST, totalIGST: G.totalIGST,
+        placeOfSupply: G.placeOfSupply, placeOfSupplyCode: G.placeOfSupplyCode,
         gstMode: G.gstMode
       }
     };
@@ -9698,7 +10330,9 @@ function App() {
     setModal: setModal
   }), view === "history" && /*#__PURE__*/React.createElement(GuestHistoryView, {
     bookings: bookings,
-    rooms: rooms
+    rooms: rooms,
+    profile: profile,
+    user: user
   }), view === "docs" && /*#__PURE__*/React.createElement(DocumentsView, {
     bookings: bookings,
     rooms: rooms
@@ -9740,7 +10374,8 @@ function App() {
   })), view === "storage" && /*#__PURE__*/React.createElement(StorageSettingsView, {
     user: user,
     profile: profile,
-    setModal: setModal
+    setModal: setModal,
+    saveProfile: saveProfile
   }), view === "access" && user?.role === "Owner" && hasFeature("roles") && /*#__PURE__*/React.createElement(AccessControlView, {
     permissions: permissions,
     savePermissions: savePermissions,

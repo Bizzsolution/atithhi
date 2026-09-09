@@ -37,7 +37,14 @@ async function checkFirestoreLicense(licenseUpper) {
   try {
     const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin/licenses`;
     const r = await fetch(url);
-    if (!r.ok) return { found: false };
+    // A non-OK HTTP response means we genuinely COULDN'T check — this is
+    // different from checking and finding the key absent. Collapsing both
+    // into the same "found: false" shape (as before) meant a transient
+    // Firestore hiccup got reported to the guest-facing app as "your
+    // license is invalid, contact support" instead of "try again in a
+    // moment" — the earlier code below now relies on this `error` flag to
+    // tell the two apart.
+    if (!r.ok) return { found: false, error: true };
     const doc = await r.json();
     const values = doc?.fields?.list?.arrayValue?.values || [];
     for (const v of values) {
@@ -110,6 +117,16 @@ export async function handler(event) {
 
     if (!valid && expired) {
       return { statusCode: 403, headers, body: JSON.stringify({ error: "EXPIRED_LICENSE", message: "License expired. Please renew." }) };
+    }
+    // Only say "invalid" when we ACTUALLY checked the live list and the
+    // key genuinely wasn't on it. If Firestore couldn't be reached (and
+    // the static env-var fallback — which normally only has a handful of
+    // legacy/manually-added keys — also doesn't have this key, which is
+    // the common case for any key generated later through the admin
+    // panel), we don't know either way: this is a connectivity problem,
+    // not evidence the license is bad, so it must not be reported as one.
+    if (!valid && fsResult.error && !envResult.found) {
+      return { statusCode: 503, headers, body: JSON.stringify({ error: "VERIFICATION_UNAVAILABLE", message: "Could not verify license right now — internet/server issue, not your license. Try again in a moment." }) };
     }
     if (!valid) {
       return { statusCode: 403, headers, body: JSON.stringify({ error: "INVALID_LICENSE", message: "Invalid license key. Contact support." }) };
