@@ -906,6 +906,77 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
   };
 }
 
+// Per-line-item tax breakdown for the invoice's itemised table (one row
+// per charge, each showing its OWN taxable value + CGST + SGST) — this is
+// what a proper GST tax invoice under Rule 46 is expected to show, rather
+// than only a category-level summary. Deliberately built ON TOP OF
+// calcBillGST rather than re-resolving rates independently: G already
+// carries the correct rate for each category (live-resolved for an active
+// booking, or exactly what was frozen at checkout for a completed one),
+// so every line here is guaranteed to use the SAME rate as the category
+// totals shown elsewhere on the invoice and in GST exports — there is no
+// second, divergent place a rate could go wrong.
+// Note: summing these rounded per-line CGST/SGST will not always exactly
+// equal G's own aggregate CGST/SGST (independent per-line rounding vs.
+// category-level rounding can differ by ±1 on a handful of paise) — this
+// is normal, expected behaviour on real GST invoices with multiple line
+// items, and the invoice's own GRAND TOTAL always uses G's authoritative
+// aggregate, never a re-sum of the displayed per-line figures.
+function buildTaxedLineItems(booking, roomObj, allRooms) {
+  const G = calcBillGST(booking, roomObj, allRooms);
+  const splitInclusive = (amtRaw, rate) => {
+    const base = amtRaw / (1 + rate);
+    return { base: Math.round(base), gst: Math.round(amtRaw - base) };
+  };
+  const splitExclusive = (amtRaw, rate) => ({ base: amtRaw, gst: Math.round(amtRaw * rate) });
+  const split = G.gstMode === "inclusive" ? splitInclusive : splitExclusive;
+
+  const lines = [];
+  const roomLineTotal = booking.roomTotal || 0;
+  if (roomLineTotal > 0) {
+    const s = split(roomLineTotal, G.roomGSTRate);
+    const cs = splitCgstSgst(s.gst);
+    const nights = booking.checkIn && booking.checkOut ? nts(booking.checkIn, booking.checkOut) : 1;
+    lines.push({
+      date: booking.checkIn || "", desc: "Room " + (booking.roomId || "") + (roomObj?.type ? " — " + roomObj.type : "") + " (" + nights + "N)",
+      // "total" is what the guest actually pays for this line — that is
+      // ALWAYS base+tax (s.base + s.gst), not the raw input amount. In
+      // inclusive mode those are numerically the same as the raw amount
+      // (tax was already embedded in it), but in exclusive mode the raw
+      // amount is the PRE-tax base only — the payable total is base+tax
+      // on top of it. Using the raw amount directly here would silently
+      // under-state every line's total by its own tax amount whenever
+      // the hotel uses exclusive pricing.
+      sac: G.roomSAC, rate: G.roomGSTRate, taxable: s.base, cgst: cs.cgst, sgst: cs.sgst, total: s.base + s.gst
+    });
+  }
+  (booking.charges || []).forEach(c => {
+    const lineTotal = (c.price || 0) * (c.qty || 0);
+    if (lineTotal <= 0) return;
+    let cat = c.cat;
+    if (cat !== "🍛 Food" && cat !== "☕ Beverages" && cat !== "🛎️ Services") {
+      const m = MENU.find(x => x.name === c.name);
+      if (m) cat = m.cat;
+    }
+    let rate, sac;
+    if (cat === "🍛 Food" || cat === "☕ Beverages") { rate = G.foodGSTRate; sac = G.foodSAC; }
+    else {
+      const sub = ITEM_SUBCATEGORY[c.name];
+      if (sub === "laundry") { rate = G.laundryGSTRate; sac = G.laundrySAC; }
+      else if (sub === "transport") { rate = G.transportGSTRate; sac = G.transportSAC; }
+      else if (sub === "extra_bed") { rate = G.extraBedGSTRate; sac = G.extraBedSAC; }
+      else { rate = G.otherGSTRate; sac = G.otherMiscSAC; }
+    }
+    const s = split(lineTotal, rate);
+    const cs = splitCgstSgst(s.gst);
+    lines.push({
+      date: booking.checkIn || "", desc: c.name + (c.qty > 1 ? " x" + c.qty : ""),
+      sac, rate, taxable: s.base, cgst: cs.cgst, sgst: cs.sgst, total: s.base + s.gst
+    });
+  });
+  return { lines, G };
+}
+
 // ── GST INVOICE NUMBERING ────────────────────────────────────────
 // Format: INV/{FY-start}-{FY-end}/{6-digit sequence}, e.g. INV/25-26/000001.
 // Indian financial year runs 1 April – 31 March.
@@ -1770,6 +1841,30 @@ const compressImg = (dataUrl, maxW = 600) => new Promise((res, rej) => {
   img.onerror = rej;
   img.src = dataUrl;
 });
+// A SEPARATE, much higher-quality resize used ONLY as the source image for
+// AI text-reading (name/DOB/address/ID-number extraction) and photo-based
+// QR decoding — never for what gets stored. compressImg's 600px/65%-quality
+// output was built to keep localStorage usage small for the image that
+// persists on the device, but that SAME heavily-degraded copy was also
+// being handed to the OCR/QR reader as its only source: at 600px, fine
+// print (a name in a modest font, the 12-digit number, dense QR modules)
+// blurs into ambiguous shapes, which is what actually caused misreads like
+// "Manoj" coming back as "Sanoj" — the model was reading a genuinely
+// blurry image, not making an arbitrary mistake. 1800px at 92% quality
+// keeps text and QR modules sharp while still being a modest upload size.
+const compressForScan = (dataUrl, maxW = 1800) => new Promise((res, rej) => {
+  const img = new Image();
+  img.onload = () => {
+    const sc = Math.min(1, maxW / Math.max(img.width, img.height, 1));
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.width * sc);
+    c.height = Math.round(img.height * sc);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    res(c.toDataURL("image/jpeg", 0.92));
+  };
+  img.onerror = rej;
+  img.src = dataUrl;
+});
 
 // ── DUAL STORAGE (window.storage primary + localStorage backup) ─
 // ── STORAGE: Firebase Firestore PRIMARY + localStorage cache ────────
@@ -1783,10 +1878,12 @@ const WS = {
     return window._db.collection("hotels").doc(this._hid()).collection("data").doc(k);
   },
   // GET: localStorage (instant) → Firestore (sync if stale)
-  async get(k) {
+  async get(k, forceServer) {
     try {
-      const v = localStorage.getItem(`ab_${k}`);
-      if (v) return JSON.parse(v);
+      if (!forceServer) {
+        const v = localStorage.getItem(`ab_${k}`);
+        if (v) return JSON.parse(v);
+      }
     } catch {}
     try {
       const ref = this._ref(k);
@@ -1931,37 +2028,85 @@ function buildSimplePDF(lines) {
   const esc = t => String(t).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
   const toWinAnsi = t => String(t)
     .replace(/[₹]/g, "Rs.")
+    .replace(/[—–]/g, "-")
+    .replace(/[·•]/g, "-")
+    .replace(/[’‘]/g, "'")
+    .replace(/[“”]/g, '"')
     .replace(/[^\x20-\x7E]/g, "");
-  let y = 800;
-  let content = "";
+  const TOP = 812, BOTTOM = 40;
+  let y = TOP;
+  const pages = [""];
+  let cur = 0;
+  const newPage = () => { pages.push(""); cur++; y = TOP; };
+
   lines.forEach(ln => {
     const text = toWinAnsi(ln.text || "");
     const size = ln.size || 10;
     const font = ln.bold ? "/F2" : "/F1";
-    if (ln.gap) { y -= ln.gap; }
+    // lh:0 must mean "stay on this line" (used to pair a label with its
+    // right-aligned value on the same row) — `||` treats 0 as falsy and
+    // silently falls through to the default spacing instead, which was
+    // quietly misaligning every label/value pair in this document (Room
+    // charges, Subtotal, GRAND TOTAL, Received by, Round Off, Net Amount,
+    // and the BILLING DETAILS pairs) onto separate lines.
+    const lh = ln.lh !== undefined ? ln.lh : (ln.size ? ln.size + 5 : 15);
+
+    // Apply this line's own gap first, THEN check whether we've run out
+    // of room on the current page — if so, start a fresh page before
+    // drawing anything. A single-page-only layout (the earlier version)
+    // clamped every line to the bottom margin once content ran long
+    // (many charges, a foreign-guest section, a long GST summary), which
+    // piled several lines on top of each other instead of overflowing
+    // onto a second page.
+    if (ln.gap) y -= ln.gap;
+    if (y < BOTTOM) newPage();
+
     if (text) {
       const x = ln.x || 50;
       if (ln.align === "right") {
         // Helvetica average width ≈ 0.5em; good enough for column alignment
         const w = text.length * size * 0.5;
-        content += `BT ${font} ${size} Tf ${Math.round(545 - w)} ${y} Td (${esc(text)}) Tj ET\n`;
+        pages[cur] += `BT ${font} ${size} Tf ${Math.round(545 - w)} ${y} Td (${esc(text)}) Tj ET\n`;
       } else {
-        content += `BT ${font} ${size} Tf ${x} ${y} Td (${esc(text)}) Tj ET\n`;
+        pages[cur] += `BT ${font} ${size} Tf ${x} ${y} Td (${esc(text)}) Tj ET\n`;
       }
     }
     if (ln.rule) {
-      content += `0.8 w 50 ${y - 4} m 545 ${y - 4} l S\n`;
+      pages[cur] += `0.8 w 50 ${y - 4} m 545 ${y - 4} l S\n`;
     }
-    y -= (ln.lh || (ln.size ? ln.size + 5 : 15));
-    if (y < 50) y = 50;
+    // Vertical grid lines (used for bordered tables) — an array of
+    // x-positions, each drawn from the current line's y down through
+    // ln.vlineHeight (defaults to this line's own lh), so a caller can
+    // draw one table row's cell borders alongside that row's text.
+    if (ln.vlines) {
+      const vTop = y + (ln.vlineTopPad || 2);
+      const vBottom = y - (ln.vlineHeight !== undefined ? ln.vlineHeight : lh) + 2;
+      ln.vlines.forEach(vx => {
+        pages[cur] += `0.7 w ${vx} ${vTop} m ${vx} ${vBottom} l S\n`;
+      });
+    }
+    y -= lh;
   });
+
+  const numPages = pages.length;
+  const pageObjStart = 3;
+  const contentObjStart = pageObjStart + numPages;
+  const fontObjStart = contentObjStart + numPages;
+
   const objs = [];
+  const kids = [];
+  for (let i = 0; i < numPages; i++) {
+    const pageId = pageObjStart + i;
+    const contentId = contentObjStart + i;
+    kids.push(`${pageId} 0 R`);
+    objs[pageId] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontObjStart} 0 R /F2 ${fontObjStart + 1} 0 R >> >> /Contents ${contentId} 0 R >>`;
+    objs[contentId] = `<< /Length ${pages[i].length} >>\nstream\n${pages[i]}endstream`;
+  }
   objs[1] = "<< /Type /Catalog /Pages 2 0 R >>";
-  objs[2] = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
-  objs[3] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>";
-  objs[4] = `<< /Length ${content.length} >>\nstream\n${content}endstream`;
-  objs[5] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
-  objs[6] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>";
+  objs[2] = `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${numPages} >>`;
+  objs[fontObjStart] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+  objs[fontObjStart + 1] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>";
+
   let pdf = "%PDF-1.4\n";
   const offsets = [];
   for (let i = 1; i < objs.length; i++) {
@@ -1977,11 +2122,10 @@ function buildSimplePDF(lines) {
   const bytes = new Uint8Array(pdf.length);
   for (let i = 0; i < pdf.length; i++) bytes[i] = pdf.charCodeAt(i) & 0xFF;
   return new Blob([bytes], { type: "application/pdf" });
-}
-
-function buildInvoicePDFBlob(b, roomObj) {
+}function buildInvoicePDFBlob(b, roomObj) {
   const n = nts(b.checkIn, b.checkOut);
-  const G = calcBillGST(b, roomObj, CURRENT_ROOMS);
+  const { lines: taxedLines, G } = buildTaxedLineItems(b, roomObj, CURRENT_ROOMS);
+  const igstTotal = G.totalIGST || 0;
   const RH = {
     name: CURRENT_PROFILE.hotelName || HOTEL.name,
     addr: CURRENT_PROFILE.hotelAddr || HOTEL.addr,
@@ -1997,23 +2141,24 @@ function buildInvoicePDFBlob(b, roomObj) {
     L.push({ text: amount, size: o.size || 10, bold: o.bold, align: "right", lh: o.lh || 15 });
   };
 
+  // ── Header ──
   L.push({ text: RH.name, size: 18, bold: true, lh: 20 });
+  if (RH.tagline) L.push({ text: RH.tagline, size: 9, lh: 12 });
   String(RH.addr || "").split("\n").forEach(a => L.push({ text: a, size: 9, lh: 11 }));
-  L.push({ text: "Phone: " + RH.phone + (RH.email ? "  |  " + RH.email : ""), size: 9, lh: 11 });
-  if (RH.gstin) L.push({ text: "GSTIN: " + RH.gstin, size: 9, lh: 11 });
+  L.push({ text: "Phone: " + RH.phone + (RH.gstin ? "   GSTIN: " + RH.gstin : ""), size: 9, lh: 11 });
   if (G.placeOfSupply) L.push({ text: "Place of Supply: " + G.placeOfSupply + (G.placeOfSupplyCode ? " (" + G.placeOfSupplyCode + ")" : ""), size: 9, lh: 11 });
   L.push({ text: "", rule: true, gap: 4, lh: 14 });
 
-  L.push({ text: "TAX INVOICE", size: 14, bold: true, lh: 18 });
-  L.push({ text: (b.invoiceNo ? "Invoice No: " + b.invoiceNo : "Booking Ref: " + b.id), size: 10, lh: 0 });
-  L.push({ text: "Date: " + (b.checkOutActual || b.checkOut || ""), size: 10, align: "right" });
-  if (b.invoiceNo) L.push({ text: "Booking Ref: " + b.id, size: 8, lh: 12 });
+  L.push({ text: "TAX INVOICE", size: 15, bold: true, lh: 0 });
+  L.push({ text: (b.invoiceNo ? "Bill No: " + b.invoiceNo : "Reg No: " + b.id), size: 9, align: "right", lh: 12 });
+  L.push({ text: "Reg No: " + b.id, size: 8, lh: 0 });
+  L.push({ text: (b.status === "checkedout" ? "Settled" : "In-House") + "  ·  " + (b.checkOutActual || todayStr()), size: 8, align: "right", lh: 16 });
 
-  L.push({ text: "", gap: 4, lh: 10 });
-  L.push({ text: "GUEST DETAILS", size: 10, bold: true, lh: 14 });
-  L.push({ text: "Name: " + (b.name || ""), size: 10, lh: 13 });
-  if (b.mobile) L.push({ text: "Mobile: " + b.mobile, size: 10, lh: 13 });
-  if (b.address) L.push({ text: "Address: " + b.address, size: 9, lh: 13 });
+  // ── Guest / Room / Billing meta (3-column feel via left/right pairs) ──
+  L.push({ text: "GUEST DETAILS", size: 9.5, bold: true, lh: 12 });
+  L.push({ text: (b.name || ""), size: 10, bold: true, lh: 12 });
+  if (b.mobile) L.push({ text: b.mobile, size: 9, lh: 11 });
+  if (b.address) L.push({ text: b.address, size: 9, lh: 11 });
   const idLabel = b.docType || "Aadhaar Card";
   const idVal = (b.docType && b.docType !== "Aadhaar Card") ? (b.aadhaar || "") : maskAadhaar(b.aadhaar);
   if (idVal) L.push({ text: idLabel + ": " + idVal, size: 9, lh: 13 });
@@ -2027,63 +2172,95 @@ function buildInvoicePDFBlob(b, roomObj) {
       (m.relation ? " (" + m.relation + ")" : "")).join(", "), size: 9, lh: 13 });
   }
 
-  L.push({ text: "", gap: 4, lh: 10 });
-  L.push({ text: "STAY DETAILS", size: 10, bold: true, lh: 14 });
-  L.push({ text: "Room: " + b.roomId + (roomObj && roomObj.type ? "  (" + roomObj.type + ")" : "") +
-    "   Guests: " + (b.adults || 1) + " adult(s)" +
-    (Number(b.children) ? ", " + b.children + " child" : ""), size: 10, lh: 13 });
-  L.push({ text: "Check-In:  " + (b.checkIn || "") + "  " + (b.checkInTime || ""), size: 10, lh: 13 });
-  L.push({ text: "Check-Out: " + (b.checkOutActual || b.checkOut || "") + "  " +
-    (b.checkOutActualTime || b.checkOutTime || "") + "   |   Nights: " + n, size: 10, lh: 13 });
-  if (b.purpose) L.push({ text: "Purpose: " + b.purpose, size: 9, lh: 13 });
+  L.push({ text: "", gap: 3, lh: 10 });
+  const payMode = b.paymentMode || (b.status === "checkedout" ? "Cash" : "-");
+  L.push({ text: "Room / Type: " + b.roomId + (roomObj?.type ? " - " + roomObj.type : ""), size: 9, lh: 0 });
+  L.push({ text: "Plan Type: EP", size: 9, align: "right", lh: 12 });
+  L.push({ text: "No. Of Pax: " + (Number(b.adults || 1) + Number(b.children || 0)), size: 9, lh: 0 });
+  L.push({ text: "Pay Mode: " + payMode, size: 9, align: "right", lh: 12 });
+  L.push({ text: "Arrival: " + (b.checkIn || "") + " " + (b.checkInTime || ""), size: 9, lh: 0 });
+  L.push({ text: "Departure: " + (b.checkOutActual || b.checkOut || "") + " " + (b.checkOutActualTime || b.checkOutTime || ""), size: 9, align: "right", lh: 12 });
+  L.push({ text: "Rack Rate: Rs." + (roomObj?.rate || 0) + "/night", size: 9, lh: 0 });
+  L.push({ text: "Charge Rate: Rs." + (n > 0 ? Math.round((b.roomTotal || 0) / n) : 0) + "/night", size: 9, align: "right", lh: 12 });
+  const rackTotal = (roomObj?.rate || 0) * n;
+  const discAmt = rackTotal - (b.roomTotal || 0);
+  if (discAmt > 0) {
+    const discPct = rackTotal > 0 ? (discAmt / rackTotal * 100) : 0;
+    L.push({ text: "Discount: Rs." + discAmt + " (" + discPct.toFixed(1) + "%)", size: 9, lh: 13 });
+  }
 
-  L.push({ text: "", rule: true, gap: 6, lh: 16 });
-  L.push({ text: "PARTICULARS", size: 10, bold: true, lh: 0 });
-  L.push({ text: "AMOUNT (Rs.)", size: 10, bold: true, align: "right", lh: 6 });
-  L.push({ text: "", rule: true, gap: 0, lh: 14 });
-
-  row("Room charges  (" + n + " night" + (n > 1 ? "s" : "") + " @ Rs." +
-      ((roomObj && roomObj.rate) || 0) + "/night)", String(b.roomTotal || 0));
-  (b.charges || []).forEach(c => {
-    row((c.name || "") + "   x" + (c.qty || 0) + " @ Rs." + (c.price || 0),
-        String((c.price || 0) * (c.qty || 0)));
-  });
-
-  L.push({ text: "", rule: true, gap: 2, lh: 14 });
-  row("Subtotal", String(G.subtotal));
-  L.push({ text: "", rule: true, gap: 4, lh: 16 });
-
-  L.push({ text: "GST SUMMARY", size: 10, bold: true, lh: 14 });
-  const gstRow = (label, sac, taxable, cgst, sgst, total) => {
-    L.push({ text: label + "  (SAC " + sac + ")", size: 8.5, lh: 11 });
-    L.push({ text: "Taxable Rs." + taxable + "   CGST Rs." + cgst + "   SGST Rs." + sgst + "   Total Rs." + total,
-      size: 8.5, align: "right", lh: 13 });
+  // ── Itemised tax table (bordered grid, matching the printed layout) ──
+  // Column x-positions span the usable page width (50 to 545). Widths are
+  // sized to what each column actually needs to hold without crowding
+  // its neighbour: Particulars gets the most room, %/Value pairs stay
+  // compact since they only ever hold short numbers.
+  const shortDate = d => {
+    if (!d) return "";
+    const dt = new Date(d + "T12:00:00");
+    if (isNaN(dt)) return "";
+    return String(dt.getDate()).padStart(2, "0") + "/" + String(dt.getMonth() + 1).padStart(2, "0");
   };
-  if (G.roomAmt > 0) gstRow("Accommodation @ " + Math.round(G.roomGSTRate * 100) + "%", G.roomSAC, G.roomAmt, G.roomCGST, G.roomSGST, G.roomGST);
-  else L.push({ text: "Accommodation (Nil-rated, tariff up to Rs.1000)  (SAC " + G.roomSAC + ")", size: 8.5, lh: 13 });
-  if (G.foodAmt > 0) gstRow("Restaurant @ " + Math.round(G.foodGSTRate * 100) + "%", G.foodSAC, G.foodAmt, G.foodCGST, G.foodSGST, G.foodGST);
-  if (G.extraBedAmt > 0) gstRow("Extra Bed @ " + Math.round(G.extraBedGSTRate * 100) + "%", G.extraBedSAC, G.extraBedAmt, G.extraBedCGST, G.extraBedSGST, G.extraBedGST);
-  if (G.laundryAmt > 0) gstRow("Laundry @ " + Math.round(G.laundryGSTRate * 100) + "%", G.laundrySAC, G.laundryAmt, G.laundryCGST, G.laundrySGST, G.laundryGST);
-  if (G.transportAmt > 0) gstRow("Transport/Cab @ " + Math.round(G.transportGSTRate * 100) + "%", G.transportSAC, G.transportAmt, G.transportCGST, G.transportSGST, G.transportGST);
-  if (G.otherMiscAmt > 0) gstRow("Other Services @ " + Math.round(G.otherGSTRate * 100) + "%", G.otherMiscSAC, G.otherMiscAmt, G.otherCGST - (G.laundryCGST||0) - (G.transportCGST||0) - (G.extraBedCGST||0), G.otherSGST - (G.laundrySGST||0) - (G.transportSGST||0) - (G.extraBedSGST||0), G.otherMiscGST);
-  L.push({ text: "Total CGST Rs." + G.totalCGST + "   Total SGST Rs." + G.totalSGST + "   Total GST Rs." + G.totalGST,
-    size: 9, bold: true, lh: 14 });
-  L.push({ text: "", rule: true, gap: 2, lh: 16 });
+  const COLX = { date: 50, desc: 92, sac: 272, cP: 312, cV: 337, sP: 372, sV: 397, iP: 432, iV: 457, tot: 545 };
+  const tblLeft = 48, tblRight = 547;
+  L.push({ text: "", gap: 6, lh: 10 });
+  const headerVlines = [tblLeft, COLX.desc - 4, COLX.sac - 4, COLX.cP - 4, COLX.sV + 22, COLX.iP - 4, COLX.tot - 40, tblRight];
+  L.push({ text: "Date", x: COLX.date, size: 8, bold: true, lh: 0, vlines: headerVlines, vlineHeight: 24 });
+  L.push({ text: "Particulars", x: COLX.desc, size: 8, bold: true, lh: 0 });
+  L.push({ text: "SAC", x: COLX.sac, size: 8, bold: true, lh: 11 });
+  L.push({ text: "CGST", x: COLX.cP, size: 8, bold: true, lh: 0 });
+  L.push({ text: "SGST", x: COLX.sP, size: 8, bold: true, lh: 0 });
+  L.push({ text: "IGST", x: COLX.iP, size: 8, bold: true, lh: 11 });
+  L.push({ text: "Total", size: 8, bold: true, align: "right", lh: 11 });
+  L.push({ text: "%", x: COLX.cP, size: 7.5, lh: 0 });
+  L.push({ text: "Value", x: COLX.cV, size: 7.5, lh: 0 });
+  L.push({ text: "%", x: COLX.sP, size: 7.5, lh: 0 });
+  L.push({ text: "Value", x: COLX.sV, size: 7.5, lh: 0 });
+  L.push({ text: "%", x: COLX.iP, size: 7.5, lh: 0 });
+  L.push({ text: "Value", x: COLX.iV, size: 7.5, lh: 13 });
+  L.push({ text: "", rule: true, gap: 1, lh: 10 });
+
+  const rowVlines = [tblLeft, COLX.desc - 4, COLX.sac - 4, COLX.cP - 4, COLX.sV + 22, COLX.iP - 4, COLX.tot - 40, tblRight];
+  taxedLines.forEach(l => {
+    L.push({ text: shortDate(l.date), x: COLX.date, size: 8.5, lh: 0, vlines: rowVlines, vlineHeight: 15 });
+    L.push({ text: l.desc.replace(/—/g, "-").slice(0, 24), x: COLX.desc, size: 8.5, lh: 0 });
+    L.push({ text: l.sac, x: COLX.sac, size: 8, lh: 0 });
+    L.push({ text: l.rate * 100 + "%", x: COLX.cP, size: 8, lh: 0 });
+    L.push({ text: String(l.cgst), x: COLX.cV, size: 8, lh: 0 });
+    L.push({ text: l.rate * 100 + "%", x: COLX.sP, size: 8, lh: 0 });
+    L.push({ text: String(l.sgst), x: COLX.sV, size: 8, lh: 0 });
+    L.push({ text: igstTotal > 0 ? (l.rate * 100) + "%" : "-", x: COLX.iP, size: 8, lh: 0 });
+    L.push({ text: igstTotal > 0 ? String((l.taxable * l.rate) - l.cgst - l.sgst) : "-", x: COLX.iV, size: 8, lh: 0 });
+    L.push({ text: "Rs." + l.total, size: 8.5, align: "right", lh: 15 });
+  });
+  L.push({ text: "Total", x: COLX.date, size: 9, bold: true, lh: 0, vlines: rowVlines, vlineHeight: 16, rule: true });
+  L.push({ text: "Rs." + G.totalCGST, x: COLX.cV, size: 8.5, bold: true, lh: 0 });
+  L.push({ text: "Rs." + G.totalSGST, x: COLX.sV, size: 8.5, bold: true, lh: 0 });
+  L.push({ text: igstTotal > 0 ? "Rs." + igstTotal : "-", x: COLX.iV, size: 8.5, bold: true, lh: 0 });
+  L.push({ text: "Rs." + G.grandTotal, size: 9, bold: true, align: "right", lh: 18 });
+
+  // ── Payment / totals ──
+  L.push({ text: "Received by " + payMode, size: 9, lh: 0 });
+  L.push({ text: "Rs. " + G.grandTotal, size: 9, align: "right", lh: 12 });
+  L.push({ text: "Subtotal", size: 8, lh: 0 });
+  L.push({ text: "Rs. " + G.subtotal, size: 8, align: "right", lh: 11 });
+  L.push({ text: "Total GST", size: 8, lh: 0 });
+  L.push({ text: "Rs. " + G.totalGST, size: 8, align: "right", lh: 11 });
+  L.push({ text: "Round Off", size: 8, lh: 0 });
+  L.push({ text: "Rs. 0.00", size: 8, align: "right", lh: 12 });
+  L.push({ text: "Net Amount", size: 10, bold: true, lh: 0 });
+  L.push({ text: "Rs. " + G.grandTotal, size: 10, bold: true, align: "right", lh: 16 });
   L.push({ text: "Amount in Words: " + amountInWords(G.grandTotal), size: 8.5, lh: 14 });
-  row("GRAND TOTAL", "Rs. " + G.grandTotal, { size: 13, bold: true, lh: 18 });
-  L.push({ text: "", rule: true, gap: 2, lh: 14 });
 
   L.push({ text: (G.gstMode === "inclusive"
     ? "Displayed rate is inclusive of GST."
     : "GST charged in addition to displayed rate.") +
-    " Rates as per 56th GST Council (eff. 22 Sept 2025).", size: 8, lh: 11 });
+    " Rates as per 56th GST Council (eff. 22 Sept 2025).", size: 8, lh: 10, gap: 5 });
   L.push({ text: b.status === "checkedout"
     ? "This bill is final — GST locked at the rate/mode active at checkout."
     : "Guest still checked in — amounts use current pricing and lock at checkout.", size: 8, lh: 14 });
 
-  L.push({ text: "Thank you for staying with " + RH.name + "!", size: 11, bold: true, gap: 6, lh: 14 });
-  if (RH.tagline) L.push({ text: RH.tagline, size: 9, lh: 12 });
-  L.push({ text: "Computer-generated invoice.", size: 8, lh: 12 });
+  L.push({ text: "Thank you for staying with " + RH.name + "!", size: 11, bold: true, gap: 3, lh: 13 });
+  L.push({ text: "Computer-generated invoice, no signature required.", size: 8, lh: 12 });
   return buildSimplePDF(L);
 }
 
@@ -2096,12 +2273,11 @@ let OPEN_INVOICE_HANDLER = null;
 // ── INVOICE PRINTER ────────────────────────────────────────────
 const buildInvoiceHTML = (b, roomObj) => {
   const n = nts(b.checkIn, b.checkOut);
-  const G = calcBillGST(b, roomObj, CURRENT_ROOMS);
-  const cSum = G.foodAmt + G.otherAmt;
+  const { lines: taxedLines, G } = buildTaxedLineItems(b, roomObj, CURRENT_ROOMS);
   const sub = G.subtotal;
   const gst = G.totalGST;
   const grand = G.grandTotal;
-  const rows = (b.charges || []).map(c => `<tr><td>${escHtml(c.name)}</td><td align=center>${escHtml(c.qty)}</td><td align=right>₹${escHtml(c.price)}</td><td align=right>₹${escHtml(c.price * c.qty)}</td></tr>`).join("");
+  const igstTotal = G.totalIGST || 0;
   // Each hotel's OWN saved details (Profile settings) always take priority
   // over the HOTEL demo constant — every customer must see their real
   // name/address/GSTIN on invoices, not the shared placeholder data.
@@ -2113,89 +2289,171 @@ const buildInvoiceHTML = (b, roomObj) => {
     email: CURRENT_PROFILE.hotelEmail || HOTEL.email,
     gstin: CURRENT_PROFILE.hotelGstin || HOTEL.gstin
   };
-  const shareText = "🏨 *" + (RH.name || "") + "*\nTax Invoice: " + b.id +
+  const shareText = "🏨 *" + (RH.name || "") + "*\nTax Invoice: " + (b.invoiceNo || b.id) +
     "\n\nGuest: " + b.name +
     "\nRoom: " + b.roomId + " (" + (roomObj?.type || "") + ")" +
     "\nCheck-In: " + fmtDateTime(b.checkIn, b.checkInTime) +
     "\nCheck-Out: " + fmtDateTime(b.checkOut, b.checkOutTime) +
     "\nTotal: ₹" + grand +
     "\n\n_Print/Save as PDF from the Print button and attach here._";
-  const html = `<!DOCTYPE html><html><head><meta charset=utf-8><title>Invoice ${escHtml(b.id)}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Arial,sans-serif;padding:28px;max-width:700px;margin:0 auto}
-.top{text-align:center;padding-bottom:16px;border-bottom:3px solid #d97706;margin-bottom:20px}
-.hn{font-size:28px;font-weight:900;color:#1e3a5f}.ht{color:#d97706;font-style:italic}.ha{color:#777;font-size:12px;margin-top:4px}
-.meta{display:flex;justify-content:space-between;margin-bottom:18px}.it{font-size:22px;font-weight:800;color:#1e3a5f}
-.rb{background:#1e3a5f;color:#fff;padding:10px 22px;border-radius:10px;text-align:center}
-.rbn{font-size:26px;font-weight:900}.rbt{font-size:12px;color:#d97706}
-.info{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}
-.ib{background:#fdf8f0;padding:11px;border-radius:7px;border-left:3px solid #d97706}
-.ibl{font-size:10px;text-transform:uppercase;color:#888;margin-bottom:3px}.ibv{font-weight:700;color:#1e3a5f;font-size:14px}
-table{width:100%;border-collapse:collapse;margin:16px 0}
-th{background:#1e3a5f;color:#fff;padding:10px;font-size:12px;text-align:left}
-td{padding:9px 10px;border-bottom:1px solid #eee;font-size:13px}
-.sr td{background:#fdf8f0;font-weight:600}.gr td{background:#fffbf0}
-.gt td{background:#1e3a5f;color:#fff;font-size:17px;font-weight:900;padding:14px 10px}
-.ft{text-align:center;margin-top:20px;padding-top:16px;border-top:1px solid #ddd;font-size:12px;color:#888;line-height:1.9}
-.actbar{display:flex;gap:10px;margin-bottom:16px}
-.actbtn{flex:1;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Segoe UI',Arial,sans-serif}
-.btn-print{background:#1e3a5f;color:#fff}
-.btn-share{background:#25d366;color:#fff}
-@media print{body{padding:8px}.actbar{display:none}}</style>
+  const payMode = b.paymentMode || (b.status === "checkedout" ? "Cash" : "—");
+  const rackTotal = (roomObj?.rate || 0) * n;
+  const discAmt = rackTotal - (b.roomTotal || 0);
+  const discPct = rackTotal > 0 ? (discAmt / rackTotal * 100) : 0;
+  const itemRows = taxedLines.map(l => `<tr>
+    <td>${escHtml(fmtDate ? fmtDate(l.date) : l.date)}</td>
+    <td>${escHtml(l.desc)}</td>
+    <td class="center">${escHtml(l.sac)}</td>
+    <td class="num">${(l.rate * 100).toFixed(1)}</td><td class="num">₹${l.cgst}</td>
+    <td class="num">${(l.rate * 100).toFixed(1)}</td><td class="num">₹${l.sgst}</td>
+    <td class="num">${igstTotal > 0 ? (l.rate*100).toFixed(1) : "—"}</td><td class="num">${igstTotal > 0 ? "₹"+((l.taxable*l.rate)-l.cgst-l.sgst) : "—"}</td>
+    <td class="num">₹${l.total}</td>
+  </tr>`).join("");
+
+  const html = `<!DOCTYPE html><html><head><meta charset=utf-8><title>Invoice ${escHtml(b.invoiceNo || b.id)}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Roboto',Arial,sans-serif}
+body{background:#e8e8e8;padding:20px}
+.sheet{max-width:820px;margin:0 auto;background:#fff;border:2px solid #000}
+.actbar{display:flex;gap:10px;padding:14px;background:#e8e8e8}
+.actbtn{flex:1;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Roboto',Arial,sans-serif}
+.btn-print{background:#1e3a5f;color:#fff}.btn-share{background:#25d366;color:#fff}
+.topbar{display:flex;justify-content:space-between;padding:6px 14px;font-size:11px;border-bottom:1px solid #000}
+.head{text-align:center;padding:12px 14px;border-bottom:2px solid #000}
+.hotelname{font-size:26px;font-weight:700;letter-spacing:.5px;color:#1e3a5f}
+.subline{font-size:11px;color:#d97706;font-style:italic;margin-top:2px}
+.addr{font-size:11px;color:#444;margin-top:4px}
+.titlebar{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:2px solid #000}
+.invtitle{font-size:18px;font-weight:800;color:#1e3a5f;letter-spacing:1px}
+.invmeta{font-size:11px;color:#555;text-align:right}
+.statuspill{display:inline-block;margin-top:4px;padding:2px 10px;border-radius:12px;font-size:10.5px;font-weight:700}
+.pill-settled{background:#dcfce7;color:#16a34a}.pill-inhouse{background:#fef3c7;color:#b45309}
+.metagrid{display:grid;grid-template-columns:1fr 1fr 1fr;border-bottom:2px solid #000}
+.metacol{padding:8px 12px;border-right:1px solid #000}
+.metacol:last-child{border-right:none}
+.metarow{display:flex;justify-content:space-between;font-size:11.5px;padding:2px 0}
+.metarow b{font-weight:700}
+.metatitle{font-weight:700;font-size:11.5px;text-decoration:underline;margin-bottom:4px}
+.familybox{margin:0;padding:10px 14px;border-bottom:1px solid #000;font-size:11.5px;background:#fafafa}
+.familybox .ft{font-size:10px;text-transform:uppercase;color:#888;font-weight:700;margin-bottom:4px}
+table.items{width:100%;border-collapse:collapse}
+table.items th{background:#f0f0f0;border:1px solid #000;padding:5px 6px;font-size:9.5px;text-transform:uppercase}
+table.items td{border:1px solid #000;padding:5px 6px;font-size:11px}
+table.items td.num,table.items th.num{text-align:right}
+table.items td.center,table.items th.center{text-align:center}
+.totrow td{font-weight:700;background:#f7f7f7}
+.bottomgrid{display:grid;grid-template-columns:210px 1fr;border-top:2px solid #000}
+.bcol{padding:10px 14px;border-right:1px solid #000;font-size:11.5px}
+.bcol:last-child{border-right:none}
+.totline{display:flex;justify-content:space-between;padding:2px 0}
+.grandline{display:flex;justify-content:space-between;font-weight:700;font-size:15px;border-top:1px solid #000;margin-top:4px;padding-top:4px;color:#1e3a5f}
+.words{padding:10px 14px;border-top:2px solid #000;font-size:11.5px}
+.words b{text-decoration:underline}
+.signbox{display:flex;justify-content:space-between;padding:26px 14px 12px;font-size:11px}
+.sigimg{text-align:right}
+.sigimg img{height:60px}
+.sigline{border-top:1.5px solid #333;width:180px;margin-top:2px}
+.footer{padding:10px 14px;font-size:10px;color:#555;border-top:1px solid #000;line-height:1.7}
+.thanks{font-size:14px;font-weight:700;color:#1e3a5f;text-align:center;padding:8px 14px 4px}
+@media print{body{padding:0;background:#fff}.actbar{display:none}.sheet{border:none;max-width:100%}}
+</style>
+<script>if (window.self !== window.top) { document.write('<style>.actbar{display:none!important}<\/style>'); }<\/script>
 </head><body>
-<div class=actbar>
+<div class="sheet">
+<div class="actbar">
   <button class="actbtn btn-print" onclick="window.print()">🖨️ Print</button>
   <button class="actbtn btn-share" onclick="shareInvoice()">📤 Share on WhatsApp</button>
 </div>
-<div class=top><div class=hn>🏨 ${escHtml(RH.name)}</div><div class=ht>${escHtml(RH.tagline)}</div>
-<div class=ha>${escHtml(RH.addr.replace(/\n/, " | "))} | ${escHtml(RH.phone)}<br>${RH.gstin ? "GSTIN: " + escHtml(RH.gstin) : ""}${G.placeOfSupply ? "  |  Place of Supply: " + escHtml(G.placeOfSupply) + (G.placeOfSupplyCode ? " (" + escHtml(G.placeOfSupplyCode) + ")" : "") : ""}</div></div>
-<div class=meta><div><div class=it>TAX INVOICE</div>
-<div style="color:#888;font-size:12px;margin-top:4px">${b.invoiceNo ? `Invoice No: <b>${escHtml(b.invoiceNo)}</b><br>` : ""}Booking Ref: <b>${escHtml(b.id)}</b> | ${new Date().toLocaleString("en-IN")}</div></div>
-<div class=rb><div class=rbn>Room ${escHtml(b.roomId)}</div><div class=rbt>${escHtml(roomObj?.type || "")}</div></div></div>
-<div class=info>
-<div class=ib><div class=ibl>Guest</div><div class=ibv>${escHtml(b.name)}</div></div>
-<div class=ib><div class=ibl>Aadhaar</div><div class=ibv>${escHtml(b.aadhaar || "XXXX XXXX XXXX")}</div></div>
-<div class=ib><div class=ibl>Mobile</div><div class=ibv>${escHtml(b.mobile)}</div></div>
-<div class=ib><div class=ibl>Address</div><div class=ibv>${escHtml((b.address || "--").slice(0, 50))}</div></div>
-<div class=ib><div class=ibl>Check-In</div><div class=ibv>${escHtml(fmtDateTime(b.checkIn, b.checkInTime))}</div></div>
-<div class=ib><div class=ibl>Check-Out / Nights</div><div class=ibv>${escHtml(fmtDateTime(b.checkOutActual || b.checkOut, b.checkOutTime))} · ${n}N</div></div>
+<div class="topbar"><span>${RH.gstin ? "GSTIN: " + escHtml(RH.gstin) : ""}</span><span>Ph: ${escHtml(RH.phone)}</span></div>
+<div class="head">
+  <div class="hotelname">${escHtml(RH.name)}</div>
+  ${RH.tagline ? `<div class="subline">${escHtml(RH.tagline)}</div>` : ""}
+  <div class="addr">${escHtml((RH.addr || "").replace(/\n/g, ", "))}</div>
 </div>
-${Array.isArray(b.family) && b.family.length ? `<div style="margin:14px 0;padding:12px 14px;background:#fdf8f0;border-radius:8px;border-left:3px solid #d97706">
-<div style="font-size:11px;text-transform:uppercase;color:#888;margin-bottom:6px;font-weight:700">Additional Occupants (${b.family.length}) — Total Guests: ${1 + b.family.length}</div>
-${b.family.map((m, i) => `<div style="font-size:12px;color:#333;padding:3px 0">${i + 1}. ${escHtml(m.name || "—")}${m.relation ? " (" + escHtml(m.relation) + ")" : ""} ${m.idNumber ? "— ID: " + escHtml(m.idNumber) : ""}</div>`).join("")}
+<div class="titlebar">
+  <div class="invtitle">TAX INVOICE</div>
+  <div class="invmeta">
+    ${b.invoiceNo ? `Bill No: <b>${escHtml(b.invoiceNo)}</b><br>` : ""}Reg No: ${escHtml(b.id)}<br>
+    ${escHtml(b.checkOutActual || todayStr())}
+    <div class="statuspill ${b.status === "checkedout" ? "pill-settled" : "pill-inhouse"}">${b.status === "checkedout" ? "✓ Settled" : "In-House"}</div>
+  </div>
+</div>
+<div class="metagrid">
+  <div class="metacol">
+    <div class="metatitle">Guest Details</div>
+    <div style="font-weight:700">${escHtml(b.name)}</div>
+    <div style="color:#555">${escHtml(b.mobile || "")}</div>
+    <div style="color:#555">${escHtml((b.address || "").slice(0, 60))}</div>
+    <div style="color:#555">${escHtml(b.docType || "Aadhaar Card")}: ${escHtml(b.aadhaar || "XXXX XXXX XXXX")}</div>
+  </div>
+  <div class="metacol">
+    <div class="metarow"><span>Room / Type</span><b>${escHtml(b.roomId)} · ${escHtml(roomObj?.type || "")}</b></div>
+    <div class="metarow"><span>Plan Type</span><b>EP</b></div>
+    <div class="metarow"><span>No. Of Pax</span><b>${escHtml(Number(b.adults || 1) + Number(b.children || 0))}</b></div>
+    <div class="metarow"><span>Pay Mode</span><b>${escHtml(payMode)}</b></div>
+    <div class="metarow"><span>Arrival</span><b>${escHtml(fmtDateTime(b.checkIn, b.checkInTime))}</b></div>
+    <div class="metarow"><span>Departure</span><b>${escHtml(fmtDateTime(b.checkOutActual || b.checkOut, b.checkOutTime))}</b></div>
+  </div>
+  <div class="metacol">
+    <div class="metarow"><span>Rack Rate</span><b>₹${escHtml(roomObj?.rate || 0)}/night</b></div>
+    <div class="metarow"><span>Charge Rate</span><b>₹${n > 0 ? Math.round((b.roomTotal || 0) / n) : 0}/night</b></div>
+    ${discAmt > 0 ? `<div class="metarow"><span>Discount</span><b>₹${discAmt} (${discPct.toFixed(1)}%)</b></div>` : ""}
+    <div class="metarow"><span>Nights</span><b>${n}</b></div>
+    ${G.placeOfSupply ? `<div class="metarow"><span>Place of Supply</span><b>${escHtml(G.placeOfSupplyCode || "")}</b></div>` : ""}
+  </div>
+</div>
+${Array.isArray(b.family) && b.family.length ? `<div class="familybox">
+<div class="ft">Additional Occupants (${b.family.length}) — Total Guests: ${1 + b.family.length}</div>
+${b.family.map((m, i) => `${i + 1}. ${escHtml(m.name || "—")}${m.relation ? " (" + escHtml(m.relation) + ")" : ""} ${m.idNumber ? "— ID: " + escHtml(m.idNumber) : ""}`).join("<br>")}
 </div>` : ""}
-<table><thead><tr><th>Description</th><th align=center>Qty</th><th align=right>Rate</th><th align=right>Amount</th></tr></thead>
-<tbody>
-<tr><td>Room ${escHtml(b.roomId)} — ${escHtml(roomObj?.type)} (${n} Night${n > 1 ? "s" : ""})</td><td align=center>${n}</td><td align=right>₹${escHtml(roomObj?.rate || 0)}/night</td><td align=right>₹${escHtml(b.roomTotal)}</td></tr>
-${rows}
-<tr class=sr><td colspan=3>Subtotal</td><td align=right>₹${sub}</td></tr>
-<tr class=gt><td colspan=3>GRAND TOTAL</td><td align=right>₹${grand}</td></tr>
-</tbody></table>
-<div style="font-size:11px;color:#555;font-style:italic;margin:4px 0 10px">Amount in Words: ${escHtml(amountInWords(grand))}</div>
-<div style="margin:14px 0"><div style="font-size:11px;text-transform:uppercase;color:#888;font-weight:700;margin-bottom:6px">GST Summary</div>
-<table><thead><tr><th>Rate</th><th>SAC</th><th align=right>Taxable Value</th><th align=right>CGST</th><th align=right>SGST</th><th align=right>Total GST</th></tr></thead><tbody>
-${G.roomAmt > 0 ? `<tr><td>Accommodation @ ${(G.roomGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.roomSAC)}</td><td align=right>₹${G.roomAmt}</td><td align=right>₹${G.roomCGST}</td><td align=right>₹${G.roomSGST}</td><td align=right>₹${G.roomGST}</td></tr>` : ""}
-${G.foodAmt > 0 ? `<tr><td>Restaurant @ ${(G.foodGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.foodSAC)}</td><td align=right>₹${G.foodAmt}</td><td align=right>₹${G.foodCGST}</td><td align=right>₹${G.foodSGST}</td><td align=right>₹${G.foodGST}</td></tr>` : ""}
-${G.extraBedAmt > 0 ? `<tr><td>Extra Bed @ ${(G.extraBedGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.extraBedSAC)}</td><td align=right>₹${G.extraBedAmt}</td><td align=right>₹${G.extraBedCGST}</td><td align=right>₹${G.extraBedSGST}</td><td align=right>₹${G.extraBedGST}</td></tr>` : ""}
-${G.laundryAmt > 0 ? `<tr><td>Laundry @ ${(G.laundryGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.laundrySAC)}</td><td align=right>₹${G.laundryAmt}</td><td align=right>₹${G.laundryCGST}</td><td align=right>₹${G.laundrySGST}</td><td align=right>₹${G.laundryGST}</td></tr>` : ""}
-${G.transportAmt > 0 ? `<tr><td>Transport/Cab @ ${(G.transportGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.transportSAC)}</td><td align=right>₹${G.transportAmt}</td><td align=right>₹${G.transportCGST}</td><td align=right>₹${G.transportSGST}</td><td align=right>₹${G.transportGST}</td></tr>` : ""}
-${G.otherMiscAmt > 0 ? `<tr><td>Other Services @ ${(G.otherGSTRate * 100).toFixed(0)}%</td><td>${escHtml(G.otherMiscSAC)}</td><td align=right>₹${G.otherMiscAmt}</td><td align=right>₹${(G.otherCGST||0) - (G.laundryCGST||0) - (G.transportCGST||0) - (G.extraBedCGST||0)}</td><td align=right>₹${(G.otherSGST||0) - (G.laundrySGST||0) - (G.transportSGST||0) - (G.extraBedSGST||0)}</td><td align=right>₹${G.otherMiscGST}</td></tr>` : ""}
-<tr class=sr><td colspan=2>Total</td><td align=right>₹${sub}</td><td align=right>₹${G.totalCGST}</td><td align=right>₹${G.totalSGST}</td><td align=right>₹${gst}</td></tr>
-</tbody></table></div>
-<div style="font-size:10px;color:#999;margin-top:4px">GST as per rates effective 22 Sept 2025 (56th GST Council). Room slab based on ₹${roomObj?.rate || 0}/night tariff. ${G.gstMode === "inclusive" ? "Displayed rate is inclusive of GST." : "GST charged in addition to displayed rate."} ${b.status === "checkedout" ? "🔒 This is a completed bill — GST is locked at the rate/mode active when the guest checked out and will not change even if pricing settings are changed later." : "⏳ Guest still checked in — this bill uses your CURRENT pricing settings and will lock in only at checkout."}</div>
-<div class=ft><b style="font-size:16px;color:#1e3a5f">🙏 Thank you for staying with ${escHtml(RH.name)}!</b>
-<div>${escHtml(RH.phone)} | ${escHtml(RH.email)}</div>
-<div style="color:#d97706;font-style:italic">"${escHtml(RH.tagline)}"</div></div>
-${b.signature && b.signature.startsWith("data:image") ? `<div style="display:flex;justify-content:flex-end;margin-top:20px;padding-top:12px;border-top:1px solid #eee">
-<div style="text-align:center">
-<img src="${b.signature}" style="height:70px;display:block;margin-bottom:4px"/>
-<div style="border-top:1.5px solid #333;width:180px;margin:0 auto"></div>
-<div style="font-size:11px;color:#888;margin-top:4px">Signature — ${escHtml(b.name)}</div>
-</div></div>` : ``}
+<table class="items">
+<tr>
+  <th rowspan="2">Date</th><th rowspan="2">Particulars</th><th rowspan="2">SAC</th>
+  <th colspan="2">CGST</th><th colspan="2">SGST</th><th colspan="2">IGST</th><th rowspan="2">Total</th>
+</tr>
+<tr><th>%</th><th>Value</th><th>%</th><th>Value</th><th>%</th><th>Value</th></tr>
+${itemRows}
+<tr class="totrow">
+  <td colspan="3">Total</td>
+  <td class="num"></td><td class="num">₹${G.totalCGST}</td>
+  <td class="num"></td><td class="num">₹${G.totalSGST}</td>
+  <td class="num"></td><td class="num">${igstTotal > 0 ? "₹"+igstTotal : "—"}</td>
+  <td class="num">₹${grand}</td>
+</tr>
+</table>
+<div class="bottomgrid">
+  <div class="bcol">
+    <div class="metatitle">Payment</div>
+    <div class="totline"><span>Received by ${escHtml(payMode)}</span></div>
+    <div class="totline"><b>₹${grand}</b></div>
+  </div>
+  <div class="bcol">
+    <div class="totline"><span>Subtotal</span><b>₹${sub}</b></div>
+    <div class="totline"><span>Total GST</span><b>₹${gst}</b></div>
+    <div class="totline"><span>Round Off</span><b>₹0.00</b></div>
+    <div class="grandline"><span>Net Amount</span><span>₹${grand}</span></div>
+  </div>
+</div>
+<div class="words">Amount In Words: <b>${escHtml(amountInWords(grand))}</b></div>
+${b.signature && b.signature.startsWith("data:image") ? `<div class="signbox">
+  <span>Guest Signature</span>
+  <div class="sigimg"><img src="${b.signature}"/><div class="sigline"></div><div style="font-size:10px;color:#888">${escHtml(b.name)}</div></div>
+</div>` : `<div class="signbox">
+  <span>Guest Signature: ______________________</span>
+  <span>Authorized Signatory</span>
+</div>`}
+<div class="thanks">🙏 Thank You For Staying With ${escHtml(RH.name)}!</div>
+<div class="footer">
+GST as per rates effective 22 Sept 2025 (56th GST Council). Room slab based on ₹${roomObj?.rate || 0}/night tariff. ${G.gstMode === "inclusive" ? "Displayed rate is inclusive of GST." : "GST charged in addition to displayed rate."} ${b.status === "checkedout" ? "This bill is final — GST locked at the rate/mode active at checkout." : "Guest still checked in — amounts use current pricing and lock at checkout."}<br>
+Computer-generated invoice, no signature required. ${escHtml(RH.phone)} ${RH.email ? "| " + escHtml(RH.email) : ""}
+</div>
+</div>
 <script>
 function shareInvoice(){
   var text = ${JSON.stringify(shareText)};
   if (navigator.share) {
-    navigator.share({ title: "Invoice " + ${JSON.stringify(b.id)}, text: text }).catch(function(){});
+    navigator.share({ title: "Invoice " + ${JSON.stringify(b.invoiceNo || b.id)}, text: text }).catch(function(){});
   } else {
     window.open("https://wa.me/?text=" + encodeURIComponent(text), "_blank");
   }
@@ -4100,7 +4358,13 @@ function DashboardView({
         color: "var(--muted)"
       }
     }, "+GST")));
-  }))));
+  }), active.length > 5 && /*#__PURE__*/React.createElement("div", {
+    onClick: () => setView("rooms"),
+    style: {
+      textAlign: "center", padding: "8px 12px", fontSize: 12.5, fontWeight: 700,
+      color: "var(--navy)", cursor: "pointer", marginTop: 2
+    }
+  }, "+ " + (active.length - 5) + " more — View all in Rooms →"))));
 }
 
 /* ── ROOMS VIEW ───────────────────────────────────────────────── */
@@ -4671,7 +4935,10 @@ function CheckInView({
     const reader = new FileReader();
     reader.onload = async () => {
       const compressed = await compressImg(reader.result).catch(() => reader.result);
-      familyRawFrontRef.current[id + "_" + side] = compressed; // raw copy for OCR/QR only, never persisted
+      // Sharper copy for OCR/QR reading specifically — see compressForScan's
+      // own comment for why the storage-sized copy alone caused misreads.
+      const scanQ = await compressForScan(reader.result).catch(() => compressed);
+      familyRawFrontRef.current[id + "_" + side] = scanQ; // raw copy for OCR/QR only, never persisted
       const isAadhaarDoc = form.docType === "Aadhaar Card";
       // _preview* drives the UI only and is never copied into the booking
       // (familyForBooking picks fields explicitly), so thumbnails and the
@@ -4892,10 +5159,26 @@ function CheckInView({
     (async () => {
       const v = qrVideoRef.current;
       if (!v) { setQrLiveMsg("❌ Camera view load nahi hua. Overlay band karke dobara try karo."); return; }
+      setQrLiveMsg("📷 Card ka QR camera ke saamne lao — paas laake steady rakho");
+      // Camera negotiation + BarcodeDetector capability check run IN
+      // PARALLEL (both are independent async calls) instead of one after
+      // the other — this alone was adding a noticeable chunk of the
+      // reported "slow to start" delay, since the detector check used to
+      // only begin after the camera had already finished opening.
+      // Requesting a lower "ideal" resolution also speeds up camera
+      // negotiation — most phones take longer to lock onto 1920x1080 than
+      // 1280x720, and 720p is already more than sharp enough to read a
+      // QR code held anywhere near the camera.
+      const detectorCapabilityPromise = (async () => {
+        try {
+          if (typeof window.BarcodeDetector === "undefined") return null;
+          const fmts = await window.BarcodeDetector.getSupportedFormats().catch(() => []);
+          return (fmts && fmts.indexOf("qr_code") !== -1) ? new window.BarcodeDetector({ formats: ["qr_code"] }) : null;
+        } catch (e) { return null; }
+      })();
       try {
-        setQrLiveMsg("📷 Card ka QR camera ke saamne lao — paas laake steady rakho");
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }
         });
       } catch (e) {
         setQrLiveMsg("❌ Camera nahi khul paaya: " + (e && e.message ? e.message : e) +
@@ -4909,13 +5192,7 @@ function CheckInView({
       v.muted = true;
       try { await v.play(); } catch (e) { /* some browsers autoplay anyway */ }
 
-      let detector = null;
-      try {
-        if (typeof window.BarcodeDetector !== "undefined") {
-          const fmts = await window.BarcodeDetector.getSupportedFormats().catch(() => []);
-          if (fmts && fmts.indexOf("qr_code") !== -1) detector = new window.BarcodeDetector({ formats: ["qr_code"] });
-        }
-      } catch (e) { detector = null; }
+      const detector = await detectorCapabilityPromise;
       if (!detector && !window.jsQR) {
         setQrLiveMsg("❌ Is browser mein QR scanning support nahi hai. Photo se AI scan use karo.");
         return;
@@ -4923,6 +5200,17 @@ function CheckInView({
 
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      // jsQR's per-frame cost scales with pixel COUNT — decoding at full
+      // camera resolution (up to 1280x720 = ~920K pixels) on every frame
+      // was slow enough on mid-range phones that many frames never
+      // finished processing before the next was due, which is exactly
+      // what made scanning feel sluggish and miss codes (the `busy` gate
+      // below skips a frame outright while the previous one is still being
+      // decoded). QR codes don't need anywhere near full resolution to
+      // decode correctly, so jsQR gets a downscaled copy — roughly 4x
+      // fewer pixels — while the native BarcodeDetector (fast at any
+      // resolution) still reads the full-resolution frame directly.
+      const JSQR_MAX_DIM = 640;
       let busy = false;
       let frames = 0;
 
@@ -4938,8 +5226,9 @@ function CheckInView({
               if (codes && codes.length) text = codes[0].rawValue;
             }
             if (!text && window.jsQR) {
-              canvas.width = v.videoWidth;
-              canvas.height = v.videoHeight;
+              const scale = Math.min(1, JSQR_MAX_DIM / Math.max(v.videoWidth, v.videoHeight));
+              canvas.width = Math.round(v.videoWidth * scale);
+              canvas.height = Math.round(v.videoHeight * scale);
               ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
               const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
               const c = window.jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
@@ -5039,9 +5328,16 @@ function CheckInView({
     canvas.height = video.videoHeight;
     canvas.getContext("2d").drawImage(video, 0, 0);
     const rawDataUrl = canvas.toDataURL("image/jpeg", 0.92);
-    // Compress same as uploaded photos (max 600px, 65% quality) — camera
-    // captures from external/USB cameras can be 1080p+ uncompressed, which
-    // would eat browser storage 5-10x faster than uploaded photos.
+    // Two separate copies from here on: a SHARP one for AI text-reading /
+    // QR decoding (compressForScan), and a much smaller one for whatever
+    // actually gets persisted to state/localStorage/local-folder
+    // (compressImg, unchanged) — camera captures from external/USB
+    // cameras can be 1080p+ uncompressed, which would eat browser storage
+    // 5-10x faster than uploaded photos if the stored copy weren't
+    // shrunk. Using the SAME shrunk copy as the scan source too was the
+    // actual cause of OCR misreads (blurry small text at 600px), so
+    // scanning now gets its own much higher-resolution source instead.
+    const scanUrl = await compressForScan(rawDataUrl).catch(() => rawDataUrl);
     const dataUrl = await compressImg(rawDataUrl).catch(() => rawDataUrl);
     closeCam();
     const isAadhaar = form.docType === "Aadhaar Card";
@@ -5050,19 +5346,19 @@ function CheckInView({
       // local-folder) — ONLY when the document is an Aadhaar Card, since
       // that's the specific document UIDAI's storage restriction covers.
       // Other ID types are stored as-is, unmasked.
-      rawFrontRef.current = dataUrl;
+      rawFrontRef.current = scanUrl;
       setPhotoFPreview(dataUrl);
       // For Aadhaar nothing is stored yet — scanAadhaar decides what to
       // store once it knows where the number is. Other IDs store as-is.
       setPhotoF(isAadhaar ? null : dataUrl);
-      setTimeout(() => scanAadhaar("f", dataUrl), 200);
+      setTimeout(() => scanAadhaar("f", scanUrl), 200);
     } else if (camSide === "b") {
       // Back also gets masked for Aadhaar — the standard card layout
       // prints the 12-digit number on both sides, not just the front.
-      rawBackRef.current = dataUrl;
+      rawBackRef.current = scanUrl;
       setPhotoBPreview(dataUrl);
       setPhotoB(isAadhaar ? null : dataUrl);
-      setTimeout(() => scanAadhaar("b", dataUrl), 200);
+      setTimeout(() => scanAadhaar("b", scanUrl), 200);
     } else if (camSide.startsWith("fam:")) {
       // Family member camera capture — same front/back flow as primary
       // guest, just routed to that member's card. camSide format:
@@ -5071,12 +5367,12 @@ function CheckInView({
       const famId = parts[1];
       const side = parts[2] || "front";
       const field = side === "front" ? "photoFront" : "photoBack";
-      familyRawFrontRef.current[famId + "_" + side] = dataUrl;
+      familyRawFrontRef.current[famId + "_" + side] = scanUrl;
       updateFamilyMember(famId, side === "front" ? "_previewFront" : "_previewBack", dataUrl);
       updateFamilyMember(famId, field, isAadhaar ? null : dataUrl);
       setTimeout(() => {
         const m = family.find(x => x._id === famId);
-        if (m) scanFamilyId({ ...m, [field]: dataUrl }, side);
+        if (m) scanFamilyId({ ...m, [field]: scanUrl }, side);
       }, 200);
     }
   };
@@ -5163,12 +5459,19 @@ function CheckInView({
         img.onerror = rej;
         img.src = rawDu;
       });
+      // Separate, sharper copy JUST for the OCR/QR reader — 1200px/80%
+      // (above) is fine as what gets stored, but was also the ONLY copy
+      // being handed to the AI for text extraction, and that resolution
+      // is where a name in a modest font starts blurring into a
+      // different-looking word ("Manoj" -> "Sanoj"). compressForScan
+      // gives the reader a materially sharper source instead.
+      const scanQ = await compressForScan(rawDu).catch(() => compressed);
       // Save compressed (typically 150-300KB) to state and storage.
       // For Aadhaar, mask the number FIRST — the raw copy is kept only in
       // a ref for OCR/QR, never in state (state is what reaches
       // localStorage, the booking record, and the local folder).
       const isAadhaarDoc = form.docType === "Aadhaar Card";
-      if (side === "f") rawFrontRef.current = compressed; else rawBackRef.current = compressed;
+      if (side === "f") rawFrontRef.current = scanQ; else rawBackRef.current = scanQ;
       (side === "f" ? setPhotoFPreview : setPhotoBPreview)(compressed);
       // Aadhaar: store nothing yet — scanAadhaar masks and stores once it
       // knows the number's position. Other IDs store immediately.
@@ -5178,8 +5481,8 @@ function CheckInView({
       } catch (x) {
         console.warn("localStorage quota:", x.message);
       }
-      // Auto-scan with the RAW compressed image (OCR needs the real number)
-      await scanAadhaar(side, compressed);
+      // Auto-scan with the SHARP copy (OCR needs the real number)
+      await scanAadhaar(side, scanQ);
     };
     r.readAsDataURL(file);
     e.target.value = "";
@@ -5634,7 +5937,7 @@ function CheckInView({
       lineHeight: 1
     }
   }, "×"), !scanning && /*#__PURE__*/React.createElement("button", {
-    onClick: () => scanAadhaar("f", photoF),
+    onClick: () => scanAadhaar("f", rawFrontRef.current || photoF),
     style: {
       position: "absolute",
       bottom: 3,
@@ -5739,7 +6042,7 @@ function CheckInView({
       lineHeight: 1
     }
   }, "×"), !scanning && /*#__PURE__*/React.createElement("button", {
-    onClick: () => scanAadhaar("b", photoB),
+    onClick: () => scanAadhaar("b", rawBackRef.current || photoB),
     style: {
       position: "absolute",
       bottom: 3,
@@ -7183,6 +7486,8 @@ function BookingModal({
   onClose
 }) {
   const [showC, setSC] = useState(false);
+  const [showPayMode, setShowPayMode] = useState(false);
+  const [payMode, setPayMode] = useState("Cash");
   const [showExtend, setShowExtend] = useState(false);
   const [newCheckOut, setNewCheckOut] = useState(b.checkOut);
   const charges = b.charges || [];
@@ -7409,12 +7714,35 @@ function BookingModal({
   }, "➕ Add Food / Services"), /*#__PURE__*/React.createElement("button", {
     className: "btn-p",
     onClick: () => openInvoice(b, room)
-  }, "🖨️ Print / Share Invoice"), /*#__PURE__*/React.createElement("button", {
+  }, "🖨️ Print / Share Invoice"), !showPayMode ? /*#__PURE__*/React.createElement("button", {
     className: "btn-d",
-    onClick: () => {
-      if (window.confirm(`Check out ${b.name}?\nTotal: ${fmtMoney(grand)} (incl. GST)`)) onCheckOut(b.id);
+    onClick: () => setShowPayMode(true)
+  }, "🚪 Check Out & Settle") : /*#__PURE__*/React.createElement("div", {
+    style: { background: "#fff1f2", borderRadius: 12, padding: 12, marginTop: 4 }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 8 }
+  }, "💳 Payment kaise mila? — Total: " + fmtMoney(grand)), /*#__PURE__*/React.createElement("div", {
+    style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }
+  }, ["Cash", "Card", "UPI", "Bank Transfer", "Online (OTA)", "Other"].map(m => /*#__PURE__*/React.createElement("button", {
+    key: m,
+    onClick: () => setPayMode(m),
+    style: {
+      padding: "8px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer",
+      border: "1.5px solid " + (payMode === m ? "#dc2626" : "var(--border)"),
+      background: payMode === m ? "#fef2f2" : "#fff",
+      color: payMode === m ? "#dc2626" : "#333"
     }
-  }, "🚪 Check Out & Settle"))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
+  }, m))), /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", gap: 8 }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowPayMode(false),
+    style: { flex: 1, padding: "10px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      if (window.confirm(`Check out ${b.name}?\nTotal: ${fmtMoney(grand)} (incl. GST)\nPayment: ${payMode}`)) onCheckOut(b.id, payMode);
+    },
+    style: { flex: 1.5, padding: "10px", borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+  }, "✅ Confirm Check Out"))))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
     booking: b,
     onAdd: items => onAddCharge(b.id, items),
     onClose: () => setSC(false)
@@ -9449,11 +9777,12 @@ function App() {
     if (!invoiceView) return;
     try {
       const blob = buildInvoicePDFBlob(invoiceView.b, invoiceView.room);
-      const file = new File([blob], `invoice-${invoiceView.b.id}.pdf`, { type: "application/pdf" });
+      const fileLabel = invoiceView.b.invoiceNo || invoiceView.b.id;
+      const file = new File([blob], `invoice-${fileLabel.replace(/\//g, "-")}.pdf`, { type: "application/pdf" });
       // Share the actual PDF where supported (WhatsApp appears in the sheet
       // and sends the file). Older browsers just get a download.
       if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
-        await navigator.share({ files: [file], title: "Invoice " + invoiceView.b.id });
+        await navigator.share({ files: [file], title: "Invoice " + fileLabel });
         return;
       }
       const url = URL.createObjectURL(blob);
@@ -9938,6 +10267,29 @@ function App() {
 
   // Actions
   const handleCheckIn = async form => {
+    // Guard against two devices checking in different guests to the SAME
+    // room at nearly the same moment. Each device's own `rooms` state can
+    // look "empty" right up until the other device's write actually syncs
+    // in (the 20s poll / onSnapshot listener isn't instant), so trusting
+    // that local state alone lets both check-ins go through — one room
+    // ends up "occupied" (whichever write landed last) while BOTH bookings
+    // stay "active", which is exactly the occupied-vs-active-count drift
+    // this was built to catch. A forced server read (bypassing the
+    // localStorage cache every other WS.get call uses) gets the true
+    // current state right before committing. If the read fails (offline,
+    // no connectivity) this falls back to proceeding on local state, since
+    // blocking a legitimate check-in during a connectivity hiccup would be
+    // worse than the rare race this guards against.
+    try {
+      const freshRooms = await WS.get("rooms", true);
+      if (Array.isArray(freshRooms)) {
+        const freshRoom = freshRooms.find(r => r.id === form.roomId);
+        if (freshRoom && freshRoom.status === "occupied") {
+          alert("Yeh room abhi-abhi kisi aur ne book kar liya hai (dusre device se). Please doosra room select karo.");
+          return;
+        }
+      }
+    } catch (e) { /* offline or read failed — proceed on local state */ }
     const id = form._tempId || uid();
     const {
       _tempId,
@@ -10024,15 +10376,25 @@ function App() {
     const b = bookings.find(x => x.id === bid);
     if (!b) return;
     const room = rooms.find(r => r.id === b.roomId);
+    // Extend at the SAME per-night rate this booking was already charged —
+    // not the room's default/rack rate. A booking checked in at a
+    // negotiated rate doesn't store that rate as its own field (only the
+    // computed roomTotal is saved), so it's derived here the same way the
+    // invoice already does: existing roomTotal ÷ existing nights. Recomputing
+    // via room.rate instead (as this used to do) silently discarded any
+    // negotiated/custom rate and re-priced the WHOLE stay — original nights
+    // included — at the room's default rate the moment anyone extended it.
+    const oldNights = nts(b.checkIn, b.checkOut);
+    const effectivePerNightRate = oldNights > 0 ? (b.roomTotal || 0) / oldNights : (room?.rate || 0);
     const newNights = nts(b.checkIn, newCheckOut);
-    const newRoomTotal = (room?.rate || 0) * newNights;
+    const newRoomTotal = Math.round(effectivePerNightRate * newNights);
     const updated = { ...b, checkOut: newCheckOut, roomTotal: newRoomTotal };
     const nb = bookings.map(x => x.id === bid ? updated : x);
     await saveBk(nb);
     AuditLog.add('EXTEND_STAY', b.name + ' -> ' + newCheckOut);
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: updated }));
   };
-  const handleCheckOut = async bid => {
+  const handleCheckOut = async (bid, paymentMode) => {
     const b = bookings.find(x => x.id === bid);
     const room = rooms.find(r => r.id === b.roomId);
     const G = calcBillGST(b, room, rooms);
@@ -10054,6 +10416,7 @@ function App() {
       subTotal: sub,
       gstAmt: gst,
       invoiceNo,
+      paymentMode: paymentMode || "Cash",
       gstBreakdown: {
         roomAmt: G.roomAmt, roomGST: G.roomGST, roomGSTRate: G.roomGSTRate,
         roomCGST: G.roomCGST, roomSGST: G.roomSGST, roomSAC: G.roomSAC, roomRuleId: G.roomRuleId,
@@ -10366,7 +10729,7 @@ function App() {
       background: "var(--gold)", border: "none", borderRadius: 8,
       color: "#fff", padding: "9px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer"
     }
-  }, "📄 Share PDF")), /*#__PURE__*/React.createElement("iframe", {
+  }, "📤 Share on WhatsApp")), /*#__PURE__*/React.createElement("iframe", {
     ref: invoiceFrameRef,
     srcDoc: invoiceView.html,
     title: "Invoice",
