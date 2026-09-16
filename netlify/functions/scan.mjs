@@ -203,29 +203,12 @@ export async function handler(event) {
     // belongs in the default list any more. "gemini-flash-latest" is a
     // Google-maintained alias that tracks whatever the current Flash
     // model is, kept first so this list needs less manual upkeep over
-    // time; the other two are explicit, confirmed-GA pins (NOT
-    // "gemini-3-flash" — that name only exists as the PREVIEW-stage
-    // "gemini-3-flash-preview"; the bare, no-suffix form isn't a real
-    // model ID and would just fail and fall through every time) in case
-    // the alias ever points somewhere temporarily unavailable.
-    //
-    // thinkingConfig matters here as much as the model name does. Gemini
-    // 3-generation models turn "thinking" on by default (medium level for
-    // Flash) — before this was set, the model was spending its output-token
-    // budget on invisible reasoning before ever writing the JSON answer,
-    // which is what was producing "Parse error" on the client: not a
-    // parsing bug, but a response that got cut off mid-thought and never
-    // contained an actual answer. thinkingBudget (older/2.5-series field)
-    // and thinkingLevel (3.x-series field) are both sent together since
-    // different models in this list read different ones — an unrecognised
-    // field is harmless, so this is safe across the whole list. Google's
-    // own docs note Gemini 3 Flash/Flash-Lite "do not support full
-    // thinking-off", so maxOutputTokens is raised as a safety margin for
-    // whatever minimum thinking still happens even at the lowest level.
+    // time; the two named models after it are explicit pins in case the
+    // alias ever points somewhere temporarily unavailable.
     let result = null;
     const lastErrors = { groq: null, gemini: null };
     const gKey = process.env.GEMINI_API_KEY;
-    const geminiModels = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite")
+    const geminiModels = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-3-flash,gemini-3.1-flash-lite")
       .split(",").map(m => m.trim()).filter(Boolean);
     if (gKey) {
       for (const model of geminiModels) {
@@ -233,24 +216,11 @@ export async function handler(event) {
         try {
           const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gKey}`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ inlineData: { mimeType: "image/jpeg", data: image } }, { text: prompt }] }],
-              generationConfig: {
-                temperature: 0, maxOutputTokens: 1000,
-                thinkingConfig: { thinkingBudget: 0, thinkingLevel: "low" }
-              }
-            })
+            body: JSON.stringify({ contents: [{ parts: [{ inlineData: { mimeType: "image/jpeg", data: image } }, { text: prompt }] }], generationConfig: { temperature: 0, maxOutputTokens: 400 } })
           });
           const d = await r.json();
-          // Require actual extractable text, not just a truthy `candidates`
-          // array — a response that hit MAX_TOKENS mid-thought still has
-          // `candidates`, just with empty/partial content, and treating
-          // that as a success meant a bad result was returned instead of
-          // this loop correctly moving on to the next model.
-          const text = d?.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (r.ok && text) { result = d; break; }
+          if (r.ok && d.candidates) { result = d; break; }
           if (d.error) { lastErrors.gemini = d.error?.message; console.warn("Gemini API error:", d.error?.message); }
-          else if (r.ok) { lastErrors.gemini = `[${model}] empty response (finishReason: ${d?.candidates?.[0]?.finishReason || "unknown"})`; }
         } catch (e) { lastErrors.gemini = e.message; console.warn("Gemini:", e.message); }
       }
     }
