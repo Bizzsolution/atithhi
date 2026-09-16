@@ -5396,7 +5396,13 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           video: {
-            facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 },
+            // Resolution bumped back up — Aadhaar's Secure QR is a DENSE
+            // code (a compressed binary blob, not a short URL like a UPI
+            // QR), and 720p was leaving too few camera pixels per module
+            // to resolve reliably, however good the decode logic on top
+            // of it was. A slightly slower camera handshake is the right
+            // trade for a scan that actually completes.
+            facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 },
             // Continuous autofocus matters a lot more here than resolution
             // does — a card held 10-15cm from the camera (as scanning
             // instructions ask for) is well inside "macro" range, and a
@@ -5446,19 +5452,32 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
       // Aadhaar's own "Secure QR" is a DENSE code — it packs a compressed
       // binary blob (name/address/photo/etc, not just a short URL like a
       // UPI payment QR) into far more modules per side than a simple QR.
-      // The earlier 640px cap here was tuned for scan SPEED and worked
-      // fine for testing against simple QR content, but was nowhere near
-      // enough resolution to resolve a dense Aadhaar QR's fine grid —
-      // which is what "camera looks fine but never actually reads
-      // anything" was, on any device that fell through to this jsQR path
-      // (see the detector-availability note above for how that happens
-      // more than it should). 960px keeps meaningfully fewer pixels than
-      // the full 1280x720 capture for per-frame speed, while giving a
-      // dense code enough modules-per-pixel to actually resolve; the
-      // native BarcodeDetector (unaffected by any of this — it reads the
-      // full-resolution frame directly) still takes over the moment it's
-      // ready regardless.
-      const JSQR_MAX_DIM = 960;
+      // Earlier, more aggressive downscaling here was tuned for scan
+      // SPEED and worked fine for testing against simple QR content, but
+      // was nowhere near enough resolution to resolve a dense Aadhaar
+      // QR's fine grid — which is what "camera looks fine but never
+      // actually reads anything" was, on any device that fell through to
+      // this jsQR path (see the detector-availability note above for how
+      // that happens more than it should).
+      // Same insight as decodeQRFromImage (the photo-upload QR path,
+      // which tries multiple scales AND rotations because "a downscaled
+      // dense QR is the most common failure") — a single, single-angle
+      // decode attempt per frame just isn't enough for Aadhaar's dense
+      // Secure QR. Doing that FULL multi-attempt sweep on every single
+      // live frame would make each frame too slow to feel responsive, so
+      // instead the rotation is cycled ACROSS successive frames: frame 1
+      // tries 0°, frame 2 tries 90°, frame 3 tries 180°, and so on. Each
+      // frame is genuinely new camera content anyway, so this covers the
+      // same angles the photo path checks explicitly, just spread over
+      // roughly half a second of continuous scanning instead of paid for
+      // all at once. jsQR's own "attemptBoth" already covers both normal
+      // and inverted reads in a single call.
+      // JSQR_MAX_DIM is deliberately generous now (only a mild trim off
+      // the 1920x1080 capture) — the resolution itself is what a dense
+      // QR needs most; a busy(-gated) frame that takes a bit longer to
+      // process is a far better trade than one that never decodes at all.
+      const JSQR_MAX_DIM = 1400;
+      const ROTATIONS = [0, 90, 180, 270];
       let busy = false;
       let frames = 0;
 
@@ -5476,9 +5495,17 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
             }
             if (!text && window.jsQR) {
               const scale = Math.min(1, JSQR_MAX_DIM / Math.max(v.videoWidth, v.videoHeight));
-              canvas.width = Math.round(v.videoWidth * scale);
-              canvas.height = Math.round(v.videoHeight * scale);
-              ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+              const baseW = Math.round(v.videoWidth * scale);
+              const baseH = Math.round(v.videoHeight * scale);
+              const rotDeg = ROTATIONS[frames % ROTATIONS.length];
+              const swap = rotDeg === 90 || rotDeg === 270;
+              canvas.width = swap ? baseH : baseW;
+              canvas.height = swap ? baseW : baseH;
+              ctx.save();
+              ctx.translate(canvas.width / 2, canvas.height / 2);
+              ctx.rotate(rotDeg * Math.PI / 180);
+              ctx.drawImage(v, -baseW / 2, -baseH / 2, baseW, baseH);
+              ctx.restore();
               const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
               const c = window.jsQR(d.data, d.width, d.height, { inversionAttempts: "attemptBoth" });
               if (c && c.data) text = c.data;
