@@ -149,6 +149,9 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
         <div class="stat"><div class="stat-num" id="trialLic" style="color:#818cf8">-</div><div class="stat-label">Trial Keys</div></div>
         <div class="stat"><div class="stat-num" id="paidLic" style="color:#34d399">-</div><div class="stat-label">Paid Keys</div></div>
       </div>
+      <div style="font-size:11px;color:#64748b;margin:-8px 0 14px;text-align:center">
+        Counts reflect the hotels currently loaded below (200 at a time) — use "Load More" or "Find by Key" to look beyond that, this is not a platform-wide total.
+      </div>
 
       <!-- Generate New Key -->
       <div class="section">
@@ -188,12 +191,21 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
       <!-- Active Licenses -->
       <div class="section">
         <div class="section-title">📋 Active Licenses</div>
-        <input id="searchBox" oninput="renderDashboard()" placeholder="🔍 Search by name, phone, hotel or key..."
+        <input id="searchBox" oninput="debouncedRender()" placeholder="🔍 Search by name, phone, hotel or key (only within loaded list)..."
           style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #263248;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px;margin-bottom:10px"/>
+        <div style="display:flex;gap:8px;margin-bottom:10px">
+          <input id="findKeyBox" placeholder="Find ANY hotel instantly by exact key..."
+            style="flex:1;box-sizing:border-box;background:#0b1220;border:1px solid #fbbf24;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px"/>
+          <button class="btn-outline btn" style="width:auto;white-space:nowrap;padding:0 16px"
+            onclick="findLicenseByKey(document.getElementById('findKeyBox').value).then(f=>showMsg(f?('✅ Found: '+(f.hotel||f.key)):'❌ Not found (checked new + old storage)', f?'success':'error'))">🔎 Find</button>
+        </div>
         <button class="btn-outline btn" onclick="hydrateLicensesFromCloud().then(()=>{initDefaultLicenses();renderDashboard();updateSyncIndicator(!LicenseCloud.lastError);showMsg(LicenseCloud.lastError?('⚠️ '+LicenseCloud.lastError):'☁️ Synced from cloud', LicenseCloud.lastError?'error':'success')})"
-          style="width:100%;margin-bottom:14px">🔄 Sync licenses from cloud (other devices)</button>
+          style="width:100%;margin-bottom:8px">🔄 Sync licenses from cloud (other devices)</button>
+        <button class="btn-outline btn" style="width:100%;margin-bottom:14px;border-color:#fbbf24;color:#fbbf24"
+          onclick="if(confirm('Copy every license from the old storage into the new scalable one? Safe to run more than once — nothing is deleted.')){showMsg('⏳ Migrating...','success');LicenseCloud.migrateOldArrayToNew().then(r=>{if(r.ok){showMsg('✅ Migrated '+r.migrated+' license(s) to scalable storage','success');hydrateLicensesFromCloud().then(renderDashboard);}else{showMsg('⚠️ Migration failed: '+r.error,'error');}})}">🔄 Migrate to Scalable Storage (one-time)</button>
         <div id="msg" class="msg"></div>
         <div id="licenseList">Loading...</div>
+        <button id="loadMoreBtn" class="btn-outline btn" style="width:100%;margin-top:10px;display:none" onclick="loadMoreLicenses()">⬇️ Load More Hotels</button>
 
         <!-- Update Netlify Instructions -->
         <div style="margin-top:20px;border-top:1px solid #1e293b;padding-top:16px">
@@ -383,34 +395,115 @@ const AdminBrute={
 // ── STATE ───────────────────────────────────────────────
 let licenses = JSON.parse(localStorage.getItem("ab_admin_licenses") || "[]");
 let adminPass = "";
+let licensesHasMore = false;
+let licensesLastDoc = null; // Firestore cursor for "load more" pagination
 
-// ── FIRESTORE SYNC for licenses (admin/licenses doc) ────
-// localStorage stays the fast primary read; Firestore is the cross-device
-// backup/sync layer. Requires Firestore rule for /admin/{doc} path.
+// ── FIRESTORE SYNC for licenses ──────────────────────────
+// Each hotel now lives at its OWN document — collection `licenses`,
+// document ID = the license key itself — instead of one entry inside a
+// single giant `admin/licenses` array document. That array had
+// Firestore's hard 1 MiB-per-document ceiling: at real scale (thousands
+// of hotels, let alone a ten-lakh-customer target) it would eventually
+// stop accepting new licenses ENTIRELY, and every single read/write
+// against it — including every OCR scan and every phone-verification
+// call from every hotel's own app — was transferring the WHOLE document
+// just to touch one entry, getting slower as more hotels signed up.
+// A per-document key means: adding hotel #1,000,000 costs exactly what
+// adding hotel #2 did, and looking up any ONE hotel is a single small
+// read no matter how many others exist.
+// `admin/licenses` (the old array doc) is still READ as a fallback by
+// the server functions and the app itself, so nothing already deployed
+// breaks — use "🔄 Migrate to Scalable Storage" below to move existing
+// entries across; new/edited entries always go to the new collection
+// from here on.
 const LicenseCloud = {
   lastError: null,
-  async pull() {
+  async pullPage(pageSize, startAfterDoc) {
+    if (!window._db) { this.lastError = "Firebase not connected in this browser"; return { list: [], hasMore: false, lastDoc: null }; }
+    try {
+      let q = window._db.collection("licenses").orderBy("__name__").limit(pageSize);
+      if (startAfterDoc) q = q.startAfter(startAfterDoc);
+      const snap = await q.get();
+      this.lastError = null;
+      const list = snap.docs.map(d => d.data());
+      return { list, hasMore: snap.docs.length === pageSize, lastDoc: snap.docs[snap.docs.length - 1] || null };
+    } catch (e) {
+      console.warn("License page pull:", e.message);
+      // Listing the whole licenses collection is deliberately DENIED by
+      // the Firestore security rules (see firestore.rules) — allowing it
+      // would let anyone dump every license key on the platform, and
+      // from there read every hotel's guest data. The rules cannot tell
+      // this admin panel apart from an attacker, because the panel
+      // talks to Firestore anonymously like everything else does.
+      // So this failure is EXPECTED and correct once rules are live;
+      // say so plainly instead of showing an empty list that looks like
+      // all the customer data vanished.
+      const denied = /permission|insufficient|PERMISSION_DENIED/i.test(e.message || "");
+      this.lastError = denied
+        ? "Bulk listing is blocked by security rules (this is intentional). Use 'Find by Key' to open any specific hotel."
+        : e.message;
+      return { list: [], hasMore: false, lastDoc: null, denied };
+    }
+  },
+  // Instant O(1) lookup of ONE hotel by its exact key, regardless of how
+  // many total hotels exist — this is how support/admin finds a specific
+  // customer without needing to page through everyone.
+  async pullByKey(key) {
     if (!window._db) { this.lastError = "Firebase not connected in this browser"; return null; }
     try {
-      const snap = await window._db.collection("admin").doc("licenses").get();
+      const doc = await window._db.collection("licenses").doc(key.toUpperCase()).get();
       this.lastError = null;
-      return snap.exists ? snap.data().list : null;
-    } catch (e) { console.warn("License pull:", e.message); this.lastError = e.message; return null; }
+      return doc.exists ? doc.data() : null;
+    } catch (e) { console.warn("License key lookup:", e.message); this.lastError = e.message; return null; }
   },
-  push(list) {
+  // Writes EACH given license as its OWN document — batched (Firestore
+  // caps a batch at 500 writes), never as one shared array anymore.
+  async pushMany(list) {
     if (!window._db) {
-      this.lastError = "Firebase not connected — key saved locally only, NOT backed up to cloud!";
-      showMsg("⚠️ Cloud sync failed: Firebase not connected. Key saved on THIS device only.", "error");
+      this.lastError = "Firebase not connected — changes saved locally only, NOT backed up to cloud!";
+      showMsg("⚠️ Cloud sync failed: Firebase not connected. Changes saved on THIS device only.", "error");
       return;
     }
-    window._db.collection("admin").doc("licenses").set({ list, ts: Date.now() }, { merge: true })
-      .then(() => { this.lastError = null; updateSyncIndicator(true); })
-      .catch(e => {
-        console.warn("License push:", e.message);
-        this.lastError = e.message;
-        updateSyncIndicator(false);
-        showMsg("⚠️ Cloud sync failed: " + e.message + " — key saved on THIS device only, won't work from other devices/servers!", "error");
-      });
+    try {
+      for (let i = 0; i < list.length; i += 450) {
+        const chunk = list.slice(i, i + 450);
+        const batch = window._db.batch();
+        chunk.forEach(l => {
+          if (!l.key) return;
+          batch.set(window._db.collection("licenses").doc(l.key.toUpperCase()), l, { merge: true });
+        });
+        await batch.commit();
+      }
+      this.lastError = null;
+      updateSyncIndicator(true);
+    } catch (e) {
+      console.warn("License push:", e.message);
+      this.lastError = e.message;
+      updateSyncIndicator(false);
+      showMsg("⚠️ Cloud sync failed: " + e.message + " — changes saved on THIS device only, won't work from other devices/servers!", "error");
+    }
+  },
+  async deleteOne(key) {
+    if (!window._db) return;
+    try { await window._db.collection("licenses").doc(key.toUpperCase()).delete(); }
+    catch (e) { console.warn("License delete:", e.message); }
+  },
+  // One-time migration: reads the OLD array doc and writes each entry
+  // into the NEW per-document collection. Safe to run more than once
+  // (merge:true means re-running just re-writes the same data) and does
+  // NOT delete the old doc — nothing is lost even if this needs re-running.
+  async migrateOldArrayToNew(onProgress) {
+    if (!window._db) return { ok: false, error: "Firebase not connected" };
+    try {
+      const snap = await window._db.collection("admin").doc("licenses").get();
+      const oldList = snap.exists ? (snap.data().list || []) : [];
+      if (!oldList.length) return { ok: true, migrated: 0 };
+      await this.pushMany(oldList);
+      if (onProgress) onProgress(oldList.length, oldList.length);
+      return { ok: true, migrated: oldList.length };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   }
 };
 
@@ -446,22 +539,88 @@ function initDefaultLicenses() {
   if (migrated) saveLicenses();
 }
 
-// Pull latest from cloud on login (cross-device sync), then merge with local
+// Pull the first page from the NEW scalable collection on login. Local
+// cache is used as an instant first paint; the first cloud page then
+// replaces it once it arrives (same "cloud is source of truth" rule as
+// before, just paginated now instead of "the whole dataset").
 async function hydrateLicensesFromCloud() {
-  const cloudList = await LicenseCloud.pull();
-  if (cloudList && Array.isArray(cloudList) && cloudList.length) {
-    // Cloud is source of truth once it exists (avoids stale-local overwrite issues)
-    licenses = cloudList;
+  const page = await LicenseCloud.pullPage(200, null);
+  if (page.list.length) {
+    licenses = page.list;
+    licensesHasMore = page.hasMore;
+    licensesLastDoc = page.lastDoc;
     localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+  } else if (page.denied) {
+    // "Permission denied" is NOT the same as "the collection is empty".
+    // Treating it as empty would fall through to the seeding branch
+    // below and re-upload this device's possibly-stale local cache over
+    // whatever is currently live — silently reverting newer changes
+    // made from another device. Keep the local cache for display only
+    // and touch nothing in the cloud.
+    licensesHasMore = false;
+    licensesLastDoc = null;
   } else if (licenses.length) {
-    // First time cloud is empty but local has data — push local up to seed cloud
-    LicenseCloud.push(licenses);
+    // Collection genuinely read back empty but local cache has data
+    // (fresh install, or not-yet-migrated old install) — push local up
+    // to seed it, same "seed from whatever we have" behaviour as before.
+    LicenseCloud.pushMany(licenses);
   }
 }
 
-function saveLicenses() {
+async function loadMoreLicenses() {
+  if (!licensesHasMore) return;
+  const page = await LicenseCloud.pullPage(200, licensesLastDoc);
+  licenses = [...licenses, ...page.list];
+  licensesHasMore = page.hasMore;
+  licensesLastDoc = page.lastDoc;
   localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
-  LicenseCloud.push(licenses); // fire-and-forget cloud backup
+  renderDashboard();
+}
+
+// Instant lookup by exact key — works regardless of how many hotels
+// exist in total, since it's a single direct document read. Merges the
+// result into the in-memory list (updating it in place if it was already
+// loaded, otherwise adding it) so it's immediately visible/editable.
+async function findLicenseByKey(rawKey) {
+  const key = (rawKey || "").trim().toUpperCase();
+  if (!key) return null;
+  let found = await LicenseCloud.pullByKey(key);
+  if (!found) {
+    // Not in the new per-document collection — check the old array doc
+    // too, so "Find" still works for a hotel that hasn't been migrated
+    // yet (same dual-path pattern the server-side functions use).
+    try {
+      const snap = await window._db.collection("admin").doc("licenses").get();
+      const oldList = snap.exists ? (snap.data().list || []) : [];
+      found = oldList.find(l => (l.key || "").toUpperCase() === key) || null;
+    } catch (e) { /* leave found as null */ }
+  }
+  if (found) {
+    const idx = licenses.findIndex(l => (l.key || "").toUpperCase() === key);
+    if (idx >= 0) licenses[idx] = found; else licenses.unshift(found);
+    renderDashboard();
+  }
+  return found;
+}
+
+// changedKeys (optional): the specific license key, or array of keys,
+// that were actually modified in this call. When known, ONLY those
+// documents get written to the cloud — every other call site here
+// touches exactly one hotel, so passing its key turns what used to be
+// "re-write every hotel currently loaded in memory" (up to 200, whatever
+// the admin has paged through) into "write the one hotel that changed".
+// Left unspecified for the bulk first-run seed / legacy-field-backfill
+// paths below, where more than one entry can genuinely change at once
+// and writing the full in-memory list is correct, not wasteful.
+function saveLicenses(changedKeys) {
+  localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+  if (changedKeys) {
+    const keys = new Set((Array.isArray(changedKeys) ? changedKeys : [changedKeys]).map(k => (k || "").toUpperCase()));
+    const toWrite = licenses.filter(l => keys.has((l.key || "").toUpperCase()));
+    LicenseCloud.pushMany(toWrite);
+  } else {
+    LicenseCloud.pushMany(licenses); // fire-and-forget cloud backup, one doc per license
+  }
 }
 
 // ── LOGIN (with brute-force lockout) ────────────────────
@@ -511,6 +670,17 @@ function doLogin() {
 function logout() { location.reload(); }
 
 // ── RENDER (XSS-safe — all user data escaped) ───────────
+// Rebuilding a 200-row list on every single keystroke was measurable
+// jank on a slower device/large list — the actual work (filtering, then
+// replacing innerHTML for the whole list) is cheap for one call, but
+// firing it on every keypress adds up while typing quickly. Waiting for
+// a short pause in typing keeps the search feeling instant without
+// doing 200-row DOM rebuilds per character.
+let _renderDebounceTimer = null;
+function debouncedRender() {
+  clearTimeout(_renderDebounceTimer);
+  _renderDebounceTimer = setTimeout(renderDashboard, 180);
+}
 function renderDashboard() {
   const active = licenses.filter(l => l.active);
   const trial = active.filter(l => l.plan === "TRIAL");
@@ -518,6 +688,8 @@ function renderDashboard() {
   document.getElementById("totalLic").textContent = active.length;
   document.getElementById("trialLic").textContent = trial.length;
   document.getElementById("paidLic").textContent = paid.length;
+  const loadMoreBtn = document.getElementById("loadMoreBtn");
+  if (loadMoreBtn) loadMoreBtn.style.display = licensesHasMore ? "block" : "none";
 
   const planColors = { TRIAL: "p-trial", BASIC: "p-basic", PRO: "p-pro", PREM: "p-pro" };
   const planLabels = { TRIAL: "Trial", BASIC: "₹499/mo", PRO: "₹999/mo", PREM: "₹1499/mo" };
@@ -578,11 +750,20 @@ const FEATURE_CATALOG = [
   { id: "roles", label: "Owner/Manager Roles", desc: "Role-based access control for staff" },
   { id: "room_edit", label: "Room Editing", desc: "Edit room numbers, rates, add new rooms" }
 ];
+// Paid add-ons — deliberately kept OUT of FEATURE_CATALOG (and therefore
+// out of every plan's defaults, PREM included, since PREM is built by
+// mapping over FEATURE_CATALOG alone). These are sold separately per
+// hotel regardless of plan, so nothing here should ever turn on by
+// itself — only this explicit per-hotel toggle does that.
+const ADDON_CATALOG = [
+  { id: "ota_import", label: "OTA Booking Import", desc: "Quick-entry bookings from Agoda/MakeMyTrip/Goibibo etc, blocks the room like a normal check-in" },
+  { id: "direct_booking", label: "Direct Booking Link", desc: "Public shareable link (for Facebook/Instagram/WhatsApp) where guests request a room; hotel confirms from the app" }
+];
 const PLAN_DEFAULT_FEATURES = {
   TRIAL: [],
   BASIC: ["history", "csv_export"],
   PRO: ["history", "csv_export", "storage", "extend_stay", "qr"],
-  PREM: FEATURE_CATALOG.map(f => f.id) // everything
+  PREM: FEATURE_CATALOG.map(f => f.id) // everything IN THE CATALOG — add-ons are separate, see ADDON_CATALOG
 };
 
 // ── EDIT HOTEL — unified modal replacing the old editContact()/editPlan()
@@ -642,7 +823,7 @@ function saveEditHotel() {
   if (planChanged) {
     l.features = [...(PLAN_DEFAULT_FEATURES[newPlan] || [])];
   }
-  saveLicenses();
+  saveLicenses(l.key);
   renderDashboard();
   closeEditHotelModal();
   const planLabels = { TRIAL: "Trial", BASIC: "Basic ₹499/mo", PRO: "Pro ₹999/mo", PREM: "Premium ₹1499/mo" };
@@ -666,6 +847,16 @@ function openFeatureControl(i) {
         <div style="font-size:11px;color:#94a3b8">${f.desc}</div>
       </div>
     </label>
+  `).join("") + `
+    <div style="margin:16px 0 10px;padding-top:12px;border-top:1px dashed #475569;font-size:12px;font-weight:700;color:#fbbf24">💰 PAID ADD-ONS — turned on individually, not part of any plan</div>
+  ` + ADDON_CATALOG.map(f => `
+    <label style="display:flex;align-items:center;gap:10px;padding:10px;background:${l.features.includes(f.id) ? '#451a03' : '#1e293b'};border:1px solid ${l.features.includes(f.id) ? '#fbbf24' : '#334155'};border-radius:8px;margin-bottom:8px;cursor:pointer">
+      <input type="checkbox" data-feat="${f.id}" ${l.features.includes(f.id) ? "checked" : ""} style="width:18px;height:18px" onchange="toggleFeatureCheckbox(this)">
+      <div>
+        <div style="font-size:13px;font-weight:700;color:${l.features.includes(f.id) ? '#fbbf24' : '#e2e8f0'}">${f.label}</div>
+        <div style="font-size:11px;color:#94a3b8">${f.desc}</div>
+      </div>
+    </label>
   `).join("");
   document.getElementById("featureModalTitle").textContent = "🎛️ Features — " + (l.hotel || l.key);
   document.getElementById("featureModal").style.display = "flex";
@@ -673,8 +864,15 @@ function openFeatureControl(i) {
 function toggleFeatureCheckbox(cb) {
   const label = cb.closest("label");
   const on = cb.checked;
-  label.style.background = on ? "#052e16" : "#1e293b";
-  label.querySelector("div > div").style.color = on ? "#4ade80" : "#e2e8f0";
+  const isAddon = ADDON_CATALOG.some(f => f.id === cb.dataset.feat);
+  if (isAddon) {
+    label.style.background = on ? "#451a03" : "#1e293b";
+    label.style.border = "1px solid " + (on ? "#fbbf24" : "#334155");
+    label.querySelector("div > div").style.color = on ? "#fbbf24" : "#e2e8f0";
+  } else {
+    label.style.background = on ? "#052e16" : "#1e293b";
+    label.querySelector("div > div").style.color = on ? "#4ade80" : "#e2e8f0";
+  }
 }
 function closeFeatureModal() {
   document.getElementById("featureModal").style.display = "none";
@@ -686,7 +884,7 @@ function saveFeatureControl() {
   if (!l) return;
   const checked = [...document.querySelectorAll('#featureList input[type=checkbox]:checked')].map(cb => cb.dataset.feat);
   l.features = checked;
-  saveLicenses();
+  saveLicenses(l.key);
   renderDashboard();
   closeFeatureModal();
   showMsg("✅ Features updated for " + (l.hotel || l.key) + " (" + checked.length + " enabled)", "success");
@@ -775,7 +973,7 @@ function generateKey() {
     expiry = exp.toISOString().split("T")[0];
   }
   licenses.push({ key, hotel, owner, phone, plan, date: today, expiry, active: true, features: [...(PLAN_DEFAULT_FEATURES[plan] || [])] });
-  saveLicenses();
+  saveLicenses(key);
 
   // Show new key
   document.getElementById("newKeyDisplay").textContent = key;
@@ -852,12 +1050,12 @@ Thank you for choosing AtithiBook! 🏨
 function revokeKey(i) {
   if (!confirm("Revoke key " + licenses[i].key + "? Customer ka access band ho jayega.")) return;
   licenses[i].active = false;
-  saveLicenses(); renderDashboard();
+  saveLicenses(licenses[i].key); renderDashboard();
   showMsg("🔴 Key revoked: " + licenses[i].key, "error");
 }
 function restoreKey(i) {
   licenses[i].active = true;
-  saveLicenses(); renderDashboard();
+  saveLicenses(licenses[i].key); renderDashboard();
   showMsg("✅ Key restored: " + licenses[i].key, "success");
 }
 

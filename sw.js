@@ -5,7 +5,7 @@
 // shell forever, even after a fresh deploy (exactly what caused devices
 // to keep showing an outdated version despite redeploying).
 
-const CACHE = 'atithibook-v3.6';
+const CACHE = 'atithibook-v4.4';
 const OFFLINE_URLS = [
   '/',
   '/index.html',
@@ -13,6 +13,8 @@ const OFFLINE_URLS = [
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/jsQR.js',
+  '/html2canvas.min.js',
+  '/jspdf.umd.min.js',
   'https://unpkg.com/react@18.3.1/umd/react.production.min.js',
   'https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js',
   'https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@400;600;700&family=Hind:wght@300;400;500;600;700&display=swap',

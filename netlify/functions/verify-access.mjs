@@ -68,14 +68,33 @@ export async function handler(event) {
   }
 
   try {
-    const url = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/admin/licenses`;
-    const r = await fetch(url);
-    if (!r.ok) {
-      return { statusCode: 502, headers, body: JSON.stringify({ ok: false, error: "Could not reach license records right now. Try again." }) };
+    // NEW scalable path first — one small direct document per hotel,
+    // O(1) regardless of total hotel count. Falls back to the OLD
+    // single-array document only for a hotel not yet migrated, so
+    // nothing breaks mid-transition. See scan.mjs's checkFirestoreLicense
+    // for the full reasoning — the old array document has a hard 1 MiB
+    // Firestore ceiling and was getting downloaded in FULL on every
+    // single verification call for every hotel.
+    let entry = null;
+    try {
+      const directUrl = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/licenses/${encodeURIComponent(licenseKey)}`;
+      const directRes = await fetch(directUrl);
+      if (directRes.ok) {
+        const doc = await directRes.json();
+        if (doc.fields?.key?.stringValue) entry = { mapValue: { fields: doc.fields } };
+      }
+    } catch (e) { /* fall through to old path below */ }
+
+    if (!entry) {
+      const url = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/admin/licenses`;
+      const r = await fetch(url);
+      if (!r.ok) {
+        return { statusCode: 502, headers, body: JSON.stringify({ ok: false, error: "Could not reach license records right now. Try again." }) };
+      }
+      const doc = await r.json();
+      const values = doc?.fields?.list?.arrayValue?.values || [];
+      entry = values.find(v => (v.mapValue?.fields?.key?.stringValue || "").toUpperCase() === licenseKey);
     }
-    const doc = await r.json();
-    const values = doc?.fields?.list?.arrayValue?.values || [];
-    const entry = values.find(v => (v.mapValue?.fields?.key?.stringValue || "").toUpperCase() === licenseKey);
 
     if (!entry) {
       recordFailure(ip, rl.entry);

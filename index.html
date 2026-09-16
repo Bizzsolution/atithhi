@@ -1031,6 +1031,36 @@ const generateCreditNoteNumber = () => generateDocumentNumber("CN");
 async function checkLicenseExpiry() {
   const key = (localStorage.getItem("ab_license_key") || "").trim().toUpperCase();
   if (!key) return null;
+  // Turns a Firestore document's `fields` object into this function's
+  // return shape — shared by both the new per-document path and the old
+  // array-scan fallback below, so the actual status logic exists once.
+  const statusFromFields = f => {
+    const expiry = f.expiry?.stringValue || null;
+    const active = f.active?.booleanValue !== false;
+    const plan = f.plan?.stringValue || "";
+    const features = (f.features?.arrayValue?.values || []).map(x => x.stringValue).filter(Boolean);
+    if (!active) return { status: "revoked", plan, features };
+    if (!expiry) return { status: "ok", plan, features }; // no expiry set — nothing to warn about
+    const daysLeft = Math.ceil((new Date(expiry + "T23:59:59") - new Date()) / 86400000);
+    if (daysLeft < 0) return { status: "expired", plan, expiry, daysLeft, features };
+    if (daysLeft <= 3) return { status: "expiring_soon", plan, expiry, daysLeft, features };
+    return { status: "ok", plan, expiry, daysLeft, features };
+  };
+  // NEW scalable path — one small direct document per hotel (O(1) lookup
+  // no matter how many hotels exist), tried first. The OLD single-array
+  // document (all hotels' licenses in one doc) is kept only as a fallback
+  // for a hotel not yet migrated via the admin panel's migration tool —
+  // that array has Firestore's hard 1 MiB-per-document ceiling and was
+  // being downloaded in FULL by every hotel's app just to check its own
+  // one entry, which stops working entirely once enough hotels exist.
+  try {
+    const directUrl = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/licenses/${encodeURIComponent(key)}`;
+    const directRes = await fetch(directUrl);
+    if (directRes.ok) {
+      const doc = await directRes.json();
+      if (doc.fields?.key?.stringValue) return statusFromFields(doc.fields);
+    }
+  } catch (e) { /* fall through to the old path below */ }
   try {
     const url = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/admin/licenses`;
     const r = await fetch(url);
@@ -1041,16 +1071,7 @@ async function checkLicenseExpiry() {
       const f = v.mapValue?.fields || {};
       const entryKey = (f.key?.stringValue || "").toUpperCase();
       if (entryKey !== key) continue;
-      const expiry = f.expiry?.stringValue || null;
-      const active = f.active?.booleanValue !== false;
-      const plan = f.plan?.stringValue || "";
-      const features = (f.features?.arrayValue?.values || []).map(x => x.stringValue).filter(Boolean);
-      if (!active) return { status: "revoked", plan, features };
-      if (!expiry) return { status: "ok", plan, features }; // no expiry set — nothing to warn about
-      const daysLeft = Math.ceil((new Date(expiry + "T23:59:59") - new Date()) / 86400000);
-      if (daysLeft < 0) return { status: "expired", plan, expiry, daysLeft, features };
-      if (daysLeft <= 3) return { status: "expiring_soon", plan, expiry, daysLeft, features };
-      return { status: "ok", plan, expiry, daysLeft, features };
+      return statusFromFields(f);
     }
     return null; // key not found in cloud list — don't alarm the user over a transient sync gap
   } catch (e) {
@@ -1097,6 +1118,17 @@ const BruteForce = {
 
 // ── HTML ESCAPE — prevents stored XSS in invoice/print/innerHTML ──
 const escHtml = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+// Safe for embedding a JS value INSIDE a script tag inside a
+// generated HTML string (e.g. `var x = ${jsonForScript(guestName)};`).
+// Plain JSON.stringify does NOT escape "/", so if the value contains the
+// literal closing-script-tag sequence — trivially possible for anything
+// sourced from a free-text field like a guest's name at check-in — the
+// browser's HTML PARSER (which scans for that exact byte sequence
+// regardless of JS string-quoting context) would end the surrounding
+// script tag early and start executing whatever follows as markup or
+// script. Escaping "<" to its unicode form breaks that sequence while
+// still round-tripping to the exact same string once JS parses it back.
+const jsonForScript = v => JSON.stringify(v).replace(/</g, "\\u003c");
 
 // ── SIMPLE INDEXEDDB HELPERS — FileSystemDirectoryHandle objects can't be
 // stored in localStorage (not JSON-serializable), but IndexedDB supports
@@ -2122,7 +2154,91 @@ function buildSimplePDF(lines) {
   const bytes = new Uint8Array(pdf.length);
   for (let i = 0; i < pdf.length; i++) bytes[i] = pdf.charCodeAt(i) & 0xFF;
   return new Blob([bytes], { type: "application/pdf" });
-}function buildInvoicePDFBlob(b, roomObj) {
+}
+// ── HTML-FAITHFUL PDF (used for WhatsApp share) ──────────────────
+// Loads a script exactly once, no matter how many times this is called
+// concurrently or across separate shares — later callers just await the
+// same in-flight/resolved promise instead of injecting duplicate tags.
+const _scriptLoadPromises = {};
+function loadScriptOnce(src) {
+  if (_scriptLoadPromises[src]) return _scriptLoadPromises[src];
+  _scriptLoadPromises[src] = new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) { resolve(); return; }
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => { delete _scriptLoadPromises[src]; reject(new Error("Failed to load " + src)); };
+    document.head.appendChild(s);
+  });
+  return _scriptLoadPromises[src];
+}
+
+// Renders the SAME styled HTML used for Print/on-screen viewing into a
+// PDF, instead of the separate hand-drawn text-and-lines PDF this file
+// used to build — that approach could never really match the real
+// invoice's fonts, colours, rounded cards, and table styling, which is
+// exactly the gap between "what prints" and "what WhatsApp received"
+// this exists to close. html2canvas/jsPDF are bundled locally (like
+// jsQR) and pre-cached by the service worker, so this works offline
+// after the first successful load, same as the rest of the app; the
+// only network dependency is the very first fetch of these two files.
+async function buildInvoicePDFFromHTML(b, roomObj) {
+  await Promise.all([
+    loadScriptOnce("/html2canvas.min.js"),
+    loadScriptOnce("/jspdf.umd.min.js")
+  ]);
+  const html = buildInvoiceHTML(b, roomObj);
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const sheet = doc.querySelector(".sheet");
+  const actbar = sheet && sheet.querySelector(".actbar");
+  if (actbar) actbar.remove(); // Print/Share buttons themselves shouldn't appear IN the PDF
+  const styleEl = doc.querySelector("style");
+
+  const container = document.createElement("div");
+  container.style.cssText = "position:fixed;left:-9999px;top:0;width:820px;background:#fff;";
+  if (styleEl) container.appendChild(styleEl.cloneNode(true));
+  container.appendChild(sheet ? sheet.cloneNode(true) : doc.body.cloneNode(true));
+  document.body.appendChild(container);
+
+  try {
+    // Let web fonts (Roboto, loaded via @import in the invoice's own
+    // <style>) actually finish loading before the screenshot — otherwise
+    // html2canvas can capture a frame still showing the fallback font.
+    await (document.fonts && document.fonts.ready ? document.fonts.ready.catch(() => {}) : Promise.resolve());
+    await new Promise(r => setTimeout(r, 150));
+
+    const canvas = await window.html2canvas(container, {
+      scale: 2, useCORS: true, backgroundColor: "#ffffff", logging: false
+    });
+
+    const { jsPDF } = window.jspdf;
+    // A4 in points, with the screenshot scaled to fill the page width and
+    // split across as many pages as its full height needs — a tall
+    // invoice (several charges, family members, a long GST summary)
+    // isn't cropped or squeezed onto one page.
+    const pageW = 595.28, pageH = 841.89;
+    const imgW = pageW;
+    const imgH = (canvas.height * imgW) / canvas.width;
+    const pdf = new jsPDF({ unit: "pt", format: "a4" });
+    let renderedH = 0;
+    let first = true;
+    while (renderedH < imgH) {
+      if (!first) pdf.addPage();
+      first = false;
+      // Shift the SAME full image up by however much has already been
+      // rendered on prior pages, so each page shows the next slice —
+      // jsPDF clips addImage to the page bounds automatically.
+      pdf.addImage(canvas.toDataURL("image/jpeg", 0.92), "JPEG", 0, -renderedH, imgW, imgH);
+      renderedH += pageH;
+    }
+    return pdf.output("blob");
+  } finally {
+    document.body.removeChild(container);
+  }
+}
+
+function buildInvoicePDFBlob(b, roomObj) {
   const n = nts(b.checkIn, b.checkOut);
   const { lines: taxedLines, G } = buildTaxedLineItems(b, roomObj, CURRENT_ROOMS);
   const igstTotal = G.totalIGST || 0;
@@ -2132,7 +2248,13 @@ function buildSimplePDF(lines) {
     phone: CURRENT_PROFILE.hotelPhone || HOTEL.phone,
     email: CURRENT_PROFILE.hotelEmail || HOTEL.email,
     gstin: CURRENT_PROFILE.hotelGstin || "",
-    tagline: CURRENT_PROFILE.hotelTagline || HOTEL.tagline || ""
+    tagline: CURRENT_PROFILE.hotelTagline || HOTEL.tagline || "",
+    // Separate from RH.name on purpose — the header always shows the full
+    // registered name (needed for the GST invoice itself), but a hotel
+    // may want something shorter/friendlier in the "Thank you for
+    // staying with ___" line specifically. Falls back to the full name
+    // when nothing's been set.
+    footerName: CURRENT_PROFILE.invoiceFooterName || CURRENT_PROFILE.hotelName || HOTEL.name
   };
   const L = [];
   const row = (label, amount, opts) => {
@@ -2259,7 +2381,7 @@ function buildSimplePDF(lines) {
     ? "This bill is final — GST locked at the rate/mode active at checkout."
     : "Guest still checked in — amounts use current pricing and lock at checkout.", size: 8, lh: 14 });
 
-  L.push({ text: "Thank you for staying with " + RH.name + "!", size: 11, bold: true, gap: 3, lh: 13 });
+  L.push({ text: "Thank you for staying with " + RH.footerName + "!", size: 11, bold: true, gap: 3, lh: 13 });
   L.push({ text: "Computer-generated invoice, no signature required.", size: 8, lh: 12 });
   return buildSimplePDF(L);
 }
@@ -2287,7 +2409,8 @@ const buildInvoiceHTML = (b, roomObj) => {
     addr: CURRENT_PROFILE.hotelAddr || HOTEL.addr,
     phone: CURRENT_PROFILE.hotelPhone || HOTEL.phone,
     email: CURRENT_PROFILE.hotelEmail || HOTEL.email,
-    gstin: CURRENT_PROFILE.hotelGstin || HOTEL.gstin
+    gstin: CURRENT_PROFILE.hotelGstin || HOTEL.gstin,
+    footerName: CURRENT_PROFILE.invoiceFooterName || CURRENT_PROFILE.hotelName || HOTEL.name
   };
   const shareText = "🏨 *" + (RH.name || "") + "*\nTax Invoice: " + (b.invoiceNo || b.id) +
     "\n\nGuest: " + b.name +
@@ -2322,7 +2445,7 @@ body{background:#e8e8e8;padding:20px}
 .topbar{display:flex;justify-content:space-between;padding:6px 14px;font-size:11px;border-bottom:1px solid #000}
 .head{text-align:center;padding:12px 14px;border-bottom:2px solid #000}
 .hotelname{font-size:26px;font-weight:700;letter-spacing:.5px;color:#1e3a5f}
-.subline{font-size:11px;color:#d97706;font-style:italic;margin-top:2px}
+.subline{font-size:9px;color:#d97706;font-style:italic;margin-top:2px;font-weight:400}
 .addr{font-size:11px;color:#444;margin-top:4px}
 .titlebar{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:2px solid #000}
 .invtitle{font-size:18px;font-weight:800;color:#1e3a5f;letter-spacing:1px}
@@ -2438,12 +2561,12 @@ ${itemRows}
 <div class="words">Amount In Words: <b>${escHtml(amountInWords(grand))}</b></div>
 ${b.signature && b.signature.startsWith("data:image") ? `<div class="signbox">
   <span>Guest Signature</span>
-  <div class="sigimg"><img src="${b.signature}"/><div class="sigline"></div><div style="font-size:10px;color:#888">${escHtml(b.name)}</div></div>
+  <div class="sigimg"><img src="${escHtml(b.signature)}"/><div class="sigline"></div><div style="font-size:10px;color:#888">${escHtml(b.name)}</div></div>
 </div>` : `<div class="signbox">
   <span>Guest Signature: ______________________</span>
   <span>Authorized Signatory</span>
 </div>`}
-<div class="thanks">🙏 Thank You For Staying With ${escHtml(RH.name)}!</div>
+<div class="thanks">🙏 Thank You For Staying With ${escHtml(RH.footerName)}!</div>
 <div class="footer">
 GST as per rates effective 22 Sept 2025 (56th GST Council). Room slab based on ₹${roomObj?.rate || 0}/night tariff. ${G.gstMode === "inclusive" ? "Displayed rate is inclusive of GST." : "GST charged in addition to displayed rate."} ${b.status === "checkedout" ? "This bill is final — GST locked at the rate/mode active at checkout." : "Guest still checked in — amounts use current pricing and lock at checkout."}<br>
 Computer-generated invoice, no signature required. ${escHtml(RH.phone)} ${RH.email ? "| " + escHtml(RH.email) : ""}
@@ -2451,9 +2574,9 @@ Computer-generated invoice, no signature required. ${escHtml(RH.phone)} ${RH.ema
 </div>
 <script>
 function shareInvoice(){
-  var text = ${JSON.stringify(shareText)};
+  var text = ${jsonForScript(shareText)};
   if (navigator.share) {
-    navigator.share({ title: "Invoice " + ${JSON.stringify(b.invoiceNo || b.id)}, text: text }).catch(function(){});
+    navigator.share({ title: "Invoice " + ${jsonForScript(b.invoiceNo || b.id)}, text: text }).catch(function(){});
   } else {
     window.open("https://wa.me/?text=" + encodeURIComponent(text), "_blank");
   }
@@ -4009,7 +4132,9 @@ function DashboardView({
   user,
   setView,
   setModal,
-  profile
+  profile,
+  bookingRequests,
+  onRequestDecision
 }) {
   const occ = rooms.filter(r => r.status === "occupied");
   const avail = rooms.filter(r => r.status === "empty");
@@ -4303,7 +4428,34 @@ function DashboardView({
       fontSize: 12,
       color: "var(--muted)"
     }
-  }, /*#__PURE__*/React.createElement("span", null, "🟢 ", avail.length, " Free"), /*#__PURE__*/React.createElement("span", null, "🔴 ", occ.length, " Occupied"))), active.length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "🟢 ", avail.length, " Free"), /*#__PURE__*/React.createElement("span", null, "🔴 ", occ.length, " Occupied"))), hasFeature("direct_booking") && Array.isArray(bookingRequests) && bookingRequests.some(r => r.status === "pending") && /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: { padding: "14px 16px", border: "1.5px solid #fbbf24" }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "st",
+    style: { color: "#d97706" }
+  }, "🌐 BOOKING REQUESTS (", bookingRequests.filter(r => r.status === "pending").length, ")"),
+    bookingRequests.filter(r => r.status === "pending").slice(0, 5).map(r => /*#__PURE__*/React.createElement("div", {
+      key: r.id,
+      style: { padding: "10px 0", borderBottom: "1px solid var(--border)" }
+    },
+      /*#__PURE__*/React.createElement("div", { style: { fontWeight: 700, fontSize: 13 } }, r.name, " · ", r.phone),
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 2 } },
+        r.roomType, " · ", fmtDate(r.checkIn), " → ", fmtDate(r.checkOut),
+        r.notes ? " · " + r.notes : ""),
+      /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 8 } },
+        /*#__PURE__*/React.createElement("button", {
+          onClick: () => onRequestDecision(r.id, "confirmed"),
+          style: { flex: 1, padding: "7px", borderRadius: 6, border: "none", background: "#16a34a", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+        }, "✅ Confirm"),
+        /*#__PURE__*/React.createElement("button", {
+          onClick: () => onRequestDecision(r.id, "declined"),
+          style: { flex: 1, padding: "7px", borderRadius: 6, border: "1px solid #dc2626", background: "#fff", color: "#dc2626", fontSize: 11, fontWeight: 700, cursor: "pointer" }
+        }, "✕ Decline"))
+    )),
+    /*#__PURE__*/React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 6 } },
+      "Confirm karne se guest ko phone par batao — yeh sirf request hai, room abhi block nahi hota. Check-In tab se actual check-in karo jab guest pahunche.")
+  ), active.length > 0 && /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       padding: "14px 16px"
@@ -4879,7 +5031,13 @@ function CheckInView({
     nationality: "",
     visaNumber: "",
     visaType: "",
-    arrivalDateIndia: ""
+    arrivalDateIndia: "",
+    // Booking source — "Direct" (walk-in/phone, default) or an OTA the
+    // reservation actually came through. Only relevant/shown when the
+    // hotel has the OTA Booking Import add-on; a hotel without it always
+    // saves bookings as "Direct" the same as before this existed.
+    bookingSource: "Direct",
+    otaReference: ""
   });
   // Per-booking rate override — lets reception pick a different rate for
   // THIS specific stay (season/negotiation) without permanently changing
@@ -5051,10 +5209,24 @@ function CheckInView({
   const qrVideoRef = useRef(null);
   const qrStreamRef = useRef(null);
   const qrLoopRef = useRef(null);
+  const qrTorchTrackRef = useRef(null);
+  const [qrTorchAvailable, setQrTorchAvailable] = useState(false);
+  const [qrTorchOn, setQrTorchOn] = useState(false);
+  const toggleQrTorch = async () => {
+    const track = qrTorchTrackRef.current;
+    if (!track) return;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: !qrTorchOn }] });
+      setQrTorchOn(v => !v);
+    } catch (e) { /* device refused mid-session, harmless */ }
+  };
 
   const stopQrLive = () => {
     if (qrLoopRef.current) { cancelAnimationFrame(qrLoopRef.current); qrLoopRef.current = null; }
     if (qrStreamRef.current) { qrStreamRef.current.getTracks().forEach(t => t.stop()); qrStreamRef.current = null; }
+    qrTorchTrackRef.current = null;
+    setQrTorchAvailable(false);
+    setQrTorchOn(false);
     setQrLiveOpen(false);
   };
 
@@ -5172,13 +5344,33 @@ function CheckInView({
       const detectorCapabilityPromise = (async () => {
         try {
           if (typeof window.BarcodeDetector === "undefined") return null;
-          const fmts = await window.BarcodeDetector.getSupportedFormats().catch(() => []);
+          const fmts = await Promise.race([
+            window.BarcodeDetector.getSupportedFormats().catch(() => []),
+            // On some Android/Chrome builds the underlying detection model
+            // hasn't finished downloading yet the first time it's used,
+            // and getSupportedFormats() can hang far longer than a user
+            // will wait. A timeout means scanning still starts on time
+            // (via jsQR) instead of the whole overlay appearing to do
+            // nothing while this silently stalls in the background.
+            new Promise(res => setTimeout(() => res([]), 800))
+          ]);
           return (fmts && fmts.indexOf("qr_code") !== -1) ? new window.BarcodeDetector({ formats: ["qr_code"] }) : null;
         } catch (e) { return null; }
       })();
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          video: {
+            facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 },
+            // Continuous autofocus matters a lot more here than resolution
+            // does — a card held 10-15cm from the camera (as scanning
+            // instructions ask for) is well inside "macro" range, and a
+            // camera left on its default focus mode can take a couple of
+            // seconds to notice and refocus that close, during which every
+            // frame is too blurry for either detector to read. Not every
+            // browser/device honours this constraint, but Chrome on
+            // Android generally does, and it's harmless where unsupported.
+            focusMode: { ideal: "continuous" }
+          }
         });
       } catch (e) {
         setQrLiveMsg("❌ Camera nahi khul paaya: " + (e && e.message ? e.message : e) +
@@ -5191,6 +5383,17 @@ function CheckInView({
       v.setAttribute("playsinline", "true");
       v.muted = true;
       try { await v.play(); } catch (e) { /* some browsers autoplay anyway */ }
+      // Torch (flashlight) support — exposed to the UI via qrTorchTrackRef
+      // so a button can toggle it; poor lobby/reception lighting is a
+      // common, purely-optical reason scans fail no matter how good the
+      // decode logic is. Silently does nothing on devices/cameras that
+      // don't support it (front cameras, laptops, many iPhones via Safari).
+      try {
+        const track = localStream.getVideoTracks()[0];
+        const caps = track && track.getCapabilities ? track.getCapabilities() : null;
+        qrTorchTrackRef.current = (caps && caps.torch) ? track : null;
+        setQrTorchAvailable(!!qrTorchTrackRef.current);
+      } catch (e) { qrTorchTrackRef.current = null; setQrTorchAvailable(false); }
 
       const detector = await detectorCapabilityPromise;
       if (!detector && !window.jsQR) {
@@ -6136,13 +6339,22 @@ function CheckInView({
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: { fontWeight: 700, fontSize: 14 }
-  }, "📷 Live QR Scan"), /*#__PURE__*/React.createElement("button", {
+  }, "📷 Live QR Scan"), /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", gap: 8 }
+  }, qrTorchAvailable && /*#__PURE__*/React.createElement("button", {
+    onClick: toggleQrTorch,
+    style: {
+      background: qrTorchOn ? "#fbbf24" : "rgba(255,255,255,.15)",
+      border: "none", borderRadius: 8,
+      color: qrTorchOn ? "#1a1a1a" : "#fff", padding: "8px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer"
+    }
+  }, qrTorchOn ? "🔦 On" : "🔦 Light"), /*#__PURE__*/React.createElement("button", {
     onClick: stopQrLive,
     style: {
       background: "rgba(255,255,255,.15)", border: "none", borderRadius: 8,
       color: "#fff", padding: "8px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer"
     }
-  }, "✕ Band karo")), /*#__PURE__*/React.createElement("div", {
+  }, "✕ Band karo"))), /*#__PURE__*/React.createElement("div", {
     style: { flex: 1, position: "relative", overflow: "hidden" }
   }, /*#__PURE__*/React.createElement("video", {
     ref: qrVideoRef,
@@ -6525,7 +6737,28 @@ function CheckInView({
     onChange: e => fld("purpose", e.target.value)
   }, ["Leisure", "Business", "Medical", "Pilgrimage", "Family Visit", "Other"].map(p => /*#__PURE__*/React.createElement("option", {
     key: p
-  }, p)))))), /*#__PURE__*/React.createElement("div", {
+  }, p)))))), hasFeature("ota_import") && /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: { padding: "14px 16px", marginTop: 12 }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: "var(--muted)",
+      display: "block",
+      marginBottom: 5
+    }
+  }, "BOOKING SOURCE"), /*#__PURE__*/React.createElement("select", {
+    value: form.bookingSource,
+    onChange: e => fld("bookingSource", e.target.value)
+  }, ["Direct", "Agoda", "MakeMyTrip", "Goibibo", "Booking.com", "Yatra", "Other OTA"].map(s => /*#__PURE__*/React.createElement("option", {
+    key: s
+  }, s))), form.bookingSource !== "Direct" && /*#__PURE__*/React.createElement("input", {
+    value: form.otaReference,
+    onChange: e => fld("otaReference", e.target.value),
+    placeholder: form.bookingSource + " booking/confirmation number",
+    style: { marginTop: 8 }
+  })), /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: { padding: "14px 16px", marginTop: 12 }
   }, /*#__PURE__*/React.createElement("label", {
@@ -6670,6 +6903,7 @@ function ProfileEditModal({
   const [hotelPhone, setHotelPhone] = useState(profile.hotelPhone || "");
   const [hotelEmail, setHotelEmail] = useState(profile.hotelEmail || "");
   const [hotelGstin, setHotelGstin] = useState(profile.hotelGstin || "");
+  const [invoiceFooterName, setInvoiceFooterName] = useState(profile.invoiceFooterName || "");
   const [gstMode, setGstMode] = useState(profile.gstMode || "exclusive");
   const [aadhaarPhotoPolicy, setAadhaarPhotoPolicy] = useState(profile.aadhaarPhotoPolicy || "none");
   const onImg = (e, kind) => {
@@ -6710,6 +6944,7 @@ function ProfileEditModal({
       hotelPhone: hotelPhone.trim(),
       hotelEmail: hotelEmail.trim(),
       hotelGstin: hotelGstin.trim().toUpperCase(),
+      invoiceFooterName: invoiceFooterName.trim(),
       gstMode,
       aadhaarPhotoPolicy
     });
@@ -6863,6 +7098,24 @@ function ProfileEditModal({
       marginTop: 4
     }
   }, "Agar GST registered ho, invoice pe correctly print hoga")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: "var(--muted)",
+      display: "block",
+      marginBottom: 5
+    }
+  }, "Invoice Footer Name (Optional)"), /*#__PURE__*/React.createElement("input", {
+    value: invoiceFooterName,
+    onChange: e => setInvoiceFooterName(e.target.value),
+    placeholder: hotelName || "e.g. Heera Continental"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "var(--muted)",
+      marginTop: 4
+    }
+  }, "\"Thank you for staying with ___\" line pe yeh naam dikhega, agar khaali chhoda toh poora registered naam use hoga")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     style: {
       fontSize: 12,
       fontWeight: 600,
@@ -7542,7 +7795,12 @@ function BookingModal({
       color: "#fff",
       fontFamily: "'Josefin Sans',sans-serif"
     }
-  }, "Room ", b.roomId), /*#__PURE__*/React.createElement("div", {
+  }, "Room ", b.roomId, b.bookingSource && b.bookingSource !== "Direct" && /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: 8, fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 10,
+      background: "rgba(251,191,36,.2)", color: "#fbbf24", verticalAlign: "middle"
+    }
+  }, "🌐 ", b.bookingSource)), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 13,
       color: "rgba(255,255,255,.7)",
@@ -8561,6 +8819,55 @@ function LocalRecordsSearch() {
     title: p.name
   }))))))));
 }
+// Owner-facing card showing the shareable direct-booking link (for
+// Facebook/Instagram/WhatsApp bios, posts, etc). Reads the license key
+// straight from localStorage — same value every staff login already
+// depends on — so this needs no props at all.
+function DirectBookingLinkCard() {
+  const [copied, setCopied] = useState(false);
+  const key = (localStorage.getItem("ab_license_key") || "").trim().toUpperCase();
+  const link = key ? `${window.location.origin}/?book=${key}` : "";
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      // Clipboard API can be blocked on some in-app browsers — text is
+      // already visible and selectable in the box below as a fallback.
+    }
+  };
+  const shareLink = async () => {
+    if (navigator.share) {
+      navigator.share({ title: "Book a room", text: "Book your stay directly:", url: link }).catch(() => {});
+    } else {
+      copyLink();
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff", border: "1.5px solid #fbbf24", borderRadius: 12,
+      padding: 14, marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { fontWeight: 700, fontSize: 13, color: "#d97706", marginBottom: 4 }
+  }, "🌐 Direct Booking Link"), /*#__PURE__*/React.createElement("div", {
+    style: { color: "var(--muted)", fontSize: 12, marginBottom: 10, lineHeight: 1.5 }
+  }, "Yeh link Facebook, Instagram bio, WhatsApp status kahin bhi share karo — guest yahan se seedha booking REQUEST bhej sakta hai, jo tum Dashboard se confirm/decline karte ho. Koi payment nahi lagti, koi login nahi chahiye guest ko."),
+  /*#__PURE__*/React.createElement("div", {
+    style: { fontSize: 12, wordBreak: "break-all", background: "#fdf8f0", padding: 10, borderRadius: 8, fontFamily: "monospace", color: "#333" }
+  }, link || "License key nahi mila"),
+  /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 10 } },
+    /*#__PURE__*/React.createElement("button", {
+      onClick: copyLink, disabled: !link,
+      style: { flex: 1, padding: "9px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+    }, copied ? "✅ Copied" : "📋 Copy Link"),
+    /*#__PURE__*/React.createElement("button", {
+      onClick: shareLink, disabled: !link,
+      style: { flex: 1, padding: "9px", borderRadius: 8, border: "none", background: "var(--gold)", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+    }, "📤 Share")));
+}
+
 function StorageSettingsView({
   user,
   profile,
@@ -9134,7 +9441,7 @@ function StorageSettingsView({
     style: { fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }
   }, "Form III khud portal (indianfrro.gov.in) par file karna hota hai — koi bhi software apne aap submit nahi kar sakta. Yeh sheet wahan bharne aur apne record ke liye hai."), exportStatus && /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
-  }, exportStatus)), user?.role === "Owner" && /*#__PURE__*/React.createElement("div", {
+  }, exportStatus)), user?.role === "Owner" && hasFeature("direct_booking") && /*#__PURE__*/React.createElement(DirectBookingLinkCard, null), user?.role === "Owner" && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#fff", border: "1px solid var(--border)", borderRadius: 12,
       padding: 14, marginTop: 14
@@ -9718,6 +10025,194 @@ const ALL_FEATURES = [
   { id: "storage", label: "Storage", icon: "💾" }
 ];
 
+// ── PUBLIC BOOKING REQUEST PAGE ──────────────────────────────────
+// Rendered instead of the normal staff app when the URL has a `?book=`
+// query param — no login, no phone-verification, nothing staff-only is
+// reachable from here. Reads the hotel's profile+rooms (already public
+// info in the same sense a hotel's own website would show — name,
+// address, room types, starting rates) and writes ONE new entry into a
+// SEPARATE `bookingRequests` list, never touching `bookings`, `users`,
+// or anything else a staff device relies on.
+//
+// IMPORTANT — this write only works once the hotel's Firestore Security
+// Rules explicitly allow it; nothing in this app's code can grant that
+// permission by itself (Security Rules live in the Firebase Console, not
+// in this codebase). Add a rule scoped ONLY to this one path, e.g.:
+//   match /hotels/{hotelId}/data/bookingRequests {
+//     allow get, list: if false;               // guests can't read others' requests
+//     allow write: if request.resource.data.value.size() <= 200;  // basic cap
+//   }
+// (adjust to taste — the point is: write-only, capped, nothing else public.)
+function PublicBookingPage({ licenseKey }) {
+  const [status, setStatus] = useState("loading"); // loading | ready | error | submitting | submitted
+  const [hotel, setHotel] = useState(null);
+  const [roomTypes, setRoomTypes] = useState([]);
+  const [checkIn, setCheckIn] = useState(todayStr());
+  const [checkOut, setCheckOut] = useState(tomorrowStr());
+  const [roomType, setRoomType] = useState("");
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState("");
+  const [notes, setNotes] = useState("");
+  const [hp, setHp] = useState(""); // honeypot — real guests never see or fill this field
+  const [refNo, setRefNo] = useState("");
+  const [errorMsg, setErrorMsg] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      if (!window._db) { setStatus("error"); return; }
+      try {
+        const hotelDoc = window._db.collection("hotels").doc(licenseKey).collection("data");
+        const [profileSnap, roomsSnap] = await Promise.all([
+          hotelDoc.doc("profile").get({ source: "server" }).catch(() => null),
+          hotelDoc.doc("rooms").get({ source: "server" }).catch(() => null)
+        ]);
+        const profileVal = profileSnap && profileSnap.exists ? profileSnap.data().value : null;
+        const roomsVal = roomsSnap && roomsSnap.exists ? roomsSnap.data().value : null;
+        if (!profileVal && !roomsVal) { setStatus("error"); return; }
+        setHotel(profileVal || {});
+        const rooms = Array.isArray(roomsVal) ? roomsVal : [];
+        // Group into TYPES with a "starting from" rate — never expose
+        // individual room numbers or live occupancy to a public page.
+        const byType = {};
+        rooms.forEach(r => {
+          if (!r || !r.type) return;
+          if (!byType[r.type]) byType[r.type] = { type: r.type, rate: r.rate || 0 };
+          else if ((r.rate || 0) < byType[r.type].rate) byType[r.type].rate = r.rate;
+        });
+        const types = Object.values(byType);
+        setRoomTypes(types);
+        setRoomType(types[0]?.type || "");
+        setStatus("ready");
+      } catch (e) {
+        setStatus("error");
+      }
+    })();
+  }, [licenseKey]);
+
+  const submit = async () => {
+    if (hp) return; // honeypot filled -> silently drop, likely a bot
+    if (!name.trim() || !phone.trim()) { setErrorMsg("Naam aur phone number zaroori hai."); return; }
+    if (!/^[6-9]\d{9}$/.test(phone.trim().replace(/\D/g, "").slice(-10))) {
+      setErrorMsg("Valid 10-digit mobile number daalo."); return;
+    }
+    if (checkOut <= checkIn) { setErrorMsg("Check-out, check-in ke baad hona chahiye."); return; }
+    // Basic client-side throttle — scoped to THIS hotel specifically (a
+    // guest legitimately comparing multiple hotels on the same phone/
+    // browser shouldn't be blocked from requesting each one). This is a
+    // speed bump, not real security — it stops accidental double-taps
+    // and unsophisticated scripted spam, not a determined attacker who
+    // can just clear storage; genuine abuse resistance has to live in
+    // the Firestore Security Rule itself (see the size/shape cap noted
+    // in this component's own top comment).
+    const cooldownKey = "ab_lastBookingReq_" + licenseKey;
+    const lastSubmit = Number(localStorage.getItem(cooldownKey) || 0);
+    if (Date.now() - lastSubmit < 2 * 60 * 1000) {
+      setErrorMsg("Aapne abhi ek request bheji hai — kripya 2 minute wait karo phir dobara try karo.");
+      return;
+    }
+    setErrorMsg("");
+    setStatus("submitting");
+    try {
+      if (!window._db) throw new Error("no connection");
+      const ref = window._db.collection("hotels").doc(licenseKey).collection("data").doc("bookingRequests");
+      const snap = await ref.get();
+      const existing = (snap.exists && snap.data().value) || [];
+      const reqId = "REQ" + Date.now().toString(36).toUpperCase();
+      const newReq = {
+        id: reqId, name: name.trim().slice(0, 100), phone: phone.trim().slice(0, 20),
+        email: email.trim().slice(0, 100),
+        checkIn, checkOut, roomType, notes: notes.trim().slice(0, 300),
+        status: "pending", createdAt: new Date().toISOString()
+      };
+      // Cap the list itself so one hotel's request queue can't grow
+      // unbounded if requests never get triaged — keep the most recent
+      // 200, same defensive pattern used for the audit log elsewhere.
+      const capped = [...existing, newReq].slice(-200);
+      await ref.set({ value: capped }, { merge: true });
+      localStorage.setItem(cooldownKey, String(Date.now()));
+      setRefNo(reqId);
+      setStatus("submitted");
+    } catch (e) {
+      setErrorMsg("Request submit nahi ho paayi (connection issue). Thodi der baad try karo, ya hotel ko seedha call karo.");
+      setStatus("ready");
+    }
+  };
+
+  const wrap = (children) => /*#__PURE__*/React.createElement("div", {
+    style: { minHeight: "100vh", background: "var(--cream, #fdf8f0)", padding: "20px 16px", fontFamily: "'Hind',sans-serif" }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { maxWidth: 480, margin: "0 auto" }
+  }, children));
+
+  if (status === "loading") {
+    return wrap(/*#__PURE__*/React.createElement("div", { style: { textAlign: "center", padding: "60px 0", color: "#888" } }, "⏳ Loading..."));
+  }
+  if (status === "error") {
+    return wrap(/*#__PURE__*/React.createElement("div", { style: { textAlign: "center", padding: "60px 0" } },
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 40 } }, "⚠️"),
+      /*#__PURE__*/React.createElement("div", { style: { marginTop: 10, color: "#555" } }, "Yeh booking link abhi kaam nahi kar raha. Hotel se seedha sampark karo.")));
+  }
+  if (status === "submitted") {
+    return wrap(/*#__PURE__*/React.createElement("div", { style: { textAlign: "center", padding: "50px 0" } },
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 48 } }, "✅"),
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 700, color: "#1e3a5f", marginTop: 12 } }, "Request Bhej Di Gayi!"),
+      /*#__PURE__*/React.createElement("div", { style: { color: "#666", marginTop: 8, lineHeight: 1.6 } },
+        "Hotel jald hi aapse ", phone, " par sampark karega confirm karne ke liye.",
+        /*#__PURE__*/React.createElement("br"), "Reference: ", /*#__PURE__*/React.createElement("b", null, refNo)),
+      /*#__PURE__*/React.createElement("div", { style: { marginTop: 6, fontSize: 12, color: "#999" } }, "(Yeh ek request hai, confirmed booking nahi — hotel confirm karega)")));
+  }
+
+  const inputStyle = { width: "100%", boxSizing: "border-box", padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", fontSize: 14, marginTop: 4 };
+  const labelStyle = { fontSize: 12, fontWeight: 700, color: "#666" };
+
+  return wrap(/*#__PURE__*/React.createElement(React.Fragment, null,
+    /*#__PURE__*/React.createElement("div", { style: { textAlign: "center", marginBottom: 18 } },
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 24, fontWeight: 700, color: "#1e3a5f", fontFamily: "'Josefin Sans',sans-serif" } }, hotel?.hotelName || "Hotel"),
+      hotel?.hotelAddr && /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, color: "#888", marginTop: 4 } }, hotel.hotelAddr)),
+    /*#__PURE__*/React.createElement("div", { style: { background: "#fff", borderRadius: 14, padding: 18, boxShadow: "0 2px 10px rgba(0,0,0,.06)" } },
+      /*#__PURE__*/React.createElement("div", { style: { fontWeight: 700, color: "#1e3a5f", marginBottom: 12 } }, "🛏️ Room Book Karo"),
+      /*#__PURE__*/React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", { style: labelStyle }, "CHECK-IN"),
+          /*#__PURE__*/React.createElement("input", { type: "date", value: checkIn, min: todayStr(), onChange: e => setCheckIn(e.target.value), style: inputStyle })),
+        /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", { style: labelStyle }, "CHECK-OUT"),
+          /*#__PURE__*/React.createElement("input", { type: "date", value: checkOut, min: checkIn, onChange: e => setCheckOut(e.target.value), style: inputStyle }))),
+      roomTypes.length > 0 && /*#__PURE__*/React.createElement("div", { style: { marginTop: 10 } },
+        /*#__PURE__*/React.createElement("label", { style: labelStyle }, "ROOM TYPE"),
+        /*#__PURE__*/React.createElement("select", { value: roomType, onChange: e => setRoomType(e.target.value), style: inputStyle },
+          roomTypes.map(t => /*#__PURE__*/React.createElement("option", { key: t.type, value: t.type }, t.type, " — from ₹", t.rate, "/night")))),
+      /*#__PURE__*/React.createElement("div", { style: { marginTop: 10 } },
+        /*#__PURE__*/React.createElement("label", { style: labelStyle }, "AAPKA NAAM *"),
+        /*#__PURE__*/React.createElement("input", { value: name, onChange: e => setName(e.target.value), placeholder: "Poora naam", style: inputStyle })),
+      /*#__PURE__*/React.createElement("div", { style: { marginTop: 10 } },
+        /*#__PURE__*/React.createElement("label", { style: labelStyle }, "MOBILE NUMBER *"),
+        /*#__PURE__*/React.createElement("input", { value: phone, onChange: e => setPhone(e.target.value), placeholder: "10-digit number", style: inputStyle })),
+      /*#__PURE__*/React.createElement("div", { style: { marginTop: 10 } },
+        /*#__PURE__*/React.createElement("label", { style: labelStyle }, "EMAIL (Optional)"),
+        /*#__PURE__*/React.createElement("input", { value: email, onChange: e => setEmail(e.target.value), placeholder: "email@example.com", style: inputStyle })),
+      /*#__PURE__*/React.createElement("div", { style: { marginTop: 10 } },
+        /*#__PURE__*/React.createElement("label", { style: labelStyle }, "SPECIAL REQUEST (Optional)"),
+        /*#__PURE__*/React.createElement("textarea", { value: notes, onChange: e => setNotes(e.target.value), rows: 2, style: { ...inputStyle, resize: "vertical" } })),
+      // Honeypot — invisible to real users via CSS, but a bot filling
+      // every field on the page will fill this too, marking the submit
+      // as spam without needing a CAPTCHA.
+      /*#__PURE__*/React.createElement("input", {
+        value: hp, onChange: e => setHp(e.target.value), tabIndex: -1, autoComplete: "off",
+        style: { position: "absolute", left: "-9999px", width: 1, height: 1 }
+      }),
+      errorMsg && /*#__PURE__*/React.createElement("div", { style: { color: "#dc2626", fontSize: 12, marginTop: 10 } }, errorMsg),
+      /*#__PURE__*/React.createElement("button", {
+        onClick: submit, disabled: status === "submitting",
+        style: {
+          width: "100%", marginTop: 16, padding: "13px", borderRadius: 10, border: "none",
+          background: "var(--gold, #d97706)", color: "#fff", fontWeight: 700, fontSize: 15,
+          cursor: status === "submitting" ? "default" : "pointer", opacity: status === "submitting" ? 0.7 : 1
+        }
+      }, status === "submitting" ? "⏳ Bhej rahe hain..." : "Booking Request Bhejo")),
+    /*#__PURE__*/React.createElement("div", { style: { textAlign: "center", fontSize: 11, color: "#aaa", marginTop: 14 } },
+      "Yeh ek request hai — hotel confirm karega, payment abhi nahi lagegi.")));
+}
+
 function App() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState(null);
@@ -9738,7 +10233,14 @@ function App() {
     const iv = setInterval(() => {
       if (!Session.valid()) {
         setUser(null);
-        WS.del("cu");
+        // Firestore Security Rules deliberately deny delete on hotel
+        // data documents (protects guest registers from being wiped by
+        // a compromised/buggy client) — "cu" lives at that same path, so
+        // clearing it has to be a write, not a delete. Overwriting with
+        // null reads back exactly the same as "nobody logged in" (see
+        // the boot-time `if (u) setUser(u)` check), so this is
+        // functionally identical to deleting it.
+        WS.set("cu", null);
         setView("dash");
         alert("Session expired. Please login again.");
       }
@@ -9756,6 +10258,7 @@ function App() {
   const [licenseSet, setLicenseSet] = useState(() => !!localStorage.getItem("ab_license_key"));
   // In-app invoice viewer (replaces the old blank popup window)
   const [invoiceView, setInvoiceView] = useState(null); // {b, room, html}
+  const [sharePdfBusy, setSharePdfBusy] = useState(false);
   const invoiceFrameRef = useRef(null);
   useEffect(() => {
     OPEN_INVOICE_HANDLER = (b, room) => {
@@ -9774,9 +10277,10 @@ function App() {
     f.contentWindow.print();
   };
   const shareInvoicePDF = async () => {
-    if (!invoiceView) return;
+    if (!invoiceView || sharePdfBusy) return;
+    setSharePdfBusy(true);
     try {
-      const blob = buildInvoicePDFBlob(invoiceView.b, invoiceView.room);
+      const blob = await buildInvoicePDFFromHTML(invoiceView.b, invoiceView.room);
       const fileLabel = invoiceView.b.invoiceNo || invoiceView.b.id;
       const file = new File([blob], `invoice-${fileLabel.replace(/\//g, "-")}.pdf`, { type: "application/pdf" });
       // Share the actual PDF where supported (WhatsApp appears in the sheet
@@ -9796,7 +10300,29 @@ function App() {
       alert("PDF download ho gaya — ab WhatsApp mein attach karke bhej sakte ho.");
     } catch (e) {
       if (e && e.name === "AbortError") return; // user dismissed the sheet
-      alert("PDF share nahi ho paaya: " + e.message);
+      // If the html2canvas/jsPDF path fails for any reason (e.g. the very
+      // first load couldn't fetch the libraries because the device is
+      // offline), fall back to the older hand-drawn PDF rather than
+      // leaving the user with no way to share at all.
+      try {
+        const blob = buildInvoicePDFBlob(invoiceView.b, invoiceView.room);
+        const fileLabel = invoiceView.b.invoiceNo || invoiceView.b.id;
+        const file = new File([blob], `invoice-${fileLabel.replace(/\//g, "-")}.pdf`, { type: "application/pdf" });
+        if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+          await navigator.share({ files: [file], title: "Invoice " + fileLabel });
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = file.name;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          alert("PDF download ho gaya (basic format — internet na hone ki wajah se).");
+        }
+      } catch (e2) {
+        alert("PDF share nahi ho paaya: " + e.message);
+      }
+    } finally {
+      setSharePdfBusy(false);
     }
   };
   // NOTE: the local-folder feature deliberately does NOT prompt for
@@ -9889,6 +10415,10 @@ function App() {
     try { const v = localStorage.getItem("ab_bookings"); if (v) return JSON.parse(v); } catch {}
     return [];
   });
+  const [bookingRequests, setBookingRequests] = useState(() => {
+    try { const v = localStorage.getItem("ab_bookingRequests"); if (v) return JSON.parse(v); } catch {}
+    return [];
+  });
   const [modal, setModal] = useState(null);
   const [checkInRoom, setCIR] = useState(null);
   const [profile, setProfile] = useState(() => {
@@ -9903,6 +10433,7 @@ function App() {
         hotelPhone: localStorage.getItem("hotelPhone") || "",
         hotelEmail: localStorage.getItem("hotelEmail") || "",
         hotelGstin: localStorage.getItem("hotelGstin") || "",
+        invoiceFooterName: localStorage.getItem("invoiceFooterName") || "",
         gstMode: localStorage.getItem("gstMode") || "exclusive",
         // "none" (default) = Aadhaar card images are never stored anywhere,
         // only the extracted text + masked number. This is the only fully
@@ -9922,6 +10453,7 @@ function App() {
         hotelPhone: "",
         hotelEmail: "",
         hotelGstin: "",
+        invoiceFooterName: "",
         gstMode: "exclusive",
         aadhaarPhotoPolicy: "none"
       };
@@ -9945,6 +10477,7 @@ function App() {
       localStorage.setItem("hotelPhone", p.hotelPhone || "");
       localStorage.setItem("hotelEmail", p.hotelEmail || "");
       localStorage.setItem("hotelGstin", p.hotelGstin || "");
+      localStorage.setItem("invoiceFooterName", p.invoiceFooterName || "");
       localStorage.setItem("gstMode", p.gstMode || "exclusive");
       localStorage.setItem("aadhaarPhotoPolicy", p.aadhaarPhotoPolicy || "none");
       if (p.hotelLogo) localStorage.setItem("hotelLogo", p.hotelLogo);else localStorage.removeItem("hotelLogo");
@@ -10045,6 +10578,7 @@ function App() {
     let unsubBk = () => {};
     let unsubProfile = () => {};
     let unsubPerms = () => {};
+    let unsubBookingRequests = () => {};
     let cancelled = false;
     let pollTimer = null;
 
@@ -10124,6 +10658,17 @@ function App() {
           if (data) setPermissions(data);
         });
       }, 900);
+      // Booking requests (from the public direct-booking link) — live, so
+      // a new request shows up on the Dashboard without waiting on the
+      // 20s poll. Only matters for hotels with the add-on enabled, but
+      // registering the listener unconditionally is harmless — an empty
+      // list for hotels that never had any requests costs one small read.
+      setTimeout(() => {
+        if (cancelled) return;
+        unsubBookingRequests = WS.onSnapshot("bookingRequests", data => {
+          if (data) setBookingRequests(data);
+        });
+      }, 1200);
       // Connection state monitor
       window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
     };
@@ -10183,6 +10728,7 @@ function App() {
       unsubBk();
       unsubProfile();
       unsubPerms();
+      unsubBookingRequests();
     };
   }, []);
 
@@ -10254,7 +10800,39 @@ function App() {
     if (!localSaved) console.warn("⚠️ Could not save bookings locally even after aggressive pruning — device storage is critically full. Cloud sync still attempted below.");
     try {
       const ref = WS._ref("bookings");
-      if (ref) await ref.set({ value: sanitizeBookingsForCloud(b), ts: Date.now() }, { merge: true });
+      const cloudPayload = sanitizeBookingsForCloud(b);
+      // Early warning for a genuinely different problem than the local
+      // pruning above: Firestore caps a SINGLE document at 1 MiB, and
+      // every checked-out guest this hotel has EVER had lives in this
+      // ONE document (photos are already stripped by
+      // sanitizeBookingsForCloud, but the records themselves accumulate
+      // forever). A busy hotel can approach that ceiling within a year
+      // or two of steady use, at which point every check-in/checkout
+      // would start failing to sync — with no obvious cause from the
+      // Owner's side. Warning well before that point (at 50% — tested
+      // against realistic record sizes, this leaves roughly a year of
+      // runway at typical busy-hotel volumes, not just a few weeks) turns a
+      // future silent, mysterious failure into something support can
+      // proactively archive old records for ahead of time. This does
+      // NOT delete or move anything by itself — it only warns; guest
+      // registers are a legal retention requirement, and safely
+      // archiving them needs care and its own release, not a rushed
+      // in-place rewrite of daily check-in/checkout logic.
+      const approxBytes = new Blob([JSON.stringify(cloudPayload)]).size;
+      const FIRESTORE_DOC_LIMIT = 1048576;
+      if (approxBytes > FIRESTORE_DOC_LIMIT * 0.5 && user?.role === "Owner") {
+        const warnKey = "ab_bookingsSizeWarnedAt";
+        const lastWarned = Number(localStorage.getItem(warnKey) || 0);
+        if (Date.now() - lastWarned > 24 * 60 * 60 * 1000) { // once/day at most
+          localStorage.setItem(warnKey, String(Date.now()));
+          setTimeout(() => alert(
+            "⚠️ Storage Warning: Aapka booking history bahut bada ho gaya hai (" +
+            Math.round(approxBytes / 1024) + " KB). Ek limit ke baad naya check-in/checkout cloud mein save hona band ho sakta hai.\n\n" +
+            "Bizsathi support se sampark karo purane guest records archive karwane ke liye."
+          ), 500);
+        }
+      }
+      if (ref) await ref.set({ value: cloudPayload, ts: Date.now() }, { merge: true });
     } catch (e) { console.warn("FB set bookings:", e.message); }
     setSyncing(false);
     AuditLog.add('CHECKIN', b[b.length - 1]?.name || 'guest');
@@ -10394,6 +10972,20 @@ function App() {
     AuditLog.add('EXTEND_STAY', b.name + ' -> ' + newCheckOut);
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: updated }));
   };
+  // Booking requests from the public link are a REQUEST queue, not a
+  // reservation-calendar — accepting one does not block a room or create
+  // a booking by itself (this app doesn't yet track future-dated room
+  // holds). It marks the request "confirmed" so staff can see at a
+  // glance who to expect, and check them in normally through Check-In
+  // when they actually arrive, using the request's details as reference.
+  const handleRequestDecision = async (reqId, decision, reason) => {
+    const updated = bookingRequests.map(r => r.id === reqId
+      ? { ...r, status: decision, decidedAt: new Date().toISOString(), decisionReason: reason || "" }
+      : r);
+    setBookingRequests(updated);
+    await WS.set("bookingRequests", updated).catch(() => {});
+    AuditLog.add(decision === "confirmed" ? "BOOKING_REQUEST_ACCEPTED" : "BOOKING_REQUEST_DECLINED", reqId);
+  };
   const handleCheckOut = async (bid, paymentMode) => {
     const b = bookings.find(x => x.id === bid);
     const room = rooms.find(r => r.id === b.roomId);
@@ -10453,7 +11045,11 @@ function App() {
     AuditLog.add("LOGOUT", user?.u || "");
     setUser(null);
     Session.clear();
-    await WS.del("cu");
+    // See the session-timeout handler above for why this is a set(null)
+    // and not a delete() — Security Rules deny delete on this path on
+    // purpose, and a null value here is read back as "logged out" the
+    // same way an absent document would be.
+    await WS.set("cu", null);
     setView("dash");
   };
 
@@ -10675,7 +11271,9 @@ function App() {
     user: user,
     setView: setView,
     setModal: setModal,
-    profile: profile
+    profile: profile,
+    bookingRequests: bookingRequests,
+    onRequestDecision: handleRequestDecision
   }), view === "rooms" && /*#__PURE__*/React.createElement(RoomsView, {
     rooms: rooms,
     bookings: bookings,
@@ -10725,11 +11323,13 @@ function App() {
     }
   }, "🖨️ Print"), /*#__PURE__*/React.createElement("button", {
     onClick: shareInvoicePDF,
+    disabled: sharePdfBusy,
     style: {
       background: "var(--gold)", border: "none", borderRadius: 8,
-      color: "#fff", padding: "9px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer"
+      color: "#fff", padding: "9px 12px", fontSize: 13, fontWeight: 700,
+      cursor: sharePdfBusy ? "default" : "pointer", opacity: sharePdfBusy ? 0.7 : 1
     }
-  }, "📤 Share on WhatsApp")), /*#__PURE__*/React.createElement("iframe", {
+  }, sharePdfBusy ? "⏳ Tayyar kar rahe hain..." : "📤 Share on WhatsApp")), /*#__PURE__*/React.createElement("iframe", {
     ref: invoiceFrameRef,
     srcDoc: invoiceView.html,
     title: "Invoice",
@@ -10804,8 +11404,16 @@ function App() {
 }
 
 // Mount React app and hide loader
+// A `?book=LICENSE-KEY` URL renders the public booking-request page
+// instead of the normal staff app — no login, no phone-verification,
+// nothing staff-only reachable from this path.
+const _bookParam = new URLSearchParams(window.location.search).get("book");
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(/*#__PURE__*/React.createElement(App, null));
+if (_bookParam) {
+  root.render(/*#__PURE__*/React.createElement(PublicBookingPage, { licenseKey: _bookParam.trim().toUpperCase() }));
+} else {
+  root.render(/*#__PURE__*/React.createElement(App, null));
+}
 setTimeout(() => {
   const l = document.getElementById('loader');
   if (l) l.style.display = 'none';

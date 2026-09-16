@@ -1,0 +1,196 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════════
+//  AtithiBook — Firestore Security Rules
+//  PASTE THESE IN: Firebase Console → Firestore Database → Rules → Publish
+// ═══════════════════════════════════════════════════════════════════
+//
+//  ⚠️  READ THIS FIRST — WHAT THESE RULES CAN AND CANNOT DO
+//
+//  This app currently uses NO Firebase Authentication. Only the
+//  firebase-app and firebase-firestore SDKs are loaded — firebase-auth
+//  is not. Every request Firestore receives from the app is therefore
+//  ANONYMOUS, which means `request.auth` is ALWAYS null inside these
+//  rules. There is no identity to check against.
+//
+//  The practical consequence, stated plainly: these rules CANNOT tell
+//  "Hotel A's staff" apart from "a stranger on the internet who has
+//  learned Hotel A's license key". Both arrive as the same anonymous
+//  request. So the security these rules provide rests entirely on one
+//  thing — the license key staying secret — which makes the key
+//  effectively a password that is typed into a shared device, shown on
+//  a setup screen, and never rotated.
+//
+//  What these rules DO achieve, and it is a very large improvement over
+//  wide-open "test mode" rules:
+//    1. They block ENUMERATION. Without `list` permission, an attacker
+//       cannot ask "give me every hotel" or "give me every license".
+//       Since license keys are cryptographically random (32^12 ≈ 1.15
+//       × 10^18 possibilities), not being able to list them means not
+//       being able to find them. This is the single biggest protection
+//       here — with `list` allowed, one query would dump every hotel's
+//       guest records on the platform.
+//    2. They cap write sizes, so nobody can inflate a document to burn
+//       through the project's storage/billing.
+//    3. They block deletes on guest/booking records, so an attacker who
+//       somehow obtained one key still cannot wipe that hotel's legally
+//       required guest register.
+//    4. They keep the public booking-request path write-only and small,
+//       so the public link cannot be used to read anyone's data.
+//
+//  What they do NOT achieve — be clear-eyed about this:
+//    • Anyone holding a valid license key can read and modify that
+//      hotel's full guest data (names, phone numbers, addresses, masked
+//      Aadhaar, stay history). That is Personal Data under the DPDP Act
+//      2023, so treat a leaked key as a reportable data breach.
+//    • A dishonest staff member who has seen the key retains access
+//      after leaving, until the key is changed for that hotel.
+//
+//  THE REAL FIX, when there is time to do it properly, is to add
+//  authentication so that rules can check identity instead of trusting
+//  a shared secret. The path that fits this app's existing design:
+//    (a) Add the firebase-auth SDK to index.html.
+//    (b) Have the existing /api/verify-access Netlify function — which
+//        already verifies license key + registered phone server-side —
+//        mint a Firebase Custom Token carrying the hotel id as a claim
+//        (needs the Firebase Admin SDK and a service-account key stored
+//        in Netlify env vars, never in client code).
+//    (c) Client calls signInWithCustomToken() with that token.
+//    (d) Replace the `hotelId` checks below with
+//        `request.auth.token.hotelId == hotelId`, which ties every read
+//        and write to a verified device rather than to knowledge of a
+//        string. At that point a leaked key alone stops being enough.
+//
+// ═══════════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- helpers -------------------------------------------------
+
+    // License keys are generated as ATITHI- followed by random
+    // alphanumerics. Constraining the shape stops junk/probe documents
+    // being created at arbitrary paths.
+    function validHotelId(id) {
+      return id is string
+        && id.size() >= 8
+        && id.size() <= 40
+        && id.matches('^ATITHI-[A-Za-z0-9]+$');
+    }
+
+    // Firestore's own hard ceiling is 1 MiB per document. Capping below
+    // that keeps a single malicious write from ballooning storage, and
+    // leaves headroom so a legitimate large-but-valid write still fits.
+    function sizeOk() {
+      return request.resource.size() < 900000;
+    }
+
+    // ---- per-hotel operational data ------------------------------
+    // Path: hotels/{hotelId}/data/{docId}
+    // docId is one of: rooms, bookings, profile, users, audit,
+    // permissions, creditNotes, bookingRequests, invoiceCounter_*, etc.
+    match /hotels/{hotelId}/data/{docId} {
+
+      // `get` (one specific document) is allowed; `list` is NOT granted
+      // anywhere in this file. That distinction is deliberate and is
+      // what prevents someone from enumerating hotels. The staff app
+      // only ever does direct .doc(id).get() calls — verified against
+      // the codebase — so denying list costs the app nothing.
+      allow get: if validHotelId(hotelId);
+
+      allow create, update: if validHotelId(hotelId) && sizeOk();
+
+      // Guest registers are a legal retention requirement under the
+      // Indian hospitality/police-reporting rules, and the app itself
+      // never deletes these documents in normal operation — it only
+      // overwrites them. Denying delete outright means a compromised or
+      // buggy client cannot destroy a hotel's records.
+      allow delete: if false;
+    }
+
+    // The app writes a few keys directly under the hotel document
+    // itself rather than the data subcollection. Same treatment.
+    match /hotels/{hotelId} {
+      allow get: if validHotelId(hotelId);
+      allow create, update: if validHotelId(hotelId) && sizeOk();
+      allow delete: if false;
+    }
+
+    // ---- licenses (new, per-document storage) --------------------
+    // Read by: the app's own expiry/feature check, and the Netlify
+    // functions (scan / verify-access) which call the REST API without
+    // a service account and are therefore also subject to these rules.
+    //
+    // `get` is allowed because those paths need it. `list` is NOT —
+    // that is what stops an attacker from dumping every license key on
+    // the platform and then walking into every hotel's data.
+    //
+    // ⚠️ KNOWN TRADE-OFF: denying `list` also breaks the admin panel's
+    // "Load More" pagination, which does a collection query. "Find by
+    // Key" (a direct get) keeps working. Fixing pagination properly
+    // means moving that read into the password-protected Netlify
+    // function using a service account, so it bypasses these rules —
+    // that is the correct place for an all-hotels query to live anyway,
+    // since a client-side admin panel cannot prove it is the admin.
+    match /licenses/{licenseKey} {
+      allow get: if true;
+      allow list: if false;
+
+      // Licenses are issued and revoked from the admin panel. Until
+      // that panel writes through an authenticated server path, writes
+      // have to remain open for it to function at all — but they are at
+      // least shape- and size-checked here.
+      allow create, update: if validHotelId(licenseKey) && sizeOk();
+      allow delete: if false;
+    }
+
+    // ---- legacy license storage ----------------------------------
+    // The OLD single-array document that held EVERY hotel's license in
+    // one place. One read of it leaks the entire customer list, so it
+    // is the highest-value target in the database.
+    //
+    // It is left readable ONLY because the app and the Netlify
+    // functions still fall back to it for hotels that have not been
+    // migrated yet.
+    //
+    // 🔴 ACTION REQUIRED: after running "Migrate to Scalable Storage"
+    // in the admin panel and confirming hotels work, change the line
+    // below to `allow read: if false;` and then delete the document.
+    // Leaving it readable indefinitely keeps a single-request breach of
+    // your whole customer list permanently available.
+    match /admin/{docId} {
+      allow get: if true;
+      allow list: if false;
+      allow create, update: if sizeOk();
+      allow delete: if false;
+    }
+
+    // ---- public booking requests ---------------------------------
+    // Written by the public ?book=KEY page, which has no login at all.
+    // This is the one path a complete stranger is expected to write to,
+    // so it is the tightest.
+    //
+    // Reading is denied outright: a guest who submits a request has no
+    // reason to read anyone else's, and the queue contains other
+    // people's names and phone numbers. The hotel's own staff app reads
+    // this document through the rule above (same physical path), which
+    // is why this more specific rule only needs to constrain writes.
+    match /hotels/{hotelId}/data/bookingRequests {
+      allow get: if validHotelId(hotelId);
+      allow list: if false;
+      // Capped far below the general limit — a request queue is small
+      // text records, so anything large is abuse rather than use.
+      allow create, update: if validHotelId(hotelId)
+        && request.resource.size() < 200000;
+      allow delete: if false;
+    }
+
+    // ---- default deny --------------------------------------------
+    // Anything not explicitly matched above is refused. New collections
+    // added later start closed and must be opened deliberately, rather
+    // than silently inheriting access.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

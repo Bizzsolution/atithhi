@@ -32,8 +32,41 @@ function parseLicenseEntry(mapValue) {
   };
 }
 
-// ── Check license against live Firestore admin/licenses doc (no SDK, plain fetch) ──
+// ── Check license — NEW scalable path first, OLD array as fallback ──
+// A license lives at its OWN document `licenses/{KEY}` now, not as one
+// entry inside a single giant `admin/licenses` array — that array doc
+// has Firestore's hard 1 MiB-per-document ceiling, and EVERY hotel's
+// EVERY scan/verify call was downloading that WHOLE document just to
+// find its own one entry. At real scale (thousands of hotels, let alone
+// the ten-lakh target) that document would eventually stop accepting
+// writes entirely, and every check gets slower as more hotels sign up —
+// the opposite of what a per-hotel document gives, which is a single
+// small O(1) read no matter how many other hotels exist.
+// The OLD array is still checked as a fallback ONLY so a hotel that
+// hasn't been migrated yet (via the admin panel's migration button)
+// keeps working exactly as before — nothing breaks mid-transition.
 async function checkFirestoreLicense(licenseUpper) {
+  try {
+    const directUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/licenses/${encodeURIComponent(licenseUpper)}`;
+    const directRes = await fetch(directUrl);
+    if (directRes.ok) {
+      const doc = await directRes.json();
+      const entry = parseLicenseEntry({ fields: doc.fields });
+      if (entry.key === licenseUpper) {
+        if (entry.expiry && Date.now() > new Date(entry.expiry + "T23:59:59Z").getTime()) {
+          return { found: true, active: false, expired: true, expiry: entry.expiry };
+        }
+        return { found: true, active: entry.active, features: entry.features };
+      }
+    }
+    // 404 (not found at the new path) is expected for not-yet-migrated
+    // hotels and falls through to the old lookup below — only a genuine
+    // network/server error should be treated as "couldn't check".
+    if (directRes.status !== 404 && !directRes.ok) return { found: false, error: true };
+  } catch (e) {
+    // Network-level failure on the fast path — still try the old path
+    // below before giving up entirely.
+  }
   try {
     const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin/licenses`;
     const r = await fetch(url);
@@ -155,68 +188,82 @@ export async function handler(event) {
       return { statusCode: 200, headers, body: JSON.stringify({ ok: true, licensed: true }) };
     }
 
-    // ── OCR: GROQ PRIMARY ──
+    // ── OCR: GEMINI PRIMARY ──
+    // Chosen as primary for accuracy on structured ID-document extraction —
+    // Gemini's vision pipeline is purpose-built for document/OCR tasks,
+    // whereas Groq's strength is raw inference speed on open-weight models
+    // (vision is a secondary capability there). Groq below is the fallback
+    // for outages, not for lower per-scan accuracy.
     // MODEL NAMES ARE CONFIGURABLE — if a provider deprecates a model, fix it
     // in Netlify dashboard (env var) instead of editing code:
-    //   Site settings → Environment variables → GROQ_MODELS
-    //   Comma-separated list, tried in order. Example:
-    //   "qwen/qwen3.6-27b,llama-3.2-90b-vision-preview"
+    //   Site settings → Environment variables → GEMINI_MODELS
+    //   Comma-separated list, tried in order.
+    // Current as of Sept 2026 — gemini-2.0-flash was already shut down
+    // 1 June 2026, and gemini-2.5-flash retires 16 Oct 2026, so neither
+    // belongs in the default list any more. "gemini-flash-latest" is a
+    // Google-maintained alias that tracks whatever the current Flash
+    // model is, kept first so this list needs less manual upkeep over
+    // time; the two named models after it are explicit pins in case the
+    // alias ever points somewhere temporarily unavailable.
     let result = null;
     const lastErrors = { groq: null, gemini: null };
-    const groqKey = process.env.GROQ_API_KEY;
-    const groqModels = (process.env.GROQ_MODELS || "qwen/qwen3.6-27b")
+    const gKey = process.env.GEMINI_API_KEY;
+    const geminiModels = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-3-flash,gemini-3.1-flash-lite")
       .split(",").map(m => m.trim()).filter(Boolean);
-    if (groqKey) {
-      for (const model of groqModels) {
+    if (gKey) {
+      for (const model of geminiModels) {
         if (result) break;
         try {
-          const gr = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + groqKey },
-            body: JSON.stringify({
-              model,
-              messages: [{ role: "user", content: [
-                { type: "image_url", image_url: { url: "data:image/jpeg;base64," + image } },
-                { type: "text", text: prompt }
-              ]}],
-              max_tokens: 1000, temperature: 0,
-              reasoning_effort: "none" // Qwen3.6 defaults to "thinking mode" which
-              // burns tokens on visible <think> reasoning before the answer —
-              // for a direct extraction task like this we want the fast,
-              // direct answer only. Ignored harmlessly by non-Qwen Groq models.
-            })
+          const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gKey}`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ contents: [{ parts: [{ inlineData: { mimeType: "image/jpeg", data: image } }, { text: prompt }] }], generationConfig: { temperature: 0, maxOutputTokens: 400 } })
           });
-          const gd = await gr.json();
-          if (gr.ok && gd.choices?.[0]?.message?.content) {
-            result = { _groq: true, _text: gd.choices[0].message.content };
-          } else if (gd.error) {
-            lastErrors.groq = `[${model}] ` + (gd.error?.message || gd.error?.code || JSON.stringify(gd.error));
-            console.warn("Groq API error:", lastErrors.groq);
-          }
-        } catch (e) { lastErrors.groq = `[${model}] ` + e.message; console.warn("Groq:", e.message); }
+          const d = await r.json();
+          if (r.ok && d.candidates) { result = d; break; }
+          if (d.error) { lastErrors.gemini = d.error?.message; console.warn("Gemini API error:", d.error?.message); }
+        } catch (e) { lastErrors.gemini = e.message; console.warn("Gemini:", e.message); }
       }
     }
 
-    // ── OCR: GEMINI FALLBACK ──
-    // Also configurable — Netlify dashboard → GEMINI_MODELS (comma-separated,
-    // tried in order). Default list below is current as of Aug 2026.
-    // Gemini 2.5-flash is announced to shut down Oct 16, 2026 — update this
-    // list before then (check https://ai.google.dev/gemini-api/docs/models).
+    // ── OCR: GROQ FALLBACK ──
+    // Only reached if Gemini returned nothing usable (bad/missing key,
+    // rate limit, outage) — a safety net for availability, not a second
+    // attempt at higher accuracy.
+    //   Site settings → Environment variables → GROQ_MODELS
+    //   Comma-separated list, tried in order. Example:
+    //   "qwen/qwen3.6-27b,llama-3.2-90b-vision-preview"
     if (!result) {
-      const gKey = process.env.GEMINI_API_KEY;
-      const geminiModels = (process.env.GEMINI_MODELS || "gemini-2.5-flash,gemini-2.0-flash,gemini-flash-latest")
+      const groqKey = process.env.GROQ_API_KEY;
+      const groqModels = (process.env.GROQ_MODELS || "qwen/qwen3.6-27b")
         .split(",").map(m => m.trim()).filter(Boolean);
-      if (gKey) {
-        for (const model of geminiModels) {
+      if (groqKey) {
+        for (const model of groqModels) {
+          if (result) break;
           try {
-            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gKey}`, {
-              method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ contents: [{ parts: [{ inlineData: { mimeType: "image/jpeg", data: image } }, { text: prompt }] }], generationConfig: { temperature: 0, maxOutputTokens: 400 } })
+            const gr = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": "Bearer " + groqKey },
+              body: JSON.stringify({
+                model,
+                messages: [{ role: "user", content: [
+                  { type: "image_url", image_url: { url: "data:image/jpeg;base64," + image } },
+                  { type: "text", text: prompt }
+                ]}],
+                max_tokens: 1000, temperature: 0,
+                reasoning_effort: "none" // Qwen3.6 defaults to "thinking mode" which
+                // burns tokens on visible <think> reasoning before the answer —
+                // for a direct extraction task like this we want the fast,
+                // direct answer only. Ignored harmlessly by non-Qwen Groq models.
+              })
             });
-            const d = await r.json();
-            if (r.ok && d.candidates) { result = d; break; }
-            if (d.error) { lastErrors.gemini = d.error?.message; console.warn("Gemini API error:", d.error?.message); }
-          } catch (e) { lastErrors.gemini = e.message; console.warn("Gemini:", e.message); }
+            const gd = await gr.json();
+            if (gr.ok && gd.choices?.[0]?.message?.content) {
+              result = { _groq: true, _text: gd.choices[0].message.content };
+            } else if (gd.error) {
+              lastErrors.groq = `[${model}] ` + (gd.error?.message || gd.error?.code || JSON.stringify(gd.error));
+              console.warn("Groq API error:", lastErrors.groq);
+            }
+          } catch (e) { lastErrors.groq = `[${model}] ` + e.message; console.warn("Groq:", e.message); }
         }
       }
     }
