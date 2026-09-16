@@ -5236,6 +5236,7 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
   const qrVideoRef = useRef(null);
   const qrStreamRef = useRef(null);
   const qrLoopRef = useRef(null);
+  const qrDetectorRef = useRef(null);
   const qrTorchTrackRef = useRef(null);
   const [qrTorchAvailable, setQrTorchAvailable] = useState(false);
   const [qrTorchOn, setQrTorchOn] = useState(false);
@@ -5251,6 +5252,7 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
   const stopQrLive = () => {
     if (qrLoopRef.current) { cancelAnimationFrame(qrLoopRef.current); qrLoopRef.current = null; }
     if (qrStreamRef.current) { qrStreamRef.current.getTracks().forEach(t => t.stop()); qrStreamRef.current = null; }
+    qrDetectorRef.current = null;
     qrTorchTrackRef.current = null;
     setQrTorchAvailable(false);
     setQrTorchOn(false);
@@ -5368,21 +5370,28 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
       // negotiation — most phones take longer to lock onto 1920x1080 than
       // 1280x720, and 720p is already more than sharp enough to read a
       // QR code held anywhere near the camera.
-      const detectorCapabilityPromise = (async () => {
+      //
+      // The capability check itself is fire-and-forget into qrDetectorRef
+      // rather than something scanning waits on (or ever gives up on).
+      // On some Android/Chrome builds the underlying detection model
+      // hasn't finished downloading the first time it's used, and
+      // getSupportedFormats() can take several seconds — a fixed timeout
+      // here previously meant that on exactly those devices, scanning
+      // would give up on the fast native detector FOR THE ENTIRE SESSION
+      // and fall back to the much slower/less capable jsQR path even
+      // after the native one became ready moments later. The tick loop
+      // below reads qrDetectorRef.current fresh on every frame, so the
+      // moment this resolves — however long it takes — scanning upgrades
+      // to native detection immediately, with jsQR only ever covering the
+      // gap before that, never the whole session.
+      (async () => {
         try {
-          if (typeof window.BarcodeDetector === "undefined") return null;
-          const fmts = await Promise.race([
-            window.BarcodeDetector.getSupportedFormats().catch(() => []),
-            // On some Android/Chrome builds the underlying detection model
-            // hasn't finished downloading yet the first time it's used,
-            // and getSupportedFormats() can hang far longer than a user
-            // will wait. A timeout means scanning still starts on time
-            // (via jsQR) instead of the whole overlay appearing to do
-            // nothing while this silently stalls in the background.
-            new Promise(res => setTimeout(() => res([]), 800))
-          ]);
-          return (fmts && fmts.indexOf("qr_code") !== -1) ? new window.BarcodeDetector({ formats: ["qr_code"] }) : null;
-        } catch (e) { return null; }
+          if (typeof window.BarcodeDetector === "undefined") return;
+          const fmts = await window.BarcodeDetector.getSupportedFormats().catch(() => []);
+          if (fmts && fmts.indexOf("qr_code") !== -1) {
+            qrDetectorRef.current = new window.BarcodeDetector({ formats: ["qr_code"] });
+          }
+        } catch (e) { /* stays on jsQR */ }
       })();
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
@@ -5422,25 +5431,34 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
         setQrTorchAvailable(!!qrTorchTrackRef.current);
       } catch (e) { qrTorchTrackRef.current = null; setQrTorchAvailable(false); }
 
-      const detector = await detectorCapabilityPromise;
-      if (!detector && !window.jsQR) {
+      // Whether BarcodeDetector will actually become usable is still
+      // pending (the capability check above is fire-and-forget) — this
+      // just confirms SOME path is possible at all: either the API
+      // exists on this browser (even if not confirmed-ready yet) or jsQR
+      // is available as the always-on baseline.
+      if (typeof window.BarcodeDetector === "undefined" && !window.jsQR) {
         setQrLiveMsg("❌ Is browser mein QR scanning support nahi hai. Photo se AI scan use karo.");
         return;
       }
 
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      // jsQR's per-frame cost scales with pixel COUNT — decoding at full
-      // camera resolution (up to 1280x720 = ~920K pixels) on every frame
-      // was slow enough on mid-range phones that many frames never
-      // finished processing before the next was due, which is exactly
-      // what made scanning feel sluggish and miss codes (the `busy` gate
-      // below skips a frame outright while the previous one is still being
-      // decoded). QR codes don't need anywhere near full resolution to
-      // decode correctly, so jsQR gets a downscaled copy — roughly 4x
-      // fewer pixels — while the native BarcodeDetector (fast at any
-      // resolution) still reads the full-resolution frame directly.
-      const JSQR_MAX_DIM = 640;
+      // Aadhaar's own "Secure QR" is a DENSE code — it packs a compressed
+      // binary blob (name/address/photo/etc, not just a short URL like a
+      // UPI payment QR) into far more modules per side than a simple QR.
+      // The earlier 640px cap here was tuned for scan SPEED and worked
+      // fine for testing against simple QR content, but was nowhere near
+      // enough resolution to resolve a dense Aadhaar QR's fine grid —
+      // which is what "camera looks fine but never actually reads
+      // anything" was, on any device that fell through to this jsQR path
+      // (see the detector-availability note above for how that happens
+      // more than it should). 960px keeps meaningfully fewer pixels than
+      // the full 1280x720 capture for per-frame speed, while giving a
+      // dense code enough modules-per-pixel to actually resolve; the
+      // native BarcodeDetector (unaffected by any of this — it reads the
+      // full-resolution frame directly) still takes over the moment it's
+      // ready regardless.
+      const JSQR_MAX_DIM = 960;
       let busy = false;
       let frames = 0;
 
@@ -5451,8 +5469,9 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
           frames++;
           let text = null;
           try {
-            if (detector) {
-              const codes = await detector.detect(v);
+            const liveDetector = qrDetectorRef.current;
+            if (liveDetector) {
+              const codes = await liveDetector.detect(v);
               if (codes && codes.length) text = codes[0].rawValue;
             }
             if (!text && window.jsQR) {

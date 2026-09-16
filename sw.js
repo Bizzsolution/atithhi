@@ -5,7 +5,7 @@
 // shell forever, even after a fresh deploy (exactly what caused devices
 // to keep showing an outdated version despite redeploying).
 
-const CACHE = 'atithibook-v4.7';
+const CACHE = 'atithibook-v4.8';
 const OFFLINE_URLS = [
   '/',
   '/index.html',
