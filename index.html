@@ -5113,28 +5113,55 @@ function CheckInView({
     if (!license) { alert("License not found. Reload app."); return; }
     setFamScanning(member._id + "_" + side);
     try {
-      const famBoxAsk = form.docType === "Aadhaar Card"
-        ? `,"numberBoxes":[{"x":0.0,"y":0.0,"w":0.0,"h":0.0}]` : "";
-      const famBoxNote = form.docType === "Aadhaar Card"
-        ? ` For "numberBoxes": return one box for EVERY place the 12-digit Aadhaar number appears, in normalized 0-1 coordinates (x,y = top-left, w,h = width/height as fractions of the full image). Cover the digits even if printed sideways. Empty array if not visible.` : "";
-      const prompt = side === "front"
-        ? `This is the FRONT of an Indian ID card (Aadhaar or similar). Extract details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
-{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","idNumber":"ID number as printed"${famBoxAsk}}${famBoxNote}`
-        : `This is the BACK of an Indian Aadhaar card. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
-{"address":"complete address","pin":"6 digit pincode","district":"","state":""${famBoxAsk}}${famBoxNote}`;
-      const result = await performOCRScan(photo, prompt, license, "family");
-      if (result.error) {
-        alert("Scan failed: " + result.error + (result.rawText ? "" : " Fill details manually."));
-        return;
+      const isAadhaarDoc = form.docType === "Aadhaar Card";
+      let parsed, numberBoxes = [];
+
+      if (isAadhaarDoc) {
+        // Same split as the primary-guest scan above, and for the same
+        // reason: asking one call to both extract text AND locate the
+        // number's pixel-coordinates was the more complex combined task
+        // that made the number itself unreliable to get back.
+        const textPrompt = side === "front"
+          ? `This is the FRONT of an Indian ID card (Aadhaar or similar). Extract details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","idNumber":"ID number as printed"}
+IMPORTANT: the "idNumber" field is the most critical one — read all digits carefully, including if partially faint or at an angle, and return them exactly as printed (spaces between groups are fine).`
+          : `This is the BACK of an Indian Aadhaar card. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"address":"complete address","pin":"6 digit pincode","district":"","state":""}`;
+        const boxPrompt = `This is ${side === "front" ? "the FRONT" : "the BACK"} of an Indian Aadhaar card. Your ONLY task is to locate the 12-digit Aadhaar number printed on this image. Return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"numberBoxes":[{"x":0.0,"y":0.0,"w":0.0,"h":0.0}]}
+Return one box for EVERY place the 12-digit number appears, in normalized 0-1 coordinates (x,y = top-left, w,h = width/height as fractions of the full image). Cover the digits even if printed sideways. Empty array if not visible.`;
+
+        const [textResult, boxResult] = await Promise.all([
+          performOCRScan(photo, textPrompt, license, "family"),
+          performOCRScan(photo, boxPrompt, license, "family")
+        ]);
+        if (textResult.error) {
+          alert("Scan failed: " + textResult.error + (textResult.rawText ? "" : " Fill details manually."));
+          return;
+        }
+        parsed = textResult.parsed;
+        if (!boxResult.error && Array.isArray(boxResult.parsed?.numberBoxes)) {
+          numberBoxes = boxResult.parsed.numberBoxes;
+        }
+      } else {
+        const prompt = side === "front"
+          ? `This is the FRONT of an Indian ID card (Aadhaar or similar). Extract details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","idNumber":"ID number as printed"}`
+          : `This is the BACK of an Indian Aadhaar card. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"address":"complete address","pin":"6 digit pincode","district":"","state":""}`;
+        const result = await performOCRScan(photo, prompt, license, "family");
+        if (result.error) {
+          alert("Scan failed: " + result.error + (result.rawText ? "" : " Fill details manually."));
+          return;
+        }
+        parsed = result.parsed;
       }
-      const parsed = result.parsed;
       // Same deferred-masking flow as the primary guest: nothing was
       // stored at capture, so decide here now that we know where the
       // number sits.
-      const isAadhaarDoc = form.docType === "Aadhaar Card";
       const famPolicy = (CURRENT_PROFILE && CURRENT_PROFILE.aadhaarPhotoPolicy) || "none";
       if (isAadhaarDoc && famPolicy !== "none") {
-        const fb = (Array.isArray(parsed.numberBoxes) ? parsed.numberBoxes : [])
+        const fb = numberBoxes
           .filter(b => b && Number.isFinite(Number(b.x)) && Number(b.w) > 0 && Number(b.h) > 0)
           .map(b => ({ x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h) }));
         setRedact({ dataUrl: photo, side, memberId: member._id, boxes: fb, draft: null });
@@ -5708,27 +5735,62 @@ function CheckInView({
     setScanMsg(`⏳ Scanning ${form.docType}...`);
     try {
       const docLabel = form.docType === "Aadhaar Card" ? "Indian Aadhaar card" : `Indian ${form.docType}`;
-      // For Aadhaar we ALSO ask for the on-image location of every visible
-      // occurrence of the 12-digit number, so we can black out exactly
-      // those pixels. Coordinates are normalized 0..1 of the image as
-      // supplied (so they stay correct even when the card is rotated or
-      // occupies only part of the frame).
-      const boxAsk = form.docType === "Aadhaar Card"
-        ? `,"numberBoxes":[{"x":0.0,"y":0.0,"w":0.0,"h":0.0}]`
-        : "";
-      const boxNote = form.docType === "Aadhaar Card"
-        ? ` For "numberBoxes": return one box for EVERY place the 12-digit Aadhaar number appears in this image (there may be more than one, and it may be printed sideways/rotated). Each box must tightly enclose all 12 digits, using normalized coordinates where x,y is the top-left corner and w,h are width and height as fractions (0 to 1) of the full image. Include the box even if the digits are rotated — cover their full on-screen bounding rectangle. If the number is not visible at all, return an empty array.`
-        : "";
-      const prompt = side === "f" ? `This is the FRONT of an ${docLabel}. Extract all details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
-{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","aadhaar":"ID number exactly as printed","fatherName":"father or husband name if visible","address":"address if visible on front"${boxAsk}}${boxNote}` : `This is the BACK of an ${docLabel}. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
-{"address":"complete address","pin":"6 digit pincode","district":"","state":""${boxAsk}}${boxNote}`;
+      const isAadhaar = form.docType === "Aadhaar Card";
 
       AuditLog.add("ID_SCAN", form.docType + " OCR initiated");
       setScanMsg("⏳ Connecting to scan server...");
-      const result = await performOCRScan(photo, prompt, license);
-      if (result.rawText) setRawOcr(result.rawText);
-      if (result.error) throw new Error(result.error);
-      const parsed = result.parsed;
+
+      let parsed, rawTextForDisplay, numberBoxes = [];
+
+      if (isAadhaar) {
+        // Split into TWO separate calls instead of one combined prompt.
+        // The combined version asked the model to do plain text extraction
+        // (name/DOB/aadhaar number/etc) AND spatial bounding-box detection
+        // (find the pixel location of the number, for masking) in the same
+        // response — a materially harder, two-different-skills task than
+        // either alone. In practice the model would sometimes shortchange
+        // one part for the other, most visibly the aadhaar number itself
+        // going missing while the easier fields (like name) still came
+        // through. Splitting gives each task the model's full attention in
+        // its own call; firing them in parallel means this costs no extra
+        // time, and the per-scan API cost is negligible either way.
+        const textPrompt = side === "f"
+          ? `This is the FRONT of an ${docLabel}. Extract all details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","aadhaar":"ID number exactly as printed","fatherName":"father or husband name if visible","address":"address if visible on front"}
+IMPORTANT: the "aadhaar" field is the most critical one — read all 12 digits carefully, including if partially faint or at an angle, and return them exactly as printed (spaces between groups are fine).`
+          : `This is the BACK of an ${docLabel}. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"address":"complete address","pin":"6 digit pincode","district":"","state":""}`;
+        const boxPrompt = `This is ${side === "f" ? "the FRONT" : "the BACK"} of an ${docLabel}. Your ONLY task is to locate the 12-digit Aadhaar number printed on this image. Return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"numberBoxes":[{"x":0.0,"y":0.0,"w":0.0,"h":0.0}]}
+Return one box for EVERY place the 12-digit number appears (there may be more than one, and it may be printed sideways/rotated). Each box must tightly enclose all 12 digits, using normalized coordinates where x,y is the top-left corner and w,h are width and height as fractions (0 to 1) of the full image. Include the box even if the digits are rotated — cover their full on-screen bounding rectangle. If the number is not visible at all, return an empty array for "numberBoxes".`;
+
+        const [textResult, boxResult] = await Promise.all([
+          performOCRScan(photo, textPrompt, license),
+          performOCRScan(photo, boxPrompt, license)
+        ]);
+
+        rawTextForDisplay = textResult.rawText || boxResult.rawText;
+        if (textResult.rawText) setRawOcr(textResult.rawText);
+        if (textResult.error) throw new Error(textResult.error);
+        parsed = textResult.parsed;
+
+        // Box detection is best-effort only — the UI already has a manual
+        // "draw the box yourself" fallback for when this comes back empty,
+        // so a failure here should never block the text fields above from
+        // being used.
+        if (!boxResult.error && Array.isArray(boxResult.parsed?.numberBoxes)) {
+          numberBoxes = boxResult.parsed.numberBoxes;
+        }
+      } else {
+        const prompt = side === "f" ? `This is the FRONT of an ${docLabel}. Extract all details and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"name":"full name in English","dob":"DD/MM/YYYY","gender":"Male or Female","aadhaar":"ID number exactly as printed","fatherName":"father or husband name if visible","address":"address if visible on front"}` : `This is the BACK of an ${docLabel}. Extract the address and return ONLY valid JSON, nothing else — no markdown code blocks, no explanation text before or after:
+{"address":"complete address","pin":"6 digit pincode","district":"","state":""}`;
+        const result = await performOCRScan(photo, prompt, license);
+        if (result.rawText) setRawOcr(result.rawText);
+        if (result.error) throw new Error(result.error);
+        parsed = result.parsed;
+      }
+
       let count = 0;
       if (parsed.name) {
         fld("name", parsed.name.trim());
@@ -5767,7 +5829,7 @@ function CheckInView({
         } else {
           // Pre-fill with whatever the model suggested, but always let the
           // person confirm/correct it before anything is written.
-          const boxes = (Array.isArray(parsed.numberBoxes) ? parsed.numberBoxes : [])
+          const boxes = numberBoxes
             .filter(b => b && Number.isFinite(Number(b.x)) && Number(b.w) > 0 && Number(b.h) > 0)
             .map(b => ({ x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h) }));
           setRedact({ dataUrl: photo, side, memberId: null, boxes, draft: null });
