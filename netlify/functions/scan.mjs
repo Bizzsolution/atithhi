@@ -231,14 +231,24 @@ export async function handler(event) {
       for (const model of geminiModels) {
         if (result) break;
         try {
+          // The API rejects a request outright if BOTH thinkingBudget AND
+          // thinkingLevel are set together ("You can only set only one of
+          // thinking budget and thinking level") — sending both, assuming
+          // the model would just ignore whichever didn't apply, was wrong
+          // and broke every single Gemini call regardless of model. The
+          // two fields belong to different model generations and are
+          // mutually exclusive per request, so pick ONE based on the
+          // model name: 2.x-series models take thinkingBudget (0 = off),
+          // 3.x-series models (and the "-latest" aliases, which currently
+          // resolve to a 3.x model) take thinkingLevel and cannot go fully
+          // to zero, only as low as "low".
+          const isGen3 = /^gemini-3/.test(model) || /-latest$/.test(model);
+          const thinkingConfig = isGen3 ? { thinkingLevel: "low" } : { thinkingBudget: 0 };
           const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gKey}`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               contents: [{ parts: [{ inlineData: { mimeType: "image/jpeg", data: image } }, { text: prompt }] }],
-              generationConfig: {
-                temperature: 0, maxOutputTokens: 1000,
-                thinkingConfig: { thinkingBudget: 0, thinkingLevel: "low" }
-              }
+              generationConfig: { temperature: 0, maxOutputTokens: 1000, thinkingConfig }
             })
           });
           const d = await r.json();
@@ -260,31 +270,43 @@ export async function handler(event) {
     // rate limit, outage) — a safety net for availability, not a second
     // attempt at higher accuracy.
     //   Site settings → Environment variables → GROQ_MODELS
-    //   Comma-separated list, tried in order. Example:
-    //   "qwen/qwen3.6-27b,llama-3.2-90b-vision-preview"
+    //   Comma-separated list, tried in order.
+    // Current as of Sept 2026 — Llama 4 Scout/Maverick are confirmed,
+    // widely-available vision models on Groq. qwen/qwen3.6-27b is kept as
+    // a last option only: Groq's own docs mark it a PREVIEW model ("not
+    // for production"), and it was in fact returning "does not exist or
+    // you do not have access to it" in practice — trying the two Llama
+    // models first means a working fallback even on accounts where Qwen
+    // access isn't (or is no longer) available.
     if (!result) {
       const groqKey = process.env.GROQ_API_KEY;
-      const groqModels = (process.env.GROQ_MODELS || "qwen/qwen3.6-27b")
+      const groqModels = (process.env.GROQ_MODELS || "meta-llama/llama-4-scout-17b-16e-instruct,meta-llama/llama-4-maverick-17b-128e-instruct,qwen/qwen3.6-27b")
         .split(",").map(m => m.trim()).filter(Boolean);
       if (groqKey) {
         for (const model of groqModels) {
           if (result) break;
           try {
+            const body = {
+              model,
+              messages: [{ role: "user", content: [
+                { type: "image_url", image_url: { url: "data:image/jpeg;base64," + image } },
+                { type: "text", text: prompt }
+              ]}],
+              max_tokens: 1000, temperature: 0
+            };
+            // Learned the hard way (from the identical mistake on the
+            // Gemini side above) not to assume a provider silently
+            // ignores a parameter that doesn't apply to a given model —
+            // only send reasoning_effort to the one model family it's
+            // actually documented for (Qwen's "thinking mode" toggle),
+            // rather than sending it unconditionally to every Groq model
+            // in this list and risking the same kind of outright
+            // rejection on models it doesn't apply to.
+            if (/^qwen\//.test(model)) body.reasoning_effort = "none";
             const gr = await fetch("https://api.groq.com/openai/v1/chat/completions", {
               method: "POST",
               headers: { "Content-Type": "application/json", "Authorization": "Bearer " + groqKey },
-              body: JSON.stringify({
-                model,
-                messages: [{ role: "user", content: [
-                  { type: "image_url", image_url: { url: "data:image/jpeg;base64," + image } },
-                  { type: "text", text: prompt }
-                ]}],
-                max_tokens: 1000, temperature: 0,
-                reasoning_effort: "none" // Qwen3.6 defaults to "thinking mode" which
-                // burns tokens on visible <think> reasoning before the answer —
-                // for a direct extraction task like this we want the fast,
-                // direct answer only. Ignored harmlessly by non-Qwen Groq models.
-              })
+              body: JSON.stringify(body)
             });
             const gd = await gr.json();
             if (gr.ok && gd.choices?.[0]?.message?.content) {
