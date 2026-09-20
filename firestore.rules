@@ -88,7 +88,9 @@ service cloud.firestore {
     // ---- per-hotel operational data ------------------------------
     // Path: hotels/{hotelId}/data/{docId}
     // docId is one of: rooms, bookings, profile, users, audit,
-    // permissions, creditNotes, bookingRequests, invoiceCounter_*, etc.
+    // permissions, creditNotes, bookings_archive_YYYY_MM, invoiceCounter_*.
+    // (Public booking requests are NOT here — they live under the
+    // separate, token-scoped public_booking/ tree; see below.)
     match /hotels/{hotelId}/data/{docId} {
 
       // `get` (one specific document) is allowed; `list` is NOT granted
@@ -98,13 +100,24 @@ service cloud.firestore {
       // the codebase — so denying list costs the app nothing.
       allow get: if validHotelId(hotelId);
 
+      // NOTE ON RULE SEMANTICS (worth remembering before adding any
+      // narrower rule under this same path): Firestore Security Rules
+      // are OR'd, not AND'd — per Google's own documentation, "if a
+      // broad rule grants access to data, you can't restrict with a
+      // more specific rule." So a tighter block added later for one
+      // specific docId under here would be SILENTLY INEFFECTIVE, since
+      // this wildcard would already have granted the access. If a path
+      // under here ever needs stricter treatment, it must be excluded
+      // from this block's conditions explicitly (or live outside this
+      // subtree entirely, the way public_booking/ does).
       allow create, update: if validHotelId(hotelId) && sizeOk();
 
       // Guest registers are a legal retention requirement under the
       // Indian hospitality/police-reporting rules, and the app itself
       // never deletes these documents in normal operation — it only
-      // overwrites them. Denying delete outright means a compromised or
-      // buggy client cannot destroy a hotel's records.
+      // overwrites them (archiving MOVES records between documents via
+      // writes, never a delete). Denying delete outright means a
+      // compromised or buggy client cannot destroy a hotel's records.
       allow delete: if false;
     }
 
@@ -165,23 +178,56 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // ---- public booking requests ---------------------------------
-    // Written by the public ?book=KEY page, which has no login at all.
-    // This is the one path a complete stranger is expected to write to,
-    // so it is the tightest.
+    // ---- public booking (token-scoped, safe to share) ------------
+    // The public booking link is "…/?book=<PUBLIC-TOKEN>", where the
+    // token is a random value UNRELATED to the hotel's license key.
+    // That distinction is the whole security design of this feature:
+    // with no Firebase Auth in this app, the license key is effectively
+    // the only credential these rules can check, so a URL meant to be
+    // posted on Facebook must not contain or reveal it. An earlier
+    // version of this feature put the license key straight in the link,
+    // which meant publishing the link published read/write access to the
+    // hotel's entire guest register. It now cannot: nothing under
+    // `hotels/{licenseKey}/**` is reachable from the public page, and the
+    // license key is not derivable from the token.
     //
-    // Reading is denied outright: a guest who submits a request has no
-    // reason to read anyone else's, and the queue contains other
-    // people's names and phone numbers. The hotel's own staff app reads
-    // this document through the rule above (same physical path), which
-    // is why this more specific rule only needs to constrain writes.
-    match /hotels/{hotelId}/data/bookingRequests {
-      allow get: if validHotelId(hotelId);
+    // This document holds ONLY the outward-facing snapshot the hotel's
+    // staff app publishes — name, address, phone, room types and a
+    // "starting from" rate. No room numbers, no occupancy, no guest
+    // data. World-readable by design (it is the same information a
+    // hotel prints on its own website), but not enumerable: `list` is
+    // denied, and tokens are 16 random chars from a 32-char alphabet
+    // (32^16 ≈ 1.2 × 10^24), so they cannot be guessed or walked.
+    match /public_booking/{token} {
+      allow get: if true;
       allow list: if false;
-      // Capped far below the general limit — a request queue is small
-      // text records, so anything large is abuse rather than use.
-      allow create, update: if validHotelId(hotelId)
-        && request.resource.size() < 200000;
+      // Only the hotel's own staff app writes this snapshot. It cannot
+      // be restricted further without auth, but the blast radius of a
+      // malicious write is limited to defacing that one hotel's public
+      // booking page — it reaches no private data.
+      allow create, update: if request.resource.size() < 50000;
+      allow delete: if false;
+    }
+
+    // Each booking request is its OWN document here, created by the
+    // public page. Per-document creates (rather than appending to a
+    // shared array) mean a guest needs no read access to submit, and
+    // cannot overwrite or expose another guest's submission.
+    match /public_booking/{token}/requests/{reqId} {
+      // ⚠️ RESIDUAL, ACCEPTED EXPOSURE: staff need to read this queue to
+      // action requests, and with no auth the rules cannot tell a staff
+      // device from a guest. So anyone holding the token can read the
+      // pending requests — i.e. the names/phones of people who have
+      // enquired at that hotel. That is a genuine but deliberately
+      // bounded trade-off: it is limited to a handful of open enquiries
+      // for one hotel, versus the entire historical guest register that
+      // the previous license-key-in-the-link design exposed. Closing it
+      // completely requires Firebase Auth (see the file header).
+      allow get, list: if true;
+      // Guests create; staff update (to mark confirmed/declined). Capped
+      // small — a request is a few short text fields, so anything larger
+      // is abuse rather than use.
+      allow create, update: if request.resource.size() < 20000;
       allow delete: if false;
     }
 

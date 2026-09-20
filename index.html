@@ -8927,14 +8927,98 @@ function LocalRecordsSearch() {
     title: p.name
   }))))))));
 }
+// ── PUBLIC BOOKING TOKEN ─────────────────────────────────────────
+// A public booking link is meant to be posted on Facebook/Instagram, so
+// whatever identifier sits in that URL must be safe to make public.
+// The license key is NOT safe for that: with no Firebase Auth in this
+// app, the license key is effectively the ONLY credential the Firestore
+// rules can check, so publishing it would publish read/write access to
+// that hotel's entire guest register. (The earlier version of this
+// feature did exactly that — the link was "?book=<LICENSE-KEY>".)
+//
+// So the public link carries a SEPARATE, unrelated random token, and
+// everything the public page touches lives under its own
+// `public_booking/{token}` tree — never under `hotels/{licenseKey}/...`.
+// The token grants access to nothing but a small published snapshot
+// (hotel name/address/room types) and the ability to file a booking
+// request. The license key is never derivable from the token, so it
+// stays secret and the guest register stays protected.
+const PUBLIC_TOKEN_PREFIX = "PB";
+function generatePublicBookingToken() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no look-alike chars
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += alphabet[b % alphabet.length];
+  return PUBLIC_TOKEN_PREFIX + out;
+}
+
+// Publishes/refreshes the small public snapshot the booking page reads.
+// Deliberately hand-picks ONLY non-sensitive, outward-facing fields —
+// the same things a hotel prints on its own website — so that even
+// though this document is world-readable by anyone with the token, it
+// contains nothing private. Room NUMBERS and live occupancy are never
+// included, only types and a "starting from" rate.
+async function publishPublicBookingSnapshot(token, profile, rooms) {
+  if (!window._db || !token) return false;
+  const byType = {};
+  (Array.isArray(rooms) ? rooms : []).forEach(r => {
+    if (!r || !r.type) return;
+    if (!byType[r.type]) byType[r.type] = { type: r.type, rate: r.rate || 0 };
+    else if ((r.rate || 0) < byType[r.type].rate) byType[r.type].rate = r.rate;
+  });
+  const snapshot = {
+    hotelName: profile?.hotelName || "",
+    hotelAddr: profile?.hotelAddr || "",
+    hotelPhone: profile?.hotelPhone || "",
+    roomTypes: Object.values(byType),
+    updatedAt: Date.now()
+  };
+  try {
+    await window._db.collection("public_booking").doc(token).set(snapshot, { merge: true });
+    return true;
+  } catch (e) {
+    console.warn("Publish public booking snapshot:", e.message);
+    return false;
+  }
+}
+
 // Owner-facing card showing the shareable direct-booking link (for
-// Facebook/Instagram/WhatsApp bios, posts, etc). Reads the license key
-// straight from localStorage — same value every staff login already
-// depends on — so this needs no props at all.
-function DirectBookingLinkCard() {
+// Facebook/Instagram/WhatsApp bios, posts, etc).
+function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
   const [copied, setCopied] = useState(false);
-  const key = (localStorage.getItem("ab_license_key") || "").trim().toUpperCase();
-  const link = key ? `${window.location.origin}/?book=${key}` : "";
+  const [busy, setBusy] = useState(false);
+  const [publishState, setPublishState] = useState(null);
+  const token = profile?.publicBookingToken || "";
+  const link = token ? `${window.location.origin}/?book=${token}` : "";
+
+  // Creating the link is an explicit action rather than something that
+  // happens silently on render: it both mints the token and publishes
+  // the public snapshot, and the Owner should be the one to decide when
+  // their hotel becomes publicly bookable.
+  const createLink = async () => {
+    setBusy(true);
+    setPublishState(null);
+    try {
+      const newToken = generatePublicBookingToken();
+      const ok = await publishPublicBookingSnapshot(newToken, profile, rooms);
+      if (!ok) { setPublishState("error"); return; }
+      await onSaveToken(newToken);
+      setPublishState("ok");
+    } finally { setBusy(false); }
+  };
+
+  // Re-publish after the hotel edits its name/address/rooms, so the
+  // public page doesn't keep showing stale details.
+  const refreshSnapshot = async () => {
+    setBusy(true);
+    setPublishState(null);
+    try {
+      const ok = await publishPublicBookingSnapshot(token, profile, rooms);
+      setPublishState(ok ? "ok" : "error");
+    } finally { setBusy(false); }
+  };
+
   const copyLink = async () => {
     try {
       await navigator.clipboard.writeText(link);
@@ -8962,23 +9046,47 @@ function DirectBookingLinkCard() {
   }, "🌐 Direct Booking Link"), /*#__PURE__*/React.createElement("div", {
     style: { color: "var(--muted)", fontSize: 12, marginBottom: 10, lineHeight: 1.5 }
   }, "Yeh link Facebook, Instagram bio, WhatsApp status kahin bhi share karo — guest yahan se seedha booking REQUEST bhej sakta hai, jo tum Dashboard se confirm/decline karte ho. Koi payment nahi lagti, koi login nahi chahiye guest ko."),
-  /*#__PURE__*/React.createElement("div", {
-    style: { fontSize: 12, wordBreak: "break-all", background: "#fdf8f0", padding: 10, borderRadius: 8, fontFamily: "monospace", color: "#333" }
-  }, link || "License key nahi mila"),
-  /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 10 } },
-    /*#__PURE__*/React.createElement("button", {
-      onClick: copyLink, disabled: !link,
-      style: { flex: 1, padding: "9px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
-    }, copied ? "✅ Copied" : "📋 Copy Link"),
-    /*#__PURE__*/React.createElement("button", {
-      onClick: shareLink, disabled: !link,
-      style: { flex: 1, padding: "9px", borderRadius: 8, border: "none", background: "var(--gold)", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
-    }, "📤 Share")));
+  !token
+    ? /*#__PURE__*/React.createElement("div", null,
+        /*#__PURE__*/React.createElement("div", {
+          style: { fontSize: 11.5, color: "var(--muted)", marginBottom: 10, lineHeight: 1.5 }
+        }, "Link banane par ek public page bantaa hai jismein sirf aapka hotel ka naam, address aur room types dikhte hain — aapka license key ya guest data kabhi public nahi hota."),
+        /*#__PURE__*/React.createElement("button", {
+          onClick: createLink, disabled: busy,
+          style: { width: "100%", padding: "11px", borderRadius: 8, border: "none", background: "var(--gold)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: busy ? "default" : "pointer", opacity: busy ? 0.7 : 1 }
+        }, busy ? "⏳ Ban raha hai..." : "🔗 Booking Link Banao"),
+        publishState === "error" && /*#__PURE__*/React.createElement("div", {
+          style: { color: "#dc2626", fontSize: 11.5, marginTop: 8 }
+        }, "Link nahi ban paaya (internet issue). Dobara try karo."))
+    : /*#__PURE__*/React.createElement("div", null,
+        /*#__PURE__*/React.createElement("div", {
+          style: { fontSize: 12, wordBreak: "break-all", background: "#fdf8f0", padding: 10, borderRadius: 8, fontFamily: "monospace", color: "#333" }
+        }, link),
+        /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 10 } },
+          /*#__PURE__*/React.createElement("button", {
+            onClick: copyLink,
+            style: { flex: 1, padding: "9px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+          }, copied ? "✅ Copied" : "📋 Copy Link"),
+          /*#__PURE__*/React.createElement("button", {
+            onClick: shareLink,
+            style: { flex: 1, padding: "9px", borderRadius: 8, border: "none", background: "var(--gold)", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+          }, "📤 Share")),
+        /*#__PURE__*/React.createElement("button", {
+          onClick: refreshSnapshot, disabled: busy,
+          style: { width: "100%", marginTop: 8, padding: "9px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 11.5, fontWeight: 700, cursor: busy ? "default" : "pointer", color: "var(--muted)" }
+        }, busy ? "⏳ Update ho raha hai..." : "🔄 Hotel details/rooms update karne ke baad yahan dabao"),
+        publishState === "ok" && /*#__PURE__*/React.createElement("div", {
+          style: { color: "#16a34a", fontSize: 11.5, marginTop: 6 }
+        }, "✅ Public page update ho gaya"),
+        publishState === "error" && /*#__PURE__*/React.createElement("div", {
+          style: { color: "#dc2626", fontSize: 11.5, marginTop: 6 }
+        }, "Update nahi ho paaya (internet issue). Dobara try karo.")));
 }
 
 function StorageSettingsView({
   user,
   profile,
+  rooms,
   setModal,
   saveProfile
 }) {
@@ -9549,7 +9657,11 @@ function StorageSettingsView({
     style: { fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }
   }, "Form III khud portal (indianfrro.gov.in) par file karna hota hai — koi bhi software apne aap submit nahi kar sakta. Yeh sheet wahan bharne aur apne record ke liye hai."), exportStatus && /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, fontSize: 13, color: exportStatus.startsWith("❌") ? "#dc2626" : "#16a34a" }
-  }, exportStatus)), user?.role === "Owner" && hasFeature("direct_booking") && /*#__PURE__*/React.createElement(DirectBookingLinkCard, null), user?.role === "Owner" && /*#__PURE__*/React.createElement("div", {
+  }, exportStatus)), user?.role === "Owner" && hasFeature("direct_booking") && /*#__PURE__*/React.createElement(DirectBookingLinkCard, {
+    profile: profile,
+    rooms: rooms,
+    onSaveToken: (t) => saveProfile({ ...profile, publicBookingToken: t })
+  }), user?.role === "Owner" && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#fff", border: "1px solid var(--border)", borderRadius: 12,
       padding: 14, marginTop: 14
@@ -9677,7 +9789,7 @@ function bookingsToCSV(bookings, rooms) {
     return [
       b.id, b.name, b.mobile, maskedAadhaar, b.roomId, room ? room.type : "",
       fmtDate(b.checkIn), fmtDate(b.checkOut), n, b.roomTotal || 0, cSum, gst,
-      grand, b.paid ? "Paid" : "Pending", b.status, (b.address || "").slice(0, 100),
+      grand, b.status === "checkedout" ? "Paid" : "Pending", b.status, (b.address || "").slice(0, 100),
       totalOccupants, familySummary
     ].map(esc).join(",");
   });
@@ -9707,6 +9819,61 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
   const [cnBusy, setCnBusy] = useState(false);
   const isOwner = !user || user.role === "Owner";
 
+  // Archived months fetched on demand — the live `bookings` prop only
+  // holds the recent window (see archiveOldBookings in App), so a date
+  // range reaching further back needs to also pull in whichever monthly
+  // archive documents it touches. Cached by month-key for the lifetime
+  // of this view so re-adjusting the date pickers within the same
+  // session doesn't re-fetch a month already retrieved.
+  const [archivedExtra, setArchivedExtra] = useState([]);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const archiveCacheRef = useRef({}); // monthKey -> bookings[]
+
+  const earliestLiveDate = useMemo(() => {
+    if (!bookings.length) return null;
+    return bookings.reduce((min, b) => (b.checkIn && b.checkIn < min) ? b.checkIn : min, bookings[0].checkIn || "9999-12-31");
+  }, [bookings]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!fromDate) { setArchivedExtra([]); return; }
+      // Nothing archived could possibly be needed if the requested start
+      // is already within what live already covers — skip the fetch
+      // entirely in the common case (recent-range queries, which is most
+      // day-to-day use of this screen).
+      if (earliestLiveDate && fromDate >= earliestLiveDate) { setArchivedExtra([]); return; }
+
+      const end = toDate || todayStr();
+      const startD = new Date(fromDate + "T12:00:00");
+      const endD = new Date(Math.min(new Date(end + "T12:00:00").getTime(),
+        earliestLiveDate ? new Date(earliestLiveDate + "T12:00:00").getTime() : Date.now()));
+      const monthKeys = [];
+      const cursor = new Date(startD.getFullYear(), startD.getMonth(), 1);
+      while (cursor <= endD) {
+        monthKeys.push("bookings_archive_" + cursor.getFullYear() + "_" + String(cursor.getMonth() + 1).padStart(2, "0"));
+        cursor.setMonth(cursor.getMonth() + 1);
+      }
+      const toFetch = monthKeys.filter(k => !(k in archiveCacheRef.current));
+      if (toFetch.length === 0) {
+        // Fully cached already — just re-merge from cache, no network needed.
+        const merged = monthKeys.flatMap(k => archiveCacheRef.current[k] || []);
+        if (!cancelled) setArchivedExtra(merged);
+        return;
+      }
+      setArchiveLoading(true);
+      try {
+        const results = await Promise.all(toFetch.map(k => WS.get(k).catch(() => null)));
+        toFetch.forEach((k, i) => { archiveCacheRef.current[k] = Array.isArray(results[i]) ? results[i] : []; });
+        const merged = monthKeys.flatMap(k => archiveCacheRef.current[k] || []);
+        if (!cancelled) setArchivedExtra(merged);
+      } finally {
+        if (!cancelled) setArchiveLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [fromDate, toDate, earliestLiveDate]);
+
   const submitCreditNote = async (booking, room) => {
     setCnBusy(true);
     try {
@@ -9729,7 +9896,10 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
   };
 
   const filtered = useMemo(() => {
-    let list = bookings;
+    // archivedExtra is [] whenever the selected range doesn't reach back
+    // past the live window (the overwhelming majority of the time), so
+    // this concat is a no-op cost in the common case.
+    let list = archivedExtra.length ? [...bookings, ...archivedExtra] : bookings;
     const term = q.trim().toLowerCase();
     if (term) {
       list = list.filter(b =>
@@ -9744,7 +9914,7 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
     if (toDate) list = list.filter(b => b.checkIn <= toDate);
     // Most recent first
     return [...list].sort((a, b) => new Date(b.checkIn) - new Date(a.checkIn));
-  }, [bookings, q, fromDate, toDate]);
+  }, [bookings, archivedExtra, q, fromDate, toDate]);
 
   const totalRevenue = useMemo(() => {
     return filtered.reduce((sum, b) => {
@@ -9799,8 +9969,9 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
     hasFeature("csv_export") && React.createElement("div", { style: { padding: "0 14px", marginBottom: 14 } },
       React.createElement("button", {
         onClick: exportAll,
-        style: { width: "100%", padding: "12px", border: "none", borderRadius: 12, background: "var(--navy)", color: "#fff", fontFamily: "'Josefin Sans',sans-serif", fontWeight: 700, fontSize: 14, cursor: "pointer" }
-      }, "\uD83D\uDCE5 Download Excel/CSV (" + filtered.length + " records)")
+        disabled: archiveLoading,
+        style: { width: "100%", padding: "12px", border: "none", borderRadius: 12, background: "var(--navy)", color: "#fff", fontFamily: "'Josefin Sans',sans-serif", fontWeight: 700, fontSize: 14, cursor: archiveLoading ? "default" : "pointer", opacity: archiveLoading ? 0.7 : 1 }
+      }, archiveLoading ? "⏳ Preparing report..." : "\uD83D\uDCE5 Download Excel/CSV (" + filtered.length + " records)")
     ),
 
     // Results list
@@ -10136,22 +10307,24 @@ const ALL_FEATURES = [
 // ── PUBLIC BOOKING REQUEST PAGE ──────────────────────────────────
 // Rendered instead of the normal staff app when the URL has a `?book=`
 // query param — no login, no phone-verification, nothing staff-only is
-// reachable from here. Reads the hotel's profile+rooms (already public
-// info in the same sense a hotel's own website would show — name,
-// address, room types, starting rates) and writes ONE new entry into a
-// SEPARATE `bookingRequests` list, never touching `bookings`, `users`,
-// or anything else a staff device relies on.
+// reachable from here.
 //
-// IMPORTANT — this write only works once the hotel's Firestore Security
-// Rules explicitly allow it; nothing in this app's code can grant that
-// permission by itself (Security Rules live in the Firebase Console, not
-// in this codebase). Add a rule scoped ONLY to this one path, e.g.:
-//   match /hotels/{hotelId}/data/bookingRequests {
-//     allow get, list: if false;               // guests can't read others' requests
-//     allow write: if request.resource.data.value.size() <= 200;  // basic cap
-//   }
-// (adjust to taste — the point is: write-only, capped, nothing else public.)
-function PublicBookingPage({ licenseKey }) {
+// SECURITY-CRITICAL: the value in that URL is a PUBLIC BOOKING TOKEN,
+// not the hotel's license key, and this component touches ONLY the
+// `public_booking/{token}` tree. It never reads or writes anything under
+// `hotels/{licenseKey}/...`. That separation is the whole point: with no
+// Firebase Auth in this app, the license key is effectively the only
+// credential the Firestore rules can check, so a page designed to be
+// opened by strangers from a Facebook link must not be able to reach
+// (or reveal) it. The token grants nothing but the published public
+// snapshot (hotel name/address/room types) and the ability to file a
+// booking request — the guest register stays entirely out of reach.
+//
+// Each request is written as its OWN document under
+// `public_booking/{token}/requests/{reqId}` rather than appended to a
+// shared array, so a guest never needs read access to (or the ability
+// to overwrite) anyone else's submission.
+function PublicBookingPage({ bookingToken }) {
   const [status, setStatus] = useState("loading"); // loading | ready | error | submitting | submitted
   const [hotel, setHotel] = useState(null);
   const [roomTypes, setRoomTypes] = useState([]);
@@ -10170,25 +10343,16 @@ function PublicBookingPage({ licenseKey }) {
     (async () => {
       if (!window._db) { setStatus("error"); return; }
       try {
-        const hotelDoc = window._db.collection("hotels").doc(licenseKey).collection("data");
-        const [profileSnap, roomsSnap] = await Promise.all([
-          hotelDoc.doc("profile").get({ source: "server" }).catch(() => null),
-          hotelDoc.doc("rooms").get({ source: "server" }).catch(() => null)
-        ]);
-        const profileVal = profileSnap && profileSnap.exists ? profileSnap.data().value : null;
-        const roomsVal = roomsSnap && roomsSnap.exists ? roomsSnap.data().value : null;
-        if (!profileVal && !roomsVal) { setStatus("error"); return; }
-        setHotel(profileVal || {});
-        const rooms = Array.isArray(roomsVal) ? roomsVal : [];
-        // Group into TYPES with a "starting from" rate — never expose
-        // individual room numbers or live occupancy to a public page.
-        const byType = {};
-        rooms.forEach(r => {
-          if (!r || !r.type) return;
-          if (!byType[r.type]) byType[r.type] = { type: r.type, rate: r.rate || 0 };
-          else if ((r.rate || 0) < byType[r.type].rate) byType[r.type].rate = r.rate;
-        });
-        const types = Object.values(byType);
+        // ONE read, of ONE public document. The snapshot was prepared by
+        // the hotel's own staff app (publishPublicBookingSnapshot) and
+        // contains only outward-facing details — no room numbers, no
+        // occupancy, no guest data, and crucially no license key.
+        const snap = await window._db.collection("public_booking").doc(bookingToken)
+          .get({ source: "server" }).catch(() => null);
+        const data = snap && snap.exists ? snap.data() : null;
+        if (!data) { setStatus("error"); return; }
+        setHotel(data);
+        const types = Array.isArray(data.roomTypes) ? data.roomTypes : [];
         setRoomTypes(types);
         setRoomType(types[0]?.type || "");
         setStatus("ready");
@@ -10196,7 +10360,7 @@ function PublicBookingPage({ licenseKey }) {
         setStatus("error");
       }
     })();
-  }, [licenseKey]);
+  }, [bookingToken]);
 
   const submit = async () => {
     if (hp) return; // honeypot filled -> silently drop, likely a bot
@@ -10213,7 +10377,7 @@ function PublicBookingPage({ licenseKey }) {
     // can just clear storage; genuine abuse resistance has to live in
     // the Firestore Security Rule itself (see the size/shape cap noted
     // in this component's own top comment).
-    const cooldownKey = "ab_lastBookingReq_" + licenseKey;
+    const cooldownKey = "ab_lastBookingReq_" + bookingToken;
     const lastSubmit = Number(localStorage.getItem(cooldownKey) || 0);
     if (Date.now() - lastSubmit < 2 * 60 * 1000) {
       setErrorMsg("Aapne abhi ek request bheji hai — kripya 2 minute wait karo phir dobara try karo.");
@@ -10223,21 +10387,21 @@ function PublicBookingPage({ licenseKey }) {
     setStatus("submitting");
     try {
       if (!window._db) throw new Error("no connection");
-      const ref = window._db.collection("hotels").doc(licenseKey).collection("data").doc("bookingRequests");
-      const snap = await ref.get();
-      const existing = (snap.exists && snap.data().value) || [];
-      const reqId = "REQ" + Date.now().toString(36).toUpperCase();
+      const reqId = "REQ" + Date.now().toString(36).toUpperCase() +
+        Math.floor(Math.random() * 1000).toString(36).toUpperCase();
       const newReq = {
         id: reqId, name: name.trim().slice(0, 100), phone: phone.trim().slice(0, 20),
         email: email.trim().slice(0, 100),
         checkIn, checkOut, roomType, notes: notes.trim().slice(0, 300),
         status: "pending", createdAt: new Date().toISOString()
       };
-      // Cap the list itself so one hotel's request queue can't grow
-      // unbounded if requests never get triaged — keep the most recent
-      // 200, same defensive pattern used for the audit log elsewhere.
-      const capped = [...existing, newReq].slice(-200);
-      await ref.set({ value: capped }, { merge: true });
+      // Each request is its own document, created (never updated) under
+      // the token's requests subcollection. Unlike the previous
+      // read-modify-write on a shared array, this needs no read access
+      // at all and makes it impossible for one guest's submission to
+      // overwrite or expose another's.
+      await window._db.collection("public_booking").doc(bookingToken)
+        .collection("requests").doc(reqId).set(newReq);
       localStorage.setItem(cooldownKey, String(Date.now()));
       setRefNo(reqId);
       setStatus("submitted");
@@ -10542,6 +10706,7 @@ function App() {
         hotelEmail: localStorage.getItem("hotelEmail") || "",
         hotelGstin: localStorage.getItem("hotelGstin") || "",
         invoiceFooterName: localStorage.getItem("invoiceFooterName") || "",
+        publicBookingToken: localStorage.getItem("publicBookingToken") || "",
         gstMode: localStorage.getItem("gstMode") || "exclusive",
         // "none" (default) = Aadhaar card images are never stored anywhere,
         // only the extracted text + masked number. This is the only fully
@@ -10562,6 +10727,7 @@ function App() {
         hotelEmail: "",
         hotelGstin: "",
         invoiceFooterName: "",
+        publicBookingToken: "",
         gstMode: "exclusive",
         aadhaarPhotoPolicy: "none"
       };
@@ -10586,6 +10752,7 @@ function App() {
       localStorage.setItem("hotelEmail", p.hotelEmail || "");
       localStorage.setItem("hotelGstin", p.hotelGstin || "");
       localStorage.setItem("invoiceFooterName", p.invoiceFooterName || "");
+      localStorage.setItem("publicBookingToken", p.publicBookingToken || "");
       localStorage.setItem("gstMode", p.gstMode || "exclusive");
       localStorage.setItem("aadhaarPhotoPolicy", p.aadhaarPhotoPolicy || "none");
       if (p.hotelLogo) localStorage.setItem("hotelLogo", p.hotelLogo);else localStorage.removeItem("hotelLogo");
@@ -10766,16 +10933,32 @@ function App() {
           if (data) setPermissions(data);
         });
       }, 900);
-      // Booking requests (from the public direct-booking link) — live, so
-      // a new request shows up on the Dashboard without waiting on the
-      // 20s poll. Only matters for hotels with the add-on enabled, but
-      // registering the listener unconditionally is harmless — an empty
-      // list for hotels that never had any requests costs one small read.
+      // Booking requests (from the public direct-booking link) live in
+      // the token-scoped `public_booking/{token}/requests` subcollection,
+      // NOT under this hotel's own data tree — see PublicBookingPage for
+      // why that separation exists (the public link must not be able to
+      // reach anything the license key protects). So this listener is set
+      // up separately from the WS helpers, which are all hardwired to
+      // hotels/{licenseKey}/data/*.
+      //
+      // Only registered when the hotel actually has a public token —
+      // hotels that never created a booking link do no extra reads.
       setTimeout(() => {
         if (cancelled) return;
-        unsubBookingRequests = WS.onSnapshot("bookingRequests", data => {
-          if (data) setBookingRequests(data);
-        });
+        const tok = (localStorage.getItem("publicBookingToken") || "").trim();
+        if (!tok || !window._db) return;
+        try {
+          unsubBookingRequests = window._db.collection("public_booking").doc(tok)
+            .collection("requests").onSnapshot(snap => {
+              const list = [];
+              snap.forEach(d => list.push(d.data()));
+              // Newest first, so the Dashboard shows the most recent
+              // enquiries at the top of the pending queue.
+              list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+              setBookingRequests(list);
+              try { localStorage.setItem("ab_bookingRequests", JSON.stringify(list)); } catch {}
+            }, err => console.warn("Booking requests listener:", err.message));
+        } catch (e) { console.warn("Booking requests listener setup:", e.message); }
       }, 1200);
       // Connection state monitor
       window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
@@ -10856,6 +11039,107 @@ function App() {
     };
   });
 
+  // ── ARCHIVING — keeps the "live" bookings document small forever ──
+  // The single-document design (every booking a hotel has EVER had, in
+  // one Firestore doc) is what the 50%-capacity warning above exists
+  // for — it doesn't fix the ceiling, only warns about it. This is that
+  // fix: once a checked-out booking is older than the live window, it
+  // moves OUT of the live document into a small, dated archive document
+  // (one per calendar month), so the live document a hotel's daily
+  // check-in/checkout depends on never grows past a small, predictable
+  // size no matter how many YEARS the hotel has used the app.
+  //
+  // The overriding rule for all of this: a guest register is a legal
+  // retention record, so a record may be MOVED but is never dropped —
+  // every path below either keeps a booking exactly where it was or
+  // successfully confirms it landed in its new home before removing it
+  // from the old one. Anything that can't be confirmed leaves the
+  // booking right where it already was, to be retried on a later save,
+  // rather than risk losing it.
+  const ARCHIVE_WINDOW_DAYS = 90;
+  // One archive document per calendar month a booking was checked out
+  // in — e.g. "bookings_archive_2026_03" — so no single archive
+  // document can grow large either; each only ever holds one month's
+  // worth of a hotel's checkouts.
+  const getArchiveMonthKey = (dateStr) => {
+    const d = new Date(dateStr + "T12:00:00");
+    if (isNaN(d)) return null;
+    return "bookings_archive_" + d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0");
+  };
+
+  // Splits `bookings` into what should stay in the live document and
+  // what should move to archives, and SAFELY performs that move —
+  // archive writes are confirmed to succeed before anything is removed
+  // from the returned "live" list. Never throws: any failure just means
+  // "nothing changed this time, try again on the next save."
+  //
+  // Capped at moving ARCHIVE_BATCH_CAP records per call (not per
+  // month — total) so that a hotel with a large pre-existing backlog
+  // (from before this existed, or from a long period offline) gets
+  // migrated gradually across several ordinary check-in/checkout saves
+  // instead of attempting one very large write the first time this runs.
+  const ARCHIVE_BATCH_CAP = 300;
+  const archiveOldBookings = async (allBookings) => {
+    const cutoff = Date.now() - ARCHIVE_WINDOW_DAYS * 86400000;
+    const eligible = [];
+    const liveIndexByBookingId = new Map();
+    allBookings.forEach((b, idx) => {
+      liveIndexByBookingId.set(b.id, idx);
+      if (b.status === "checkedout" && b.checkOutActual) {
+        const t = new Date(b.checkOutActual + "T12:00:00").getTime();
+        if (!isNaN(t) && t < cutoff) eligible.push(b);
+      }
+    });
+    if (eligible.length === 0) return { live: allBookings, archivedCount: 0 };
+
+    const batch = eligible.slice(0, ARCHIVE_BATCH_CAP);
+    const byMonth = new Map(); // monthKey -> [bookings]
+    for (const b of batch) {
+      const key = getArchiveMonthKey(b.checkOutActual);
+      if (!key) continue; // malformed date — leave it in live rather than risk misfiling it
+      if (!byMonth.has(key)) byMonth.set(key, []);
+      byMonth.get(key).push(b);
+    }
+
+    const successfullyArchivedIds = new Set();
+    for (const [monthKey, monthBookings] of byMonth) {
+      try {
+        const existing = await WS.get(monthKey, true); // force-server: never trust a stale local cache for a merge
+        const existingArr = Array.isArray(existing) ? existing : [];
+        const existingIds = new Set(existingArr.map(x => x.id));
+        // Only append records not already present in that month's
+        // archive — safe to re-run this whole function against a month
+        // that was partially archived before (e.g. a previous attempt
+        // succeeded for some records this session but not all).
+        const toAppend = monthBookings.filter(b => !existingIds.has(b.id));
+        if (toAppend.length === 0) {
+          // Already fully archived (from an earlier, interrupted attempt)
+          // — safe to remove from live even though nothing new was written.
+          monthBookings.forEach(b => successfullyArchivedIds.add(b.id));
+          continue;
+        }
+        const merged = [...existingArr, ...sanitizeBookingsForCloud(toAppend)];
+        const ref = WS._ref(monthKey);
+        if (!ref) continue; // no Firestore connection — leave these in live, retry later
+        await ref.set({ value: merged, ts: Date.now() }, { merge: true });
+        // Only mark as archived AFTER the write above has resolved
+        // successfully — this is the exact line that guarantees no
+        // booking is ever removed from "live" without first being
+        // durably saved somewhere else.
+        monthBookings.forEach(b => successfullyArchivedIds.add(b.id));
+      } catch (e) {
+        console.warn("Archiving " + monthKey + " failed, will retry next save:", e.message);
+        // Deliberately no re-throw — a failed month just means those
+        // specific records stay in "live" and get tried again next time
+        // saveBk runs, which happens constantly during normal use.
+      }
+    }
+
+    if (successfullyArchivedIds.size === 0) return { live: allBookings, archivedCount: 0 };
+    const live = allBookings.filter(b => !successfullyArchivedIds.has(b.id));
+    return { live, archivedCount: successfullyArchivedIds.size };
+  };
+
   // Root-cause fix for localStorage quota exhaustion: every checked-in
   // guest's photos get embedded in the "bookings" localStorage cache, which
   // otherwise grows FOREVER as a hotel does more check-ins over months —
@@ -10889,7 +11173,19 @@ function App() {
     await WS.set("rooms", r);
     setSyncing(false);
   };
-  const saveBk = async b => {
+  const saveBk = async rawB => {
+    // Auto-archive: moves any checked-out booking older than the live
+    // window into its monthly archive document — see archiveOldBookings
+    // above for the safety guarantees (nothing is ever removed from live
+    // without a confirmed successful archive write first). This runs on
+    // every save, but is a fast no-op on the overwhelming majority of
+    // calls (there's usually nothing old enough to move); the extra
+    // archive read/write only happens on the rare save where there
+    // actually is something to relocate.
+    const { live: b, archivedCount } = await archiveOldBookings(rawB);
+    if (archivedCount > 0) {
+      AuditLog.add("BOOKINGS_ARCHIVED", archivedCount + " record(s) moved to monthly archive");
+    }
     setBookings(b);
     setSyncing(true);
     // Progressively more aggressive pruning if storage is running low —
@@ -11091,7 +11387,21 @@ function App() {
       ? { ...r, status: decision, decidedAt: new Date().toISOString(), decisionReason: reason || "" }
       : r);
     setBookingRequests(updated);
-    await WS.set("bookingRequests", updated).catch(() => {});
+    // Writes to the token-scoped public subcollection (same place the
+    // public page created the request), updating only that ONE request's
+    // document — not a whole-array rewrite, so two staff members acting
+    // on two different requests can't clobber each other's decision.
+    const tok = (localStorage.getItem("publicBookingToken") || "").trim();
+    if (tok && window._db) {
+      try {
+        await window._db.collection("public_booking").doc(tok)
+          .collection("requests").doc(reqId).set({
+            status: decision,
+            decidedAt: new Date().toISOString(),
+            decisionReason: reason || ""
+          }, { merge: true });
+      } catch (e) { console.warn("Request decision save:", e.message); }
+    }
     AuditLog.add(decision === "confirmed" ? "BOOKING_REQUEST_ACCEPTED" : "BOOKING_REQUEST_DECLINED", reqId);
   };
   const handleCheckOut = async (bid, paymentMode) => {
@@ -11445,6 +11755,7 @@ function App() {
   })), view === "storage" && /*#__PURE__*/React.createElement(StorageSettingsView, {
     user: user,
     profile: profile,
+    rooms: rooms,
     setModal: setModal,
     saveProfile: saveProfile
   }), view === "access" && user?.role === "Owner" && hasFeature("roles") && /*#__PURE__*/React.createElement(AccessControlView, {
@@ -11518,7 +11829,12 @@ function App() {
 const _bookParam = new URLSearchParams(window.location.search).get("book");
 const root = ReactDOM.createRoot(document.getElementById('root'));
 if (_bookParam) {
-  root.render(/*#__PURE__*/React.createElement(PublicBookingPage, { licenseKey: _bookParam.trim().toUpperCase() }));
+  // The param is a PUBLIC BOOKING TOKEN (see PublicBookingPage), not a
+  // license key. Passed through as-is apart from trimming whitespace —
+  // the token's alphabet is fixed-case, so unlike the old license-key
+  // handling there is nothing to normalise, and upper-casing it would
+  // corrupt it.
+  root.render(/*#__PURE__*/React.createElement(PublicBookingPage, { bookingToken: _bookParam.trim() }));
 } else {
   root.render(/*#__PURE__*/React.createElement(App, null));
 }
