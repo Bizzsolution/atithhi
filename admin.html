@@ -200,7 +200,7 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
           <button class="btn-outline btn" style="width:auto;white-space:nowrap;padding:0 16px"
             onclick="findLicenseByKey(document.getElementById('findKeyBox').value).then(f=>showMsg(f?('✅ Found: '+(f.hotel||f.key)):'❌ Not found (checked new + old storage)', f?'success':'error'))">🔎 Find</button>
         </div>
-        <button class="btn-outline btn" onclick="hydrateLicensesFromCloud().then(()=>{initDefaultLicenses();renderDashboard();updateSyncIndicator(!LicenseCloud.lastError);showMsg(LicenseCloud.lastError?('⚠️ '+LicenseCloud.lastError):'☁️ Synced from cloud', LicenseCloud.lastError?'error':'success')})"
+        <button class="btn-outline btn" onclick="hydrateLicensesFromCloud().then(()=>{initDefaultLicenses();renderDashboard();const denied=LicenseCloud.lastError&&LicenseCloud.lastErrorExpected;updateSyncIndicator(LicenseCloud.lastError?(denied?'denied':false):true);showMsg(LicenseCloud.lastError?((denied?'🔒 ':'⚠️ ')+LicenseCloud.lastError):'☁️ Synced from cloud', LicenseCloud.lastError?(denied?'success':'error'):'success')})"
           style="width:100%;margin-bottom:8px">🔄 Sync licenses from cloud (other devices)</button>
         <button class="btn-outline btn" style="width:100%;margin-bottom:14px;border-color:#fbbf24;color:#fbbf24"
           onclick="if(confirm('Copy every license from the old storage into the new scalable one? Safe to run more than once — nothing is deleted.')){showMsg('⏳ Migrating...','success');LicenseCloud.migrateOldArrayToNew().then(r=>{if(r.ok){showMsg('✅ Migrated '+r.migrated+' license(s) to scalable storage','success');hydrateLicensesFromCloud().then(renderDashboard);}else{showMsg('⚠️ Migration failed: '+r.error,'error');}})}">🔄 Migrate to Scalable Storage (one-time)</button>
@@ -223,6 +223,20 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
     <div class="tabpanel" id="panel-billing">
       <div id="blMsg" class="msg"></div>
       <div id="blCloudNote" style="display:none;font-size:12px;border-radius:10px;padding:10px 12px;margin-bottom:14px"></div>
+
+      <!-- Vault ID backup reminder — see billingRenderVaultBanner() for
+           why this exists front-and-center rather than tucked inside
+           Settings (where it lived originally and where almost nobody
+           would ever see it before issuing their first invoice). -->
+      <div id="blVaultBanner" style="display:none;background:#422006;border:1px solid #92400e;border-radius:12px;padding:14px 16px;margin-bottom:16px">
+        <div style="font-weight:800;font-size:13px;color:#fcd34d;margin-bottom:6px">⚠️ Pehle yeh Vault ID save kar lo</div>
+        <div style="font-size:12px;color:#fde68a;line-height:1.6;margin-bottom:10px">Aapke saare invoices is ID ke peeche cloud mein save hote hain. Agar is browser ka data kabhi clear ho gaya aur yeh ID kahin save nahi kiya, toh poora invoice-history access nahi ho payega (data delete nahi hoga, bas is device ke bina usse dobara jodna mushkil hoga). Isko abhi kahin surakshit jagah (jaise apne phone ke notes ya password manager) copy karke rakh lo.</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <div id="blVaultBannerId" class="netlify-box" style="margin:0;flex:1;min-width:200px"></div>
+          <button class="btn btn-outline" style="width:auto;white-space:nowrap" onclick="billingCopyVaultFromBanner()">📋 Copy</button>
+          <button class="btn btn-success" style="width:auto;white-space:nowrap" onclick="billingConfirmVaultBackedUp()">✅ Save kar liya</button>
+        </div>
+      </div>
 
       <!-- Create invoice -->
       <div class="section">
@@ -530,12 +544,12 @@ let licensesLastDoc = null; // Firestore cursor for "load more" pagination
 const LicenseCloud = {
   lastError: null,
   async pullPage(pageSize, startAfterDoc) {
-    if (!window._db) { this.lastError = "Firebase not connected in this browser"; return { list: [], hasMore: false, lastDoc: null }; }
+    if (!window._db) { this.lastError = "Firebase not connected in this browser"; this.lastErrorExpected = false; return { list: [], hasMore: false, lastDoc: null }; }
     try {
       let q = window._db.collection("licenses").orderBy("__name__").limit(pageSize);
       if (startAfterDoc) q = q.startAfter(startAfterDoc);
       const snap = await q.get();
-      this.lastError = null;
+      this.lastError = null; this.lastErrorExpected = false;
       const list = snap.docs.map(d => d.data());
       return { list, hasMore: snap.docs.length === pageSize, lastDoc: snap.docs[snap.docs.length - 1] || null };
     } catch (e) {
@@ -549,10 +563,18 @@ const LicenseCloud = {
       // So this failure is EXPECTED and correct once rules are live;
       // say so plainly instead of showing an empty list that looks like
       // all the customer data vanished.
+      //
+      // lastErrorExpected marks exactly that distinction for callers —
+      // whoever reads lastError to decide whether to alarm the admin
+      // (e.g. the top-bar sync indicator) needs to know this is the
+      // rules working correctly, not something broken. Conflating the
+      // two here previously meant a healthy, correctly-secured panel
+      // permanently showed "🔴 Sync Failed" at every login.
       const denied = /permission|insufficient|PERMISSION_DENIED/i.test(e.message || "");
       this.lastError = denied
         ? "Bulk listing is blocked by security rules (this is intentional). Use 'Find by Key' to open any specific hotel."
         : e.message;
+      this.lastErrorExpected = denied;
       return { list: [], hasMore: false, lastDoc: null, denied };
     }
   },
@@ -560,18 +582,26 @@ const LicenseCloud = {
   // many total hotels exist — this is how support/admin finds a specific
   // customer without needing to page through everyone.
   async pullByKey(key) {
-    if (!window._db) { this.lastError = "Firebase not connected in this browser"; return null; }
+    // A single-document `get` by exact key is explicitly ALLOWED by the
+    // rules (unlike the collection-wide `list` in pullPage above), so a
+    // failure here is always a genuine problem, never an expected
+    // security block — lastErrorExpected stays false throughout.
+    if (!window._db) { this.lastError = "Firebase not connected in this browser"; this.lastErrorExpected = false; return null; }
     try {
       const doc = await window._db.collection("licenses").doc(key.toUpperCase()).get();
-      this.lastError = null;
+      this.lastError = null; this.lastErrorExpected = false;
       return doc.exists ? doc.data() : null;
-    } catch (e) { console.warn("License key lookup:", e.message); this.lastError = e.message; return null; }
+    } catch (e) { console.warn("License key lookup:", e.message); this.lastError = e.message; this.lastErrorExpected = false; return null; }
   },
   // Writes EACH given license as its OWN document — batched (Firestore
   // caps a batch at 500 writes), never as one shared array anymore.
   async pushMany(list) {
+    // Writes to licenses/{key} are allowed by the rules for any
+    // validly-formatted key, so — same reasoning as pullByKey above — a
+    // failure here is always genuine, never an expected security block.
     if (!window._db) {
       this.lastError = "Firebase not connected — changes saved locally only, NOT backed up to cloud!";
+      this.lastErrorExpected = false;
       showMsg("⚠️ Cloud sync failed: Firebase not connected. Changes saved on THIS device only.", "error");
       return;
     }
@@ -585,11 +615,11 @@ const LicenseCloud = {
         });
         await batch.commit();
       }
-      this.lastError = null;
+      this.lastError = null; this.lastErrorExpected = false;
       updateSyncIndicator(true);
     } catch (e) {
       console.warn("License push:", e.message);
-      this.lastError = e.message;
+      this.lastError = e.message; this.lastErrorExpected = false;
       updateSyncIndicator(false);
       showMsg("⚠️ Cloud sync failed: " + e.message + " — changes saved on THIS device only, won't work from other devices/servers!", "error");
     }
@@ -618,11 +648,22 @@ const LicenseCloud = {
   }
 };
 
-function updateSyncIndicator(ok) {
+function updateSyncIndicator(state) {
+  // state: true (real success) | false (genuine failure) | "denied" (rules
+  // correctly blocking bulk-list — not a failure, panel still works via
+  // Find-by-Key). Accepting the old boolean calling convention too, so
+  // nothing elsewhere needs to change unless it wants the nuance.
   const el = document.getElementById("cloudSyncStatus");
   if (!el) return;
-  el.textContent = ok ? "☁️ Synced" : "🔴 Sync Failed";
-  el.style.color = ok ? "#4ade80" : "#f87171";
+  if (state === "denied") {
+    el.textContent = "🔒 List Protected";
+    el.style.color = "#60a5fa";
+    el.title = "Bulk-listing is intentionally blocked by security rules. Licenses shown below are from this device's last successful sync — use 'Find by Key' for a live lookup on any specific hotel.";
+  } else {
+    el.textContent = state ? "☁️ Synced" : "🔴 Sync Failed";
+    el.style.color = state ? "#4ade80" : "#f87171";
+    el.title = state ? "" : "Could not reach Firestore — check internet connection and Firebase config.";
+  }
 }
 
 function initDefaultLicenses() {
@@ -761,8 +802,8 @@ function doLogin() {
       hydrateLicensesFromCloud().then(() => {
         initDefaultLicenses();
         renderDashboard();
-        updateSyncIndicator(!LicenseCloud.lastError);
-        if (LicenseCloud.lastError) {
+        updateSyncIndicator(LicenseCloud.lastError ? (LicenseCloud.lastErrorExpected ? "denied" : false) : true);
+        if (LicenseCloud.lastError && !LicenseCloud.lastErrorExpected) {
           showMsg("⚠️ Cloud sync issue: " + LicenseCloud.lastError + " — licenses generated here may not reach the scan server!", "error");
         }
       });
@@ -1876,6 +1917,27 @@ let blDraft = null;
 let blInited = false;
 let blViewerInv = null;
 
+function billingRenderVaultBanner() {
+  const banner = document.getElementById("blVaultBanner");
+  const backedUp = localStorage.getItem("ab_billing_vault_backedup") === Billing.vault();
+  banner.style.display = backedUp ? "none" : "block";
+  if (!backedUp) document.getElementById("blVaultBannerId").textContent = Billing.vault();
+}
+function billingCopyVaultFromBanner() {
+  navigator.clipboard?.writeText(Billing.vault())
+    .then(() => blMsg("📋 Vault ID copy ho gayi — kahin surakshit save kar lo", "success"))
+    .catch(() => prompt("Vault ID copy karo:", Billing.vault()));
+}
+function billingConfirmVaultBackedUp() {
+  // Tied to the specific vault value (not just a bare "true") so that
+  // switching to a DIFFERENT vault later (billingUseVault) correctly
+  // brings the reminder back for that new, not-yet-backed-up ID rather
+  // than staying silently dismissed forever.
+  localStorage.setItem("ab_billing_vault_backedup", Billing.vault());
+  document.getElementById("blVaultBanner").style.display = "none";
+  blMsg("✅ Theek hai — ab yaad rakhna isko kahin likh ke rakha hai", "success");
+}
+
 function billingInit() {
   if (!blInited) {
     Billing.loadLocal();
@@ -1889,6 +1951,7 @@ function billingInit() {
   billingPopulateClients();
   billingRenderRegister();
   document.getElementById("blVaultId").textContent = Billing.vault();
+  billingRenderVaultBanner();
 }
 
 async function billingSyncCloud(showResult) {
@@ -2369,8 +2432,14 @@ async function billingUseVault() {
   if (v === Billing.vault()) { blMsg("Yahi vault already use ho raha hai", "success"); return; }
   if (Billing.invoices.length && !confirm("Is device ke invoices naye vault mein bhi upload ho jaayenge. Continue?")) return;
   localStorage.setItem("ab_billing_vault", v);
+  // Typing/pasting a specific vault ID in here is itself evidence the
+  // admin already has a record of it somewhere (that's how they got it
+  // to paste) — so, unlike a freshly auto-generated vault, this one
+  // doesn't need the "go save this" reminder repeated at them.
+  localStorage.setItem("ab_billing_vault_backedup", v);
   document.getElementById("blVaultId").textContent = v;
   document.getElementById("blVaultInput").value = "";
+  billingRenderVaultBanner();
   await billingSyncCloud(true);
 }
 

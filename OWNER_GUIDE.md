@@ -152,9 +152,14 @@ Agar customer bolta hai "kaam nahi kar raha":
 | File | Purpose |
 |---|---|
 | `index.html` | Customer-facing app |
+| `admin.html` | BizzSathi admin panel — licenses, feature control, Billing |
+| `firestore.rules` | Security rules — must be published in Firebase Console separately from every code deploy |
 | `manifest.json` | PWA (installable on phone) |
-| `netlify.toml` | Server routing config |
-| `netlify/functions/scan.mjs` | Backend — hides API key |
+| `netlify.toml` | Server routing config + CSP headers |
+| `netlify/functions/scan.mjs` | Backend — hides API key, does Aadhaar OCR |
+| `netlify/functions/verify-access.mjs` | Phone-bound license verification |
+| `netlify/functions/admin.mjs` | Admin panel's server-side auth check |
+| `netlify/functions/manage-keys.mjs` | API-key status checker (Settings tab) |
 
 ---
 
@@ -167,3 +172,29 @@ Agar customer bolta hai "kaam nahi kar raha":
 4. WhatsApp karo: URL + Key + Login
 5. Done ✅
 ```
+
+---
+
+## Billing Panel (Admin → 🧾 Billing tab)
+
+Client (hotel) ko professional GST invoice banane/bhejне ke liye — Admin
+Panel ke andar, Dashboard/Settings ke saamne wala tab.
+
+**🔴 Vault ID — ise zaroor samjho:**
+Saare invoices ek secret "Vault ID" (jaise `VABC123...`, 24 characters,
+`V` se shuru) ke peeche cloud mein save hote hain. Yeh ID is browser ke
+`localStorage` mein rehta hai — kahin doosri jagah automatically backup
+nahi hota.
+
+- **Pehli baar Billing tab kholne par** ek peela banner Vault ID copy
+  karne ko bolega — usko kahin surakshit jagah (phone notes, password
+  manager) save kar lo, phir "✅ Save kar liya" dabao.
+- **Agar yeh ID kho gayi** (browser data clear ho gaya, naya device,
+  vagera, bina copy kiye) — invoice history khud delete nahi hota, cloud
+  mein rehta hai, lekin usse wapas jodना tabhi possible hai jab exact
+  Vault ID pata ho. Isliye ise ek baar zaroor kahin likh ke rakho.
+- **Doosre device se same invoices dekhne ke liye**: Billing → Settings
+  → "Doosre device ka Vault ID paste karo" mein wahi ID daalo.
+- Yeh ID **password jaisa hai** — kisi customer/hotel ke saath share mat
+  karo (BizzSathi ki apni billing data hai, kisi hotel ki nahi).
+
