@@ -8959,8 +8959,17 @@ function generatePublicBookingToken() {
 // though this document is world-readable by anyone with the token, it
 // contains nothing private. Room NUMBERS and live occupancy are never
 // included, only types and a "starting from" rate.
+// Returns { ok: true } or { ok: false, reason, detail } — the specific
+// failure matters here and must not be flattened into a generic
+// "something went wrong". The most likely failure by far is that the
+// Firestore Security Rules for the public_booking/ path haven't been
+// published yet in the Firebase Console (this path is new), which shows
+// up as a permission-denied error and has nothing to do with the
+// network. Reporting that as an "internet issue" sends whoever is
+// setting this up chasing entirely the wrong problem.
 async function publishPublicBookingSnapshot(token, profile, rooms) {
-  if (!window._db || !token) return false;
+  if (!window._db) return { ok: false, reason: "no-db", detail: "Firebase connected nahi hai" };
+  if (!token) return { ok: false, reason: "no-token", detail: "Token missing" };
   const byType = {};
   (Array.isArray(rooms) ? rooms : []).forEach(r => {
     if (!r || !r.type) return;
@@ -8976,10 +8985,17 @@ async function publishPublicBookingSnapshot(token, profile, rooms) {
   };
   try {
     await window._db.collection("public_booking").doc(token).set(snapshot, { merge: true });
-    return true;
+    return { ok: true };
   } catch (e) {
-    console.warn("Publish public booking snapshot:", e.message);
-    return false;
+    const msg = (e && e.message) || String(e);
+    const code = (e && e.code) || "";
+    console.warn("Publish public booking snapshot:", code, msg);
+    const denied = /permission|insufficient|PERMISSION_DENIED/i.test(code + " " + msg);
+    return {
+      ok: false,
+      reason: denied ? "permission-denied" : "network",
+      detail: msg
+    };
   }
 }
 
@@ -9001,10 +9017,10 @@ function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
     setPublishState(null);
     try {
       const newToken = generatePublicBookingToken();
-      const ok = await publishPublicBookingSnapshot(newToken, profile, rooms);
-      if (!ok) { setPublishState("error"); return; }
+      const res = await publishPublicBookingSnapshot(newToken, profile, rooms);
+      if (!res.ok) { setPublishState(res); return; }
       await onSaveToken(newToken);
-      setPublishState("ok");
+      setPublishState({ ok: true });
     } finally { setBusy(false); }
   };
 
@@ -9014,9 +9030,30 @@ function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
     setBusy(true);
     setPublishState(null);
     try {
-      const ok = await publishPublicBookingSnapshot(token, profile, rooms);
-      setPublishState(ok ? "ok" : "error");
+      const res = await publishPublicBookingSnapshot(token, profile, rooms);
+      setPublishState(res);
     } finally { setBusy(false); }
+  };
+
+  // Surfaces the ACTUAL reason rather than always blaming the network —
+  // a permission-denied here almost always means the Firestore rules for
+  // public_booking/ haven't been published yet, which is a one-time
+  // setup step, not a transient failure to retry.
+  const renderPublishError = (st) => {
+    if (!st || st.ok || !st.reason) return null;
+    if (st.reason === "permission-denied") {
+      return /*#__PURE__*/React.createElement("div", {
+        style: { color: "#dc2626", fontSize: 11.5, marginTop: 8, lineHeight: 1.5 }
+      }, "Firebase ne permission deny kiya — iska matlab is feature ke liye Firestore Security Rules abhi publish nahi hui hain. Bizzsathi support ko batao: 'public_booking rules deploy karni hain'. (Yeh internet ki problem nahi hai.)");
+    }
+    if (st.reason === "no-db") {
+      return /*#__PURE__*/React.createElement("div", {
+        style: { color: "#dc2626", fontSize: 11.5, marginTop: 8 }
+      }, "Cloud se connection nahi hai. Internet check karke dobara try karo.");
+    }
+    return /*#__PURE__*/React.createElement("div", {
+      style: { color: "#dc2626", fontSize: 11.5, marginTop: 8, lineHeight: 1.5 }
+    }, "Link nahi ban paaya. Detail: " + (st.detail || "unknown"));
   };
 
   const copyLink = async () => {
@@ -9055,9 +9092,7 @@ function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
           onClick: createLink, disabled: busy,
           style: { width: "100%", padding: "11px", borderRadius: 8, border: "none", background: "var(--gold)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: busy ? "default" : "pointer", opacity: busy ? 0.7 : 1 }
         }, busy ? "⏳ Ban raha hai..." : "🔗 Booking Link Banao"),
-        publishState === "error" && /*#__PURE__*/React.createElement("div", {
-          style: { color: "#dc2626", fontSize: 11.5, marginTop: 8 }
-        }, "Link nahi ban paaya (internet issue). Dobara try karo."))
+        renderPublishError(publishState))
     : /*#__PURE__*/React.createElement("div", null,
         /*#__PURE__*/React.createElement("div", {
           style: { fontSize: 12, wordBreak: "break-all", background: "#fdf8f0", padding: 10, borderRadius: 8, fontFamily: "monospace", color: "#333" }
@@ -9075,12 +9110,10 @@ function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
           onClick: refreshSnapshot, disabled: busy,
           style: { width: "100%", marginTop: 8, padding: "9px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 11.5, fontWeight: 700, cursor: busy ? "default" : "pointer", color: "var(--muted)" }
         }, busy ? "⏳ Update ho raha hai..." : "🔄 Hotel details/rooms update karne ke baad yahan dabao"),
-        publishState === "ok" && /*#__PURE__*/React.createElement("div", {
+        publishState && publishState.ok && /*#__PURE__*/React.createElement("div", {
           style: { color: "#16a34a", fontSize: 11.5, marginTop: 6 }
         }, "✅ Public page update ho gaya"),
-        publishState === "error" && /*#__PURE__*/React.createElement("div", {
-          style: { color: "#dc2626", fontSize: 11.5, marginTop: 6 }
-        }, "Update nahi ho paaya (internet issue). Dobara try karo.")));
+        renderPublishError(publishState)));
 }
 
 function StorageSettingsView({

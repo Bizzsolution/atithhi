@@ -137,6 +137,7 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
   <div class="main">
     <div class="tabbar">
       <button class="tab active" id="tab-dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
+      <button class="tab" id="tab-billing" onclick="switchTab('billing')">🧾 Billing</button>
       <button class="tab" id="tab-settings" onclick="switchTab('settings')">⚙️ Settings</button>
       <button class="tab" id="tab-guide" onclick="switchTab('guide')">📖 Guide</button>
     </div>
@@ -213,6 +214,115 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
           <div style="font-size:12px;color:#64748b;margin-bottom:8px">Copy the string below → Netlify Dashboard → Environment Variables → VALID_LICENSES → Paste → Save → Deploy</div>
           <div class="netlify-box" id="validLicString">Loading...</div>
           <button class="copy-all-btn" onclick="copyValidLicenses()">📋 Copy VALID_LICENSES String</button>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ═══ TAB: BILLING ═══ -->
+    <div class="tabpanel" id="panel-billing">
+      <div id="blMsg" class="msg"></div>
+      <div id="blCloudNote" style="display:none;font-size:12px;border-radius:10px;padding:10px 12px;margin-bottom:14px"></div>
+
+      <!-- Create invoice -->
+      <div class="section">
+        <div class="section-title">🧾 Naya Invoice Banao</div>
+
+        <div class="bl-grid2">
+          <div>
+            <label class="bl-lbl">Client (Hotel) select karo</label>
+            <select id="blClientSel" onchange="billingSelectClient(this.value)"></select>
+          </div>
+          <div>
+            <label class="bl-lbl">Ya License Key se dhoondho</label>
+            <div style="display:flex;gap:8px">
+              <input id="blFindKey" placeholder="ATITHI-XXXXXXXXXXXX" style="margin-bottom:0"/>
+              <button class="btn btn-outline" style="white-space:nowrap" onclick="billingFindClient()">🔎 Find</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="bl-sub">Billing details (agli baar ke liye save ho jaayengi)</div>
+        <div class="bl-grid2">
+          <div><label class="bl-lbl">Business / Legal name *</label><input id="blcName" oninput="billingRecalc()"/></div>
+          <div><label class="bl-lbl">Contact person</label><input id="blcContact"/></div>
+          <div><label class="bl-lbl">Phone (WhatsApp)</label><input id="blcPhone" inputmode="tel"/></div>
+          <div><label class="bl-lbl">Email</label><input id="blcEmail" type="email"/></div>
+          <div><label class="bl-lbl">GSTIN (agar hai)</label><input id="blcGstin" oninput="billingOnClientGstin()" style="text-transform:uppercase"/></div>
+          <div><label class="bl-lbl">State (Place of Supply) *</label><select id="blcState" onchange="billingRecalc()"></select></div>
+        </div>
+        <label class="bl-lbl">Billing address</label>
+        <textarea id="blcAddr" rows="2"></textarea>
+
+        <div class="bl-sub">Line items</div>
+        <div id="blItems"></div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+          <button class="btn btn-outline" onclick="billingAddItem()">＋ Item</button>
+          <button class="btn btn-outline" onclick="billingAddItem('Setup & Onboarding Fee')">＋ Setup fee</button>
+          <button class="btn btn-outline" onclick="billingAddItem('Add-on: OTA Booking Import')">＋ OTA Import add-on</button>
+          <button class="btn btn-outline" onclick="billingAddItem('Add-on: Direct Booking Link')">＋ Direct Booking add-on</button>
+        </div>
+
+        <div class="bl-grid3">
+          <div><label class="bl-lbl">Invoice date</label><input id="blDate" type="date" onchange="billingRecalc()"/></div>
+          <div><label class="bl-lbl">Payment terms (days)</label><input id="blTerms" type="number" min="0" onchange="billingRecalc()"/></div>
+          <div><label class="bl-lbl">Discount (₹)</label><input id="blDiscount" type="number" min="0" step="0.01" value="0" oninput="billingRecalc()"/></div>
+        </div>
+        <label class="bl-check"><input type="checkbox" id="blInclusive" onchange="billingRecalc()"/> Rates GST ke saath (inclusive) hain</label>
+        <label class="bl-check"><input type="checkbox" id="blPaidNow" onchange="billingTogglePaidNow()"/> Payment already mil chuka hai (invoice PAID ban kar issue hoga)</label>
+        <div id="blPaidBox" style="display:none" class="bl-grid3">
+          <div><label class="bl-lbl">Payment date</label><input id="blPayDate" type="date"/></div>
+          <div><label class="bl-lbl">Mode</label><select id="blPayMode"><option>UPI</option><option>Bank Transfer</option><option>Cash</option><option>Card</option><option>Cheque</option></select></div>
+          <div><label class="bl-lbl">Reference / UTR</label><input id="blPayRef"/></div>
+        </div>
+        <label class="bl-lbl">Note (invoice pe dikhega)</label>
+        <textarea id="blNotes" rows="2"></textarea>
+
+        <div id="blTotals" class="bl-totals"></div>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-outline" style="flex:1;padding:13px" onclick="billingPreview()">👁️ Preview</button>
+          <button class="btn btn-success" style="flex:2" id="blIssueBtn" onclick="billingIssue()">✅ Issue Invoice</button>
+        </div>
+        <div style="font-size:11px;color:#64748b;margin-top:8px">Issue karne ke baad invoice edit nahi hota (GST norm). Galti ho to Cancel karke naya banao — invoice number series todi nahi jaati.</div>
+      </div>
+
+      <!-- Register -->
+      <div class="section">
+        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <span>📚 Invoice Register</span>
+          <span style="display:flex;gap:6px">
+            <button class="btn btn-outline" onclick="billingSyncCloud(true)">🔄 Sync</button>
+            <button class="btn btn-outline" onclick="billingExportCSV()">⬇️ CSV (GST)</button>
+          </span>
+        </div>
+        <div class="bl-grid2">
+          <input id="blRegSearch" placeholder="🔍 Invoice no, client, GSTIN..." oninput="billingRenderRegister()"/>
+          <select id="blRegStatus" onchange="billingRenderRegister()">
+            <option value="">Sab status</option><option value="unpaid">Due</option><option value="paid">Paid</option><option value="cancelled">Cancelled</option>
+          </select>
+        </div>
+        <div id="blRegSummary" style="font-size:12px;color:#94a3b8;margin-bottom:10px"></div>
+        <div id="blRegister"></div>
+      </div>
+
+      <!-- Seller settings -->
+      <div class="section">
+        <div class="section-title" style="cursor:pointer" onclick="billingToggleSettings()">⚙️ Billing Settings (aapki company details) <span id="blSetArrow">▸</span></div>
+        <div id="blSettingsBody" style="display:none">
+          <div style="font-size:12px;color:#94a3b8;margin-bottom:12px;line-height:1.6">Yeh details har invoice pe "From" section mein chhapti hain. GSTIN daaloge to invoice <b>TAX INVOICE</b> banega aur GST lagega; khaali chhodoge to bina GST ka <b>INVOICE</b> banega.</div>
+          <div id="blSettingsFields"></div>
+          <button class="btn btn-primary" onclick="billingSaveSettings()">💾 Settings Save karo</button>
+
+          <div style="margin-top:18px;padding:14px;background:#0b1220;border:1px solid #263248;border-radius:12px">
+            <div style="font-weight:700;font-size:13px;margin-bottom:6px">🔐 Billing Vault ID</div>
+            <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;line-height:1.6">Aapke saare invoices is secret ID ke andar cloud mein save hote hain. Doosre device pe same invoices dekhne ke liye wahan yahi ID daalo. <b>Ise password ki tarah kisi ke saath share mat karo.</b></div>
+            <div id="blVaultId" class="netlify-box" style="margin-top:0;margin-bottom:10px"></div>
+            <div style="display:flex;gap:8px">
+              <input id="blVaultInput" placeholder="Doosre device ka Vault ID paste karo" style="margin-bottom:0"/>
+              <button class="btn btn-outline" style="white-space:nowrap" onclick="billingUseVault()">Use</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -330,8 +440,8 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
           3. VALID_LICENSES string copy karo → Netlify update karo → Deploy<br/><br/>
           <b style="color:#f8fafc">Payment Confirm Hone Ke Baad:</b><br/>
           1. Apna UPI/bank app check karke payment confirm karo<br/>
-          2. License card mein "🧾 Invoice" button dabao — receipt copy ho jayegi<br/>
-          3. WhatsApp pe paste karke customer ko bhej do<br/><br/>
+          2. License card mein "🧾 Invoice" button dabao — Billing tab khulega, client already selected hoga<br/>
+          3. Item/amount check karke "Issue Invoice" dabao, phir 💬 WhatsApp ya ✉️ Email se seedha PDF bhej do<br/><br/>
           <b style="color:#f8fafc">Customer Ka License Expire Karna:</b><br/>
           1. Key ke saamne "Revoke" button dabao<br/>
           2. VALID_LICENSES copy karo → Netlify → Update → Deploy<br/>
@@ -366,10 +476,11 @@ function escHtml(s){
 
 // ── TAB NAVIGATION ──────────────────────────────
 function switchTab(name){
-  ["dashboard","settings","guide"].forEach(t => {
+  ["dashboard","billing","settings","guide"].forEach(t => {
     document.getElementById("tab-"+t).classList.toggle("active", t===name);
     document.getElementById("panel-"+t).classList.toggle("active", t===name);
   });
+  if (name === "billing" && typeof billingInit === "function") billingInit();
 }
 
 // ── SECURITY: Brute-force lockout for admin login ──
@@ -1016,34 +1127,14 @@ function shareWA() {
 // landed (check your bank/UPI app — this button does NOT detect payment
 // automatically, since that needs a real payment gateway integration).
 function generateInvoiceForLicense(i) {
+  // The old version only copied a plain-text receipt to the clipboard —
+  // not a GST invoice, with a random (non-sequential) number, and the
+  // clipboard API fails silently in several browsers. It now opens the
+  // Billing tab with this client pre-selected.
   const l = licenses[i];
   if (!l) return;
-  const planLabels = { TRIAL: "Trial (Free)", BASIC: "Basic Plan", PRO: "Pro Plan", PREM: "Premium Plan" };
-  const amount = PLAN_AMOUNTS[l.plan] || 0;
-  if (amount === 0) { alert("Trial plan ka koi payment nahi hota — invoice zaroorat nahi."); return; }
-  const invoiceNo = "INV-" + l.key.replace(/[^A-Z0-9]/g, "").slice(-6) + "-" + Date.now().toString().slice(-5);
-  const today = new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
-  const invoiceText =
-`🧾 *Payment Receipt / Invoice*
-
-Invoice No: ${invoiceNo}
-Date: ${today}
-
-Billed To: ${l.hotel || l.key}
-${l.owner ? "Contact: " + l.owner + (l.phone ? " (" + l.phone + ")" : "") : ""}
-License Key: ${l.key}
-
-Plan: ${planLabels[l.plan] || l.plan}
-Amount Paid: ₹${amount}
-Billing Cycle: Monthly
-
-Payment Received Via: UPI (${UPI_ID})
-
-Thank you for choosing AtithiBook! 🏨
-— BizzSathi
-📞 8447992260, 9315660112
-📧 bizsaathi5@gmail.com`;
-  navigator.clipboard?.writeText(invoiceText).then(() => showMsg("🧾 Invoice copied — paste & send via WhatsApp", "success")).catch(() => prompt("Copy invoice:", invoiceText));
+  switchTab("billing");
+  billingSelectClient(l.key);
 }
 
 // ── REVOKE / RESTORE ─────────────────────────────────────
@@ -1266,5 +1357,1023 @@ async function refreshKeyStatus(){
   </div>
 </div>
 
+
+<style>
+.bl-lbl{display:block;font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:5px;text-transform:uppercase;letter-spacing:.3px}
+.bl-sub{font-size:12px;font-weight:800;color:#cbd5e1;margin:8px 0 10px;padding-top:10px;border-top:1px dashed #263248}
+.bl-grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.bl-grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 12px}
+@media (max-width:600px){.bl-grid2,.bl-grid3{grid-template-columns:1fr}}
+.bl-check{display:flex;align-items:center;gap:8px;font-size:13px;color:#cbd5e1;margin-bottom:12px;cursor:pointer}
+.bl-check input{width:auto;margin:0}
+.bl-item{background:#0b1220;border:1px solid #263248;border-radius:12px;padding:12px;margin-bottom:10px}
+.bl-item-row{display:grid;grid-template-columns:90px 1fr 1fr 36px;gap:8px;align-items:end}
+.bl-item-row input{margin-bottom:0}
+.bl-amt{font-weight:800;color:#e2e8f0;font-size:14px;padding-bottom:10px;text-align:right}
+.bl-x{background:#3f1d1d;color:#fca5a5;border:none;border-radius:8px;height:40px;cursor:pointer;font-size:16px}
+.bl-totals{background:#0b1220;border:1px solid #263248;border-radius:12px;padding:14px;margin:6px 0 14px;font-size:13px}
+.bl-totals .r{display:flex;justify-content:space-between;padding:3px 0;color:#94a3b8}
+.bl-totals .r b{color:#e2e8f0}
+.bl-totals .g{border-top:1px solid #263248;margin-top:6px;padding-top:8px;font-size:16px;color:#f8fafc;font-weight:800}
+.bl-badge{display:inline-block;font-size:10px;font-weight:800;padding:3px 8px;border-radius:999px;letter-spacing:.4px}
+.bl-b-paid{background:#052e16;color:#4ade80}.bl-b-unpaid{background:#422006;color:#fbbf24}.bl-b-cancelled{background:#450a0a;color:#f87171}
+.bl-vbtn{padding:9px 12px;border:none;border-radius:9px;font-weight:700;font-size:13px;cursor:pointer;background:#1e293b;color:#e2e8f0}
+.bl-vbtn.pri{background:#2563eb;color:#fff}.bl-vbtn.grn{background:#16a34a;color:#fff}.bl-vbtn.wa{background:#25d366;color:#fff}
+</style>
+
+<!-- Invoice viewer -->
+<div id="blViewer" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.88);z-index:300;overflow-y:auto">
+  <div style="max-width:860px;margin:0 auto;padding:12px">
+    <div style="position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;gap:8px;padding:10px 0;background:rgba(2,6,23,.95)">
+      <button class="bl-vbtn pri" onclick="billingViewerAction('pdf')">⬇️ PDF</button>
+      <button class="bl-vbtn" onclick="billingViewerAction('share')">📤 Share</button>
+      <button class="bl-vbtn wa" onclick="billingViewerAction('wa')">💬 WhatsApp</button>
+      <button class="bl-vbtn" onclick="billingViewerAction('email')">✉️ Email</button>
+      <button class="bl-vbtn" onclick="billingViewerAction('print')">🖨️ Print</button>
+      <button class="bl-vbtn grn" id="blVMarkPaid" onclick="billingOpenPay()">✅ Mark Paid</button>
+      <button class="bl-vbtn" style="margin-left:auto" onclick="billingCloseViewer()">✕ Close</button>
+    </div>
+    <div id="blViewerHint" style="font-size:12px;color:#94a3b8;margin:0 0 8px"></div>
+    <div id="blViewerDoc" style="width:100%;overflow:hidden;border-radius:6px"></div>
+  </div>
+</div>
+
+<!-- Mark paid -->
+<div id="blPayModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:400;align-items:center;justify-content:center;padding:16px">
+  <div style="width:100%;max-width:380px;background:#0f172a;border:1px solid #1e293b;border-radius:16px;padding:18px">
+    <div style="font-weight:800;font-size:15px;margin-bottom:12px">✅ Payment record karo</div>
+    <label class="bl-lbl">Payment date</label><input id="blMpDate" type="date"/>
+    <label class="bl-lbl">Mode</label><select id="blMpMode"><option>UPI</option><option>Bank Transfer</option><option>Cash</option><option>Card</option><option>Cheque</option></select>
+    <label class="bl-lbl">Reference / UTR</label><input id="blMpRef"/>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-outline" style="flex:1;padding:12px" onclick="document.getElementById('blPayModal').style.display='none'">Cancel</button>
+      <button class="btn btn-success" style="flex:2" onclick="billingConfirmPaid()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  BILLING — professional GST invoices from BizzSathi to its clients
+// ═══════════════════════════════════════════════════════════════════
+// Design rules this module follows (GST Rule 46 + usual SaaS practice):
+//  • Invoice numbers are CONSECUTIVE per financial year, unique, max 16
+//    chars, only A-Z 0-9 "/" "-" — e.g. BZS/26-27/0001. Allocated via a
+//    Firestore transaction so two devices can never issue the same number.
+//  • An issued invoice is never edited or deleted. Status can move to
+//    PAID or CANCELLED; the number is retained either way, so the series
+//    never has gaps you can't explain.
+//  • Seller details are SNAPSHOTTED into each invoice at issue time, so
+//    later changes to company settings never rewrite old invoices.
+//  • Money is handled in integer paise throughout — no floating-point
+//    rounding drift in tax or totals.
+//  • Same state as seller → CGST + SGST; different state → IGST.
+//    No valid seller GSTIN → no GST at all, titled "INVOICE".
+//
+// Storage: every path the admin panel can reach is readable by anyone
+// who knows the path (the app has no Firebase Auth), so billing data
+// lives under `billing/{vaultId}` where vaultId is a 24-char random
+// secret kept on this device. Invoices and client profiles are separate
+// documents in sub-collections, so there is no single-document size
+// ceiling on how many invoices can be issued.
+
+const BL_STATES = [["01","Jammu & Kashmir"],["02","Himachal Pradesh"],["03","Punjab"],["04","Chandigarh"],["05","Uttarakhand"],["06","Haryana"],["07","Delhi"],["08","Rajasthan"],["09","Uttar Pradesh"],["10","Bihar"],["11","Sikkim"],["12","Arunachal Pradesh"],["13","Nagaland"],["14","Manipur"],["15","Mizoram"],["16","Tripura"],["17","Meghalaya"],["18","Assam"],["19","West Bengal"],["20","Jharkhand"],["21","Odisha"],["22","Chhattisgarh"],["23","Madhya Pradesh"],["24","Gujarat"],["26","Dadra & Nagar Haveli and Daman & Diu"],["27","Maharashtra"],["29","Karnataka"],["30","Goa"],["31","Lakshadweep"],["32","Kerala"],["33","Tamil Nadu"],["34","Puducherry"],["35","Andaman & Nicobar Islands"],["36","Telangana"],["37","Andhra Pradesh"],["38","Ladakh"],["97","Other Territory"]];
+const blStateName = code => { const s = BL_STATES.find(x => x[0] === code); return s ? s[1] : ""; };
+const BL_GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+const BL_PLAN_LABELS = { TRIAL: "Trial", BASIC: "Basic", PRO: "Pro", PREM: "Premium" };
+
+const BL_DEFAULT_SETTINGS = {
+  businessName: "BizzSathi",
+  legalName: "",
+  address: "",
+  stateCode: "09",
+  gstin: "",
+  pan: "",
+  email: "bizsaathi5@gmail.com",
+  phone: "8447992260, 9315660112",
+  website: "",
+  productName: "AtithiBook — Hotel Management Software",
+  sac: "997331",
+  gstRate: 18,
+  prefix: "BZS",
+  termsDays: 7,
+  bankName: "", accountName: "", accountNo: "", ifsc: "",
+  upiId: (typeof UPI_ID !== "undefined" ? UPI_ID : ""),
+  signatory: "",
+  notes: "Thank you for choosing AtithiBook.",
+  terms: "1. Payment is due by the due date mentioned on this invoice.\n2. Subscription fees are billed in advance for the billing period stated.\n3. Fees once paid are non-refundable, except where required by law.\n4. Please quote the invoice number as the payment reference."
+};
+
+// ── small helpers ────────────────────────────────────────────────
+const blEsc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const blToday = () => { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); };
+function blAddDays(iso, days) { const d = new Date(iso + "T12:00:00"); d.setDate(d.getDate() + Number(days || 0)); return d.toISOString().slice(0, 10); }
+function blAddMonths(iso, months) { const d = new Date(iso + "T12:00:00"); d.setMonth(d.getMonth() + Number(months || 0)); return d.toISOString().slice(0, 10); }
+function blFmtDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso + "T12:00:00");
+  return isNaN(d) ? iso : d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+function blFY(iso) {
+  const d = new Date(iso + "T12:00:00");
+  const y = d.getFullYear() % 100;
+  const start = d.getMonth() >= 3 ? y : (y + 99) % 100; // FY starts 1 April
+  return String(start).padStart(2, "0") + "-" + String((start + 1) % 100).padStart(2, "0");
+}
+function blMoney(paise) {
+  const neg = paise < 0;
+  const s = (Math.abs(paise) / 100).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (neg ? "-₹" : "₹") + s;
+}
+function blRandom(n) {
+  const a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const b = new Uint8Array(n); crypto.getRandomValues(b);
+  let o = ""; for (const x of b) o += a[x % a.length]; return o;
+}
+function blWords(n) {
+  const a = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const b = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const two = x => x < 20 ? a[x] : b[Math.floor(x / 10)] + (x % 10 ? " " + a[x % 10] : "");
+  const three = x => x >= 100 ? a[Math.floor(x / 100)] + " Hundred" + (x % 100 ? " " + two(x % 100) : "") : two(x);
+  if (n === 0) return "Zero";
+  const out = [];
+  const crore = Math.floor(n / 1e7); n %= 1e7;
+  const lakh = Math.floor(n / 1e5); n %= 1e5;
+  const th = Math.floor(n / 1000); n %= 1000;
+  if (crore) out.push(blWords(crore) + " Crore");
+  if (lakh) out.push(two(lakh) + " Lakh");
+  if (th) out.push(two(th) + " Thousand");
+  if (n) out.push(three(n));
+  return out.join(" ");
+}
+function blAmountWords(paise) {
+  const r = Math.floor(Math.abs(paise) / 100), p = Math.abs(paise) % 100;
+  return "Rupees " + blWords(r) + (p ? " and " + blWords(p) + " Paise" : "") + " Only";
+}
+function blMsg(text, type) {
+  const el = document.getElementById("blMsg");
+  if (!el) return;
+  el.className = "msg msg-" + (type || "success");
+  el.textContent = text;
+  el.style.display = "block";
+  el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  clearTimeout(blMsg._t);
+  blMsg._t = setTimeout(() => { el.style.display = "none"; }, 7000);
+}
+const blIsDenied = e => /permission|insufficient|PERMISSION_DENIED/i.test(((e && e.code) || "") + " " + ((e && e.message) || ""));
+
+// ── store (local cache + cloud vault) ────────────────────────────
+const Billing = {
+  settings: null,
+  invoices: [],
+  clients: {},
+  cloudOk: null,
+  vault() {
+    let v = localStorage.getItem("ab_billing_vault");
+    if (!v) { v = "V" + blRandom(23); localStorage.setItem("ab_billing_vault", v); }
+    return v;
+  },
+  root() { return window._db ? window._db.collection("billing").doc(this.vault()) : null; },
+  loadLocal() {
+    try { this.settings = { ...BL_DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem("ab_billing_settings") || "{}") }; }
+    catch (e) { this.settings = { ...BL_DEFAULT_SETTINGS }; }
+    try { this.invoices = JSON.parse(localStorage.getItem("ab_billing_invoices") || "[]"); } catch (e) { this.invoices = []; }
+    try { this.clients = JSON.parse(localStorage.getItem("ab_billing_clients") || "{}"); } catch (e) { this.clients = {}; }
+  },
+  saveLocal() {
+    try {
+      localStorage.setItem("ab_billing_settings", JSON.stringify(this.settings));
+      localStorage.setItem("ab_billing_invoices", JSON.stringify(this.invoices));
+      localStorage.setItem("ab_billing_clients", JSON.stringify(this.clients));
+    } catch (e) { console.warn("Billing local save:", e.message); }
+  },
+  async loadCloud() {
+    const root = this.root();
+    if (!root) { this.cloudOk = false; return { ok: false, reason: "offline" }; }
+    try {
+      const [snap, invSnap, cliSnap] = await Promise.all([
+        root.get(),
+        root.collection("invoices").orderBy("createdAt", "desc").limit(1000).get(),
+        root.collection("clients").get()
+      ]);
+      if (snap.exists && snap.data().settings) this.settings = { ...BL_DEFAULT_SETTINGS, ...snap.data().settings };
+      const byId = new Map(this.invoices.map(x => [x.id, x]));
+      const cloudIds = new Set();
+      invSnap.forEach(d => {
+        const c = d.data(); cloudIds.add(c.id);
+        const l = byId.get(c.id);
+        if (!l || (c.updatedAt || 0) >= (l.updatedAt || 0)) byId.set(c.id, c);
+      });
+      this.invoices = [...byId.values()].sort((x, y) => (y.createdAt || 0) - (x.createdAt || 0));
+      cliSnap.forEach(d => { this.clients[d.id] = d.data(); });
+      this.saveLocal();
+      this.cloudOk = true;
+      // Anything issued on this device while offline goes up now.
+      for (const inv of this.invoices) if (!cloudIds.has(inv.id)) await this.saveInvoice(inv).catch(() => {});
+      return { ok: true };
+    } catch (e) {
+      this.cloudOk = false;
+      return { ok: false, reason: blIsDenied(e) ? "denied" : "error", detail: e.message };
+    }
+  },
+  async saveSettings(s) {
+    this.settings = { ...BL_DEFAULT_SETTINGS, ...s };
+    this.saveLocal();
+    const root = this.root(); if (!root) return;
+    await root.set({ settings: JSON.parse(JSON.stringify(this.settings)) }, { merge: true });
+  },
+  async saveInvoice(inv) {
+    const root = this.root(); if (!root) throw new Error("offline");
+    await root.collection("invoices").doc(inv.id).set(JSON.parse(JSON.stringify(inv)));
+  },
+  async saveClient(c) {
+    if (!c.key) return;
+    this.clients[c.key] = c; this.saveLocal();
+    const root = this.root(); if (!root) return;
+    await root.collection("clients").doc(c.key).set(JSON.parse(JSON.stringify(c)), { merge: true });
+  },
+  localMax(fy) { return this.invoices.filter(i => i.fy === fy).reduce((m, i) => Math.max(m, i.seq || 0), 0); },
+  // Transaction: two devices issuing at the same moment get different
+  // numbers. Never lower than what this device already holds either.
+  async allocateNumber(fy) {
+    const root = this.root();
+    if (!root || typeof window._db.runTransaction !== "function") throw new Error("offline");
+    const localMax = this.localMax(fy);
+    return await window._db.runTransaction(async tx => {
+      const snap = await tx.get(root);
+      const counters = (snap.exists && snap.data().counters) || {};
+      const next = Math.max(counters[fy] || 0, localMax) + 1;
+      tx.set(root, { counters: { ...counters, [fy]: next } }, { merge: true });
+      return next;
+    });
+  }
+};
+window.Billing = Billing;
+
+// ── calculation (paise) ──────────────────────────────────────────
+function blCompute(draft, s) {
+  const items = draft.items.map(it => {
+    const qty = Math.max(0, Number(it.qty) || 0);
+    const ratePaise = Math.max(0, Math.round((Number(it.rate) || 0) * 100));
+    return { desc: String(it.desc || "").trim(), period: String(it.period || "").trim(), sac: it.sac || s.sac, qty, ratePaise, amountPaise: Math.round(qty * ratePaise) };
+  });
+  const gross = items.reduce((t, i) => t + i.amountPaise, 0);
+  const discount = Math.min(gross, Math.max(0, Math.round((Number(draft.discount) || 0) * 100)));
+  const net = gross - discount;
+  const registered = BL_GSTIN_RE.test(String(s.gstin || "").toUpperCase());
+  const rate = registered ? (Number(s.gstRate) || 0) : 0;
+  let taxable, tax;
+  if (rate && draft.inclusive) { taxable = Math.round(net * 100 / (100 + rate)); tax = net - taxable; }
+  else { taxable = net; tax = Math.round(net * rate / 100); }
+  const posCode = draft.client.stateCode || s.stateCode;
+  const taxType = !rate ? "none" : (posCode === s.stateCode ? "intra" : "inter");
+  let cgst = 0, sgst = 0, igst = 0;
+  if (taxType === "intra") { cgst = Math.floor(tax / 2); sgst = tax - cgst; }
+  else if (taxType === "inter") igst = tax;
+  const exact = taxable + tax;
+  const total = Math.round(exact / 100) * 100;
+  return { items, gross, discount, taxable, tax, cgst, sgst, igst, rate, taxType, roundOff: total - exact, total, registered, posCode };
+}
+
+// ── invoice document (self-contained HTML, A4 width 794px) ───────
+function blInvoiceHTML(inv, opts) {
+  opts = opts || {};
+  const s = inv.seller, c = inv.client, t = inv.totals, e = blEsc;
+  const title = t.registered ? "TAX INVOICE" : "INVOICE";
+  const ST = { paid: ["PAID", "#15803d", "#dcfce7"], unpaid: ["DUE", "#b45309", "#fef3c7"], cancelled: ["CANCELLED", "#b91c1c", "#fee2e2"] };
+  const [stTxt, stFg, stBg] = ST[inv.status] || ST.unpaid;
+  const join = arr => arr.filter(Boolean).map(x => "<div>" + x + "</div>").join("");
+  const sellerLines = join([
+    s.legalName && s.legalName !== s.businessName ? e(s.legalName) : "",
+    e(s.address).replace(/\n/g, "<br>"),
+    s.stateCode ? e(blStateName(s.stateCode)) + " — State Code " + e(s.stateCode) : "",
+    s.gstin ? "<b>GSTIN:</b> " + e(s.gstin) : "",
+    s.pan ? "<b>PAN:</b> " + e(s.pan) : "",
+    [s.email, s.phone].filter(Boolean).map(e).join(" &nbsp;·&nbsp; "),
+    s.website ? e(s.website) : ""
+  ]);
+  const clientLines = join([
+    c.contact ? "Attn: " + e(c.contact) : "",
+    e(c.address).replace(/\n/g, "<br>"),
+    c.stateCode ? e(blStateName(c.stateCode)) + " — State Code " + e(c.stateCode) : "",
+    c.gstin ? "<b>GSTIN:</b> " + e(c.gstin) : "<span style='color:#64748b'>GSTIN: Unregistered</span>",
+    [c.phone, c.email].filter(Boolean).map(e).join(" &nbsp;·&nbsp; ")
+  ]);
+  const meta = [
+    ["Invoice No.", e(inv.number)],
+    ["Invoice Date", e(blFmtDate(inv.date))],
+    ["Due Date", e(blFmtDate(inv.dueDate))],
+    ["Place of Supply", e(blStateName(t.posCode)) + " (" + e(t.posCode) + ")"],
+    ["Reverse Charge", "No"]
+  ].map(([k, v]) => `<tr><td class="mk">${k}</td><td class="mv">${v}</td></tr>`).join("");
+
+  const rows = t.items.map((it, i) => `<tr>
+    <td class="c">${i + 1}</td>
+    <td><div class="dsc">${e(it.desc)}</div>${it.period ? `<div class="per">${e(it.period)}</div>` : ""}</td>
+    <td class="c">${e(it.sac)}</td>
+    <td class="r">${it.qty}</td>
+    <td class="r">${blMoney(it.ratePaise)}</td>
+    <td class="r">${blMoney(it.amountPaise)}</td></tr>`).join("");
+
+  const half = t.rate / 2;
+  const tot = [];
+  tot.push(["Sub Total", blMoney(t.gross)]);
+  if (t.discount) tot.push(["Discount", "-" + blMoney(t.discount)]);
+  tot.push(["Taxable Value", blMoney(t.taxable)]);
+  if (t.taxType === "intra") { tot.push(["CGST @ " + half + "%", blMoney(t.cgst)]); tot.push(["SGST @ " + half + "%", blMoney(t.sgst)]); }
+  if (t.taxType === "inter") tot.push(["IGST @ " + t.rate + "%", blMoney(t.igst)]);
+  if (t.roundOff) tot.push(["Round Off", blMoney(t.roundOff)]);
+  const totRows = tot.map(([k, v]) => `<tr><td>${k}</td><td class="r">${v}</td></tr>`).join("");
+  const paid = inv.status === "paid";
+  const balance = inv.status === "cancelled" ? 0 : (paid ? 0 : t.total);
+
+  let payBlock = "";
+  if (paid && inv.payment) {
+    payBlock = `<div class="bx"><div class="bh">Payment Received</div>
+      <div>${e(blFmtDate(inv.payment.date))} via ${e(inv.payment.mode)}${inv.payment.ref ? " — Ref: " + e(inv.payment.ref) : ""}</div></div>`;
+  } else if (inv.status !== "cancelled") {
+    const bank = join([
+      s.accountName ? "<b>A/c Name:</b> " + e(s.accountName) : "",
+      s.accountNo ? "<b>A/c No.:</b> " + e(s.accountNo) : "",
+      s.ifsc ? "<b>IFSC:</b> " + e(s.ifsc) : "",
+      s.bankName ? "<b>Bank:</b> " + e(s.bankName) : "",
+      s.upiId ? "<b>UPI:</b> " + e(s.upiId) : ""
+    ]);
+    let qr = "";
+    if (s.upiId && !opts.noQr && t.total > 0) {
+      const upi = `upi://pay?pa=${encodeURIComponent(s.upiId)}&pn=${encodeURIComponent(s.businessName || "")}&am=${(t.total / 100).toFixed(2)}&cu=INR&tn=${encodeURIComponent(inv.number)}`;
+      qr = `<img crossorigin="anonymous" src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=${encodeURIComponent(upi)}" style="width:92px;height:92px;flex-shrink:0" alt="UPI QR"/>`;
+    }
+    if (bank || qr) payBlock = `<div class="bx"><div class="bh">Payment Details</div><div style="display:flex;gap:12px;align-items:flex-start"><div style="flex:1">${bank}</div>${qr}</div></div>`;
+  }
+
+  const stamp = inv.status === "paid" || inv.status === "cancelled"
+    ? `<div class="stamp" style="color:${stFg};border-color:${stFg}">${stTxt}</div>` : "";
+  const cancelNote = inv.status === "cancelled" && inv.cancelled
+    ? `<div class="bx" style="border-color:#fecaca;background:#fef2f2"><div class="bh" style="color:#b91c1c">Cancelled on ${e(blFmtDate(inv.cancelled.date))}</div><div>${e(inv.cancelled.reason || "")}</div></div>` : "";
+  const taxNote = t.registered ? "" : `<div style="margin-top:6px;color:#64748b;font-size:10.5px">Supplier is not registered under GST; no GST has been charged on this invoice.</div>`;
+
+  return `<style>
+.bzinv{position:relative;width:794px;min-height:1123px;box-sizing:border-box;background:#fff;color:#0f172a;font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:1.5;padding:44px 48px 36px}
+.bzinv *{box-sizing:border-box}
+.bzinv .top{display:flex;justify-content:space-between;gap:24px}
+.bzinv .brand{font-size:26px;font-weight:800;letter-spacing:-.3px;color:#0f2a4a}
+.bzinv .muted{color:#475569;font-size:11.5px;margin-top:6px}
+.bzinv .doc{text-align:right;min-width:250px}
+.bzinv .ttl{font-size:22px;font-weight:800;letter-spacing:2px;color:#0f2a4a}
+.bzinv .orig{font-size:9.5px;letter-spacing:1.2px;color:#64748b;margin:2px 0 10px}
+.bzinv .meta{margin-left:auto;border-collapse:collapse}
+.bzinv .meta td{padding:2px 0 2px 14px;font-size:11.5px}
+.bzinv .mk{color:#64748b;text-align:right}
+.bzinv .mv{font-weight:700;text-align:right}
+.bzinv .pill{display:inline-block;margin-top:10px;padding:4px 12px;border-radius:999px;font-weight:800;font-size:11px;letter-spacing:1px}
+.bzinv .bar{height:4px;background:linear-gradient(90deg,#0f2a4a,#2563eb);border-radius:4px;margin:22px 0 20px}
+.bzinv .parties{display:flex;gap:18px}
+.bzinv .card{flex:1;border:1px solid #e2e8f0;border-radius:8px;padding:12px 14px;background:#f8fafc}
+.bzinv .lbl{font-size:9.5px;font-weight:800;letter-spacing:1.2px;color:#64748b;margin-bottom:6px}
+.bzinv .nm{font-size:14px;font-weight:800;color:#0f172a;margin-bottom:2px}
+.bzinv .card div{color:#334155;font-size:11.5px}
+.bzinv table.it{width:100%;border-collapse:collapse;margin-top:22px}
+.bzinv table.it th{background:#0f2a4a;color:#fff;font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;padding:9px 10px;text-align:left}
+.bzinv table.it td{padding:10px;border-bottom:1px solid #e2e8f0;vertical-align:top;font-size:12px}
+.bzinv .r{text-align:right}.bzinv .c{text-align:center}
+.bzinv .dsc{font-weight:700;color:#0f172a}.bzinv .per{color:#64748b;font-size:11px;margin-top:2px}
+.bzinv .low{display:flex;gap:22px;margin-top:18px}
+.bzinv .lft{flex:1}
+.bzinv .rgt{width:300px}
+.bzinv .tt{width:100%;border-collapse:collapse}
+.bzinv .tt td{padding:5px 0;font-size:12px;color:#334155}
+.bzinv .tt .gr td{border-top:2px solid #0f2a4a;padding-top:9px;font-size:15px;font-weight:800;color:#0f172a}
+.bzinv .tt .bal td{font-weight:800;color:${balance ? "#b45309" : "#15803d"}}
+.bzinv .bx{border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:11.5px;color:#334155}
+.bzinv .bh{font-size:9.5px;font-weight:800;letter-spacing:1.2px;color:#64748b;margin-bottom:5px;text-transform:uppercase}
+.bzinv .words{font-weight:700;color:#0f172a}
+.bzinv .terms{margin-top:14px;font-size:10.5px;color:#475569;white-space:pre-line}
+.bzinv .sign{display:flex;justify-content:flex-end;margin-top:26px}
+.bzinv .sign .in{text-align:center;min-width:220px}
+.bzinv .sign .ln{border-top:1px solid #94a3b8;margin-top:34px;padding-top:5px;font-size:11px;color:#475569}
+.bzinv .foot{margin-top:24px;padding-top:10px;border-top:1px solid #e2e8f0;text-align:center;font-size:10px;color:#94a3b8}
+.bzinv .stamp{position:absolute;top:360px;left:50%;transform:translateX(-50%) rotate(-18deg);border:5px solid;border-radius:12px;padding:6px 26px;font-size:56px;font-weight:900;letter-spacing:6px;opacity:.13;pointer-events:none}
+</style>
+<div class="bzinv">
+  ${stamp}
+  <div class="top">
+    <div style="flex:1">
+      <div class="brand">${e(s.businessName)}</div>
+      <div class="muted">${sellerLines}</div>
+    </div>
+    <div class="doc">
+      <div class="ttl">${title}</div>
+      <div class="orig">ORIGINAL FOR RECIPIENT</div>
+      <table class="meta">${meta}</table>
+      <div class="pill" style="color:${stFg};background:${stBg}">${stTxt}</div>
+    </div>
+  </div>
+  <div class="bar"></div>
+  <div class="parties">
+    <div class="card"><div class="lbl">BILLED TO</div><div class="nm">${e(c.name)}</div>${clientLines}</div>
+    <div class="card"><div class="lbl">SUBSCRIPTION</div>
+      <div class="nm">${e(s.productName || "AtithiBook")}</div>
+      ${inv.plan ? `<div><b>Plan:</b> ${e(BL_PLAN_LABELS[inv.plan] || inv.plan)}</div>` : ""}
+      ${c.key ? `<div><b>License Key:</b> ${e(c.key)}</div>` : ""}
+      ${t.items[0] && t.items[0].period ? `<div><b>Period:</b> ${e(t.items[0].period)}</div>` : ""}
+    </div>
+  </div>
+  <table class="it">
+    <thead><tr><th class="c" style="width:34px">#</th><th>Description</th><th class="c" style="width:74px">SAC</th><th class="r" style="width:50px">Qty</th><th class="r" style="width:100px">Rate</th><th class="r" style="width:110px">Amount</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div class="low">
+    <div class="lft">
+      <div class="bx"><div class="bh">Amount in Words</div><div class="words">${e(blAmountWords(t.total))}</div>${taxNote}</div>
+      ${payBlock}
+      ${cancelNote}
+      ${inv.notes ? `<div class="bx"><div class="bh">Note</div><div style="white-space:pre-line">${e(inv.notes)}</div></div>` : ""}
+    </div>
+    <div class="rgt">
+      <table class="tt">${totRows}
+        <tr class="gr"><td>Total</td><td class="r">${blMoney(t.total)}</td></tr>
+        ${paid ? `<tr><td>Amount Paid</td><td class="r">${blMoney(t.total)}</td></tr>` : ""}
+        ${inv.status !== "cancelled" ? `<tr class="bal"><td>Balance Due</td><td class="r">${blMoney(balance)}</td></tr>` : ""}
+      </table>
+    </div>
+  </div>
+  ${s.terms ? `<div class="terms"><b>Terms &amp; Conditions</b>\n${e(s.terms)}</div>` : ""}
+  <div class="sign"><div class="in">
+    <div style="font-size:11.5px;font-weight:700">For ${e(s.legalName || s.businessName)}</div>
+    <div class="ln">${s.signatory ? e(s.signatory) + " — " : ""}Authorised Signatory</div>
+  </div></div>
+  <div class="foot">This is a computer-generated invoice and does not require a physical signature.${s.website || s.email ? " &nbsp;·&nbsp; " + e(s.website || s.email) : ""}</div>
+</div>`;
+}
+
+// ── PDF / share / send ───────────────────────────────────────────
+const _blScripts = {};
+function blLoadScript(src) {
+  if (_blScripts[src]) return _blScripts[src];
+  _blScripts[src] = new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = res;
+    s.onerror = () => { delete _blScripts[src]; rej(new Error("Failed to load " + src)); };
+    document.head.appendChild(s);
+  });
+  return _blScripts[src];
+}
+async function blInvoicePDF(inv, opts) {
+  await Promise.all([blLoadScript("/html2canvas.min.js"), blLoadScript("/jspdf.umd.min.js")]);
+  const host = document.createElement("div");
+  host.style.cssText = "position:fixed;left:-10000px;top:0;width:794px;background:#fff";
+  host.innerHTML = blInvoiceHTML(inv, opts);
+  document.body.appendChild(host);
+  try {
+    await Promise.all([...host.querySelectorAll("img")].map(img => img.complete ? null :
+      new Promise(r => { img.onload = img.onerror = r; setTimeout(r, 4000); })));
+    const canvas = await window.html2canvas(host.querySelector(".bzinv"), { scale: 2, useCORS: true, backgroundColor: "#ffffff", logging: false });
+    let img;
+    try { img = canvas.toDataURL("image/jpeg", 0.95); }
+    catch (e) {
+      // A QR image that loaded without CORS headers can taint the canvas;
+      // regenerate without it rather than fail the whole PDF.
+      if (!(opts && opts.noQr)) return blInvoicePDF(inv, { noQr: true });
+      throw e;
+    }
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ unit: "pt", format: "a4" });
+    const pw = 595.28, ph = 841.89, ih = canvas.height * pw / canvas.width;
+    let y = 0, first = true;
+    while (y < ih - 1) { if (!first) pdf.addPage(); first = false; pdf.addImage(img, "JPEG", 0, -y, pw, ih); y += ph; }
+    pdf.setProperties({ title: "Invoice " + inv.number, author: inv.seller.businessName });
+    return pdf.output("blob");
+  } finally { host.remove(); }
+}
+const blFileName = inv => "Invoice_" + inv.number.replace(/[^A-Za-z0-9-]/g, "-") + ".pdf";
+function blDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+function blShareText(inv) {
+  const c = inv.client, s = inv.seller, t = inv.totals;
+  const due = inv.status === "paid" ? "Payment received — thank you!" :
+    inv.status === "cancelled" ? "This invoice has been cancelled." :
+    `Amount due: ${blMoney(t.total)} by ${blFmtDate(inv.dueDate)}` + (s.upiId ? `\nUPI: ${s.upiId}` : "");
+  return `Dear ${c.contact || c.name},\n\nPlease find attached invoice ${inv.number} dated ${blFmtDate(inv.date)} from ${s.businessName} for ${s.productName || "AtithiBook"}.\n\nInvoice total: ${blMoney(t.total)}\n${due}\n\nRegards,\n${s.businessName}${s.phone ? "\n" + s.phone : ""}`;
+}
+function blPrint(inv) {
+  const f = document.createElement("iframe");
+  f.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0";
+  document.body.appendChild(f);
+  const d = f.contentDocument;
+  d.open();
+  d.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + blEsc(inv.number) + '</title><style>@page{size:A4;margin:0}body{margin:0}</style></head><body>' + blInvoiceHTML(inv) + "</body></html>");
+  d.close();
+  setTimeout(() => { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) {} setTimeout(() => f.remove(), 3000); }, 500);
+}
+
+// ── UI state ─────────────────────────────────────────────────────
+let blDraft = null;
+let blInited = false;
+let blViewerInv = null;
+
+function billingInit() {
+  if (!blInited) {
+    Billing.loadLocal();
+    const stSel = document.getElementById("blcState");
+    stSel.innerHTML = BL_STATES.map(([c, n]) => `<option value="${c}">${blEsc(n)} (${c})</option>`).join("");
+    billingRenderSettings();
+    billingResetDraft();
+    blInited = true;
+    billingSyncCloud(false);
+  }
+  billingPopulateClients();
+  billingRenderRegister();
+  document.getElementById("blVaultId").textContent = Billing.vault();
+}
+
+async function billingSyncCloud(showResult) {
+  const note = document.getElementById("blCloudNote");
+  const r = await Billing.loadCloud();
+  if (r.ok) {
+    note.style.display = "none";
+    billingRenderSettings(); billingRenderRegister(); billingRecalc();
+    if (showResult) blMsg("☁️ Invoices cloud se sync ho gaye", "success");
+  } else {
+    note.style.display = "block";
+    note.style.background = "#422006"; note.style.color = "#fcd34d"; note.style.border = "1px solid #78350f";
+    note.textContent = r.reason === "denied"
+      ? "⚠️ Cloud ne permission deny kiya — Firestore rules mein 'billing' block publish karna baaki hai (nayi firestore.rules). Tab tak invoices sirf is device pe save honge."
+      : r.reason === "offline"
+        ? "⚠️ Cloud connected nahi hai — invoices sirf is device pe save honge."
+        : "⚠️ Cloud sync nahi ho paaya: " + (r.detail || "") + " — invoices is device pe safe hain.";
+    if (showResult) blMsg(note.textContent, "error");
+  }
+}
+
+function billingPopulateClients() {
+  const sel = document.getElementById("blClientSel");
+  const cur = sel.value;
+  const list = (typeof licenses !== "undefined" ? licenses : []).slice()
+    .sort((a, b) => (a.plan === "TRIAL") - (b.plan === "TRIAL") || String(a.hotel || "").localeCompare(String(b.hotel || "")));
+  sel.innerHTML = `<option value="">— Client chuno (${list.length}) —</option>` +
+    list.map(l => `<option value="${blEsc(l.key)}">${blEsc(l.hotel || "(no name)")} · ${blEsc(l.key)} · ${blEsc(BL_PLAN_LABELS[l.plan] || l.plan)}${l.active === false ? " · REVOKED" : ""}</option>`).join("");
+  if (cur) sel.value = cur;
+}
+
+async function billingFindClient() {
+  const key = document.getElementById("blFindKey").value.trim().toUpperCase();
+  if (!key) return;
+  const found = typeof findLicenseByKey === "function" ? await findLicenseByKey(key) : null;
+  if (!found) { blMsg("❌ Yeh license key nahi mili", "error"); return; }
+  billingPopulateClients();
+  billingSelectClient(found.key);
+  blMsg("✅ Client mil gaya: " + (found.hotel || found.key), "success");
+}
+
+function billingSelectClient(key) {
+  if (!blInited) billingInit();
+  const sel = document.getElementById("blClientSel");
+  const lic = (typeof licenses !== "undefined" ? licenses : []).find(l => l.key === key);
+  if (key && !lic) { billingPopulateClients(); }
+  sel.value = key || "";
+  blDraft.clientKey = key || "";
+  blDraft.plan = lic ? lic.plan : "";
+  const saved = Billing.clients[key] || {};
+  const set = (id, v) => { document.getElementById(id).value = v || ""; };
+  set("blcName", saved.name || (lic && lic.hotel));
+  set("blcContact", saved.contact || (lic && lic.owner));
+  set("blcPhone", saved.phone || (lic && String(lic.phone || "").split(",")[0].trim()));
+  set("blcEmail", saved.email);
+  set("blcGstin", saved.gstin);
+  set("blcAddr", saved.address);
+  document.getElementById("blcState").value = saved.stateCode || Billing.settings.stateCode || "09";
+  // Default subscription line for the plan.
+  if (lic) {
+    const amt = (typeof PLAN_AMOUNTS !== "undefined" && PLAN_AMOUNTS[lic.plan]) || 0;
+    const start = document.getElementById("blDate").value || blToday();
+    blDraft.items = [{
+      desc: `${Billing.settings.productName ? Billing.settings.productName.split("—")[0].trim() : "AtithiBook"} ${BL_PLAN_LABELS[lic.plan] || lic.plan} Plan — Monthly Subscription`,
+      period: `${blFmtDate(start)} to ${blFmtDate(blAddDays(blAddMonths(start, 1), -1))}`,
+      qty: 1, rate: amt, autoPeriod: true
+    }];
+    billingRenderItems();
+  }
+  billingRecalc();
+  if (key) document.getElementById("panel-billing").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function billingOnClientGstin() {
+  const el = document.getElementById("blcGstin");
+  const v = el.value.toUpperCase().replace(/\s/g, "");
+  if (el.value !== v) el.value = v;
+  if (BL_GSTIN_RE.test(v)) {
+    const code = v.slice(0, 2);
+    if (blStateName(code)) document.getElementById("blcState").value = code;
+  }
+  billingRecalc();
+}
+
+function billingResetDraft() {
+  blDraft = { clientKey: "", plan: "", items: [{ desc: "", period: "", qty: 1, rate: 0 }] };
+  ["blcName", "blcContact", "blcPhone", "blcEmail", "blcGstin", "blcAddr", "blFindKey", "blPayRef"].forEach(id => { const el = document.getElementById(id); if (el) el.value = ""; });
+  document.getElementById("blClientSel").value = "";
+  document.getElementById("blcState").value = Billing.settings.stateCode || "09";
+  document.getElementById("blDate").value = blToday();
+  document.getElementById("blPayDate").value = blToday();
+  document.getElementById("blTerms").value = Billing.settings.termsDays;
+  document.getElementById("blDiscount").value = 0;
+  document.getElementById("blInclusive").checked = false;
+  document.getElementById("blPaidNow").checked = false;
+  document.getElementById("blPaidBox").style.display = "none";
+  document.getElementById("blNotes").value = Billing.settings.notes || "";
+  billingRenderItems();
+  billingRecalc();
+}
+
+function billingRenderItems() {
+  const box = document.getElementById("blItems");
+  box.innerHTML = blDraft.items.map((it, i) => `
+    <div class="bl-item">
+      <input placeholder="Description (jaise: AtithiBook Pro Plan — Monthly Subscription)" value="${blEsc(it.desc)}" oninput="billingItemEdit(${i},'desc',this.value)"/>
+      <input placeholder="Billing period / details (optional)" value="${blEsc(it.period)}" oninput="billingItemEdit(${i},'period',this.value)"/>
+      <div class="bl-item-row">
+        <div><label class="bl-lbl">Qty</label><input type="number" min="0" step="1" value="${it.qty}" oninput="billingItemEdit(${i},'qty',this.value)"/></div>
+        <div><label class="bl-lbl">Rate (₹)</label><input type="number" min="0" step="0.01" value="${it.rate}" oninput="billingItemEdit(${i},'rate',this.value)"/></div>
+        <div class="bl-amt" id="blAmt${i}"></div>
+        <button class="bl-x" title="Remove" onclick="billingRemoveItem(${i})">×</button>
+      </div>
+    </div>`).join("");
+}
+function billingItemEdit(i, field, value) {
+  const it = blDraft.items[i]; if (!it) return;
+  it[field] = value;
+  if (field === "period") it.autoPeriod = false;
+  if (field === "qty" && i === 0 && it.autoPeriod) {
+    const start = document.getElementById("blDate").value || blToday();
+    const m = Math.max(1, Math.round(Number(value) || 1));
+    it.period = `${blFmtDate(start)} to ${blFmtDate(blAddDays(blAddMonths(start, m), -1))}`;
+    const inputs = document.querySelectorAll("#blItems .bl-item")[0].querySelectorAll("input");
+    inputs[1].value = it.period;
+  }
+  billingRecalc();
+}
+function billingAddItem(desc) { blDraft.items.push({ desc: desc || "", period: "", qty: 1, rate: 0 }); billingRenderItems(); billingRecalc(); }
+function billingRemoveItem(i) {
+  blDraft.items.splice(i, 1);
+  if (!blDraft.items.length) blDraft.items.push({ desc: "", period: "", qty: 1, rate: 0 });
+  billingRenderItems(); billingRecalc();
+}
+function billingTogglePaidNow() {
+  document.getElementById("blPaidBox").style.display = document.getElementById("blPaidNow").checked ? "grid" : "none";
+}
+
+function blReadClient() {
+  const g = id => document.getElementById(id).value.trim();
+  return {
+    key: blDraft.clientKey || "",
+    name: g("blcName"), contact: g("blcContact"), phone: g("blcPhone"), email: g("blcEmail"),
+    gstin: g("blcGstin").toUpperCase(), address: g("blcAddr"), stateCode: document.getElementById("blcState").value
+  };
+}
+function blReadDraft() {
+  return {
+    client: blReadClient(),
+    items: blDraft.items,
+    discount: document.getElementById("blDiscount").value,
+    inclusive: document.getElementById("blInclusive").checked
+  };
+}
+
+function billingRecalc() {
+  if (!blDraft) return;
+  const s = Billing.settings;
+  const d = blReadDraft();
+  const t = blCompute(d, s);
+  t.items.forEach((it, i) => { const el = document.getElementById("blAmt" + i); if (el) el.textContent = blMoney(it.amountPaise); });
+  const due = blAddDays(document.getElementById("blDate").value || blToday(), document.getElementById("blTerms").value);
+  const half = t.rate / 2;
+  const row = (k, v) => `<div class="r"><span>${k}</span><b>${v}</b></div>`;
+  let h = row("Sub Total", blMoney(t.gross));
+  if (t.discount) h += row("Discount", "-" + blMoney(t.discount));
+  h += row("Taxable Value", blMoney(t.taxable));
+  if (t.taxType === "intra") h += row(`CGST @ ${half}%`, blMoney(t.cgst)) + row(`SGST @ ${half}%`, blMoney(t.sgst));
+  if (t.taxType === "inter") h += row(`IGST @ ${t.rate}%`, blMoney(t.igst));
+  if (t.roundOff) h += row("Round Off", blMoney(t.roundOff));
+  h += `<div class="r g"><span>Total</span><span>${blMoney(t.total)}</span></div>`;
+  h += `<div style="font-size:11px;color:#64748b;margin-top:6px">${t.registered
+    ? (t.taxType === "intra" ? "Same state → CGST + SGST" : "Doosra state → IGST") + " · Place of Supply: " + blEsc(blStateName(t.posCode))
+    : "GSTIN settings mein nahi hai → GST nahi lagega (INVOICE banega, TAX INVOICE nahi)"} · Due: ${blEsc(blFmtDate(due))}</div>`;
+  document.getElementById("blTotals").innerHTML = h;
+}
+
+function blValidate(d, t) {
+  const s = Billing.settings;
+  if (!s.businessName) return "Pehle Billing Settings mein apni company ka naam bharo.";
+  if (s.gstin && !BL_GSTIN_RE.test(String(s.gstin).toUpperCase())) return "Settings mein aapka GSTIN format galat hai — theek karo ya khaali chhodo.";
+  if (!d.client.name) return "Client ka business/legal naam bharo.";
+  if (!d.client.stateCode) return "Client ka state (Place of Supply) chuno.";
+  if (d.client.gstin && !BL_GSTIN_RE.test(d.client.gstin)) return "Client ka GSTIN format galat hai (15 characters, jaise 09AAACB1234C1Z5).";
+  if (d.client.gstin && d.client.gstin.slice(0, 2) !== d.client.stateCode) return "Client GSTIN ka state code aur chuna hua state match nahi kar rahe.";
+  if (!t.items.some(i => i.desc && i.amountPaise > 0)) return "Kam se kam ek item description aur amount ke saath chahiye.";
+  if (t.items.some(i => i.amountPaise > 0 && !i.desc)) return "Har amount wale item ka description bharo.";
+  if (t.total <= 0) return "Invoice total zero se zyada hona chahiye.";
+  if (!document.getElementById("blDate").value) return "Invoice date chuno.";
+  return "";
+}
+
+function blBuildInvoice(number, fy, seq) {
+  const d = blReadDraft();
+  const t = blCompute(d, Billing.settings);
+  const date = document.getElementById("blDate").value;
+  const paidNow = document.getElementById("blPaidNow").checked;
+  const now = Date.now();
+  return {
+    id: number.replace(/\//g, "-"), number, fy, seq,
+    createdAt: now, updatedAt: now,
+    date, dueDate: blAddDays(date, document.getElementById("blTerms").value),
+    status: paidNow ? "paid" : "unpaid",
+    seller: { ...Billing.settings },
+    client: d.client,
+    plan: blDraft.plan || "",
+    inclusive: d.inclusive,
+    totals: { ...t, items: t.items.filter(i => i.desc || i.amountPaise) },
+    notes: document.getElementById("blNotes").value.trim(),
+    payment: paidNow ? {
+      date: document.getElementById("blPayDate").value || date,
+      mode: document.getElementById("blPayMode").value,
+      ref: document.getElementById("blPayRef").value.trim()
+    } : null,
+    cancelled: null
+  };
+}
+
+function billingPreview() {
+  const d = blReadDraft(), t = blCompute(d, Billing.settings);
+  const err = blValidate(d, t);
+  if (err) { blMsg("⚠️ " + err, "error"); return; }
+  const fy = blFY(document.getElementById("blDate").value);
+  const prefix = (Billing.settings.prefix || "INV").toUpperCase();
+  const inv = blBuildInvoice(`${prefix}/${fy}/PREVIEW`, fy, 0);
+  billingOpenViewer(inv, true);
+}
+
+let blIssuing = false;
+async function billingIssue() {
+  if (blIssuing) return;
+  const d = blReadDraft(), t = blCompute(d, Billing.settings);
+  const err = blValidate(d, t);
+  if (err) { blMsg("⚠️ " + err, "error"); return; }
+  const date = document.getElementById("blDate").value;
+  const fy = blFY(date);
+  const prefix = String(Billing.settings.prefix || "INV").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5) || "INV";
+  if (!confirm(`Invoice issue karein?\n\nClient: ${d.client.name}\nTotal: ${blMoney(t.total)}\n\nIssue ke baad yeh edit nahi hoga.`)) return;
+  blIssuing = true;
+  const btn = document.getElementById("blIssueBtn");
+  btn.disabled = true; btn.textContent = "⏳ Issue ho raha hai...";
+  try {
+    let seq;
+    try { seq = await Billing.allocateNumber(fy); }
+    catch (e) {
+      if (blIsDenied(e)) { blMsg("❌ Cloud ne permission deny kiya — Firestore rules mein 'billing' block publish karo (nayi firestore.rules), phir dobara try karo.", "error"); return; }
+      if (!confirm("Cloud se connect nahi ho paaya, isliye invoice number sirf is device ke record se diya jaayega.\n\nAgar aap doosre device se bhi invoice banate ho to number duplicate ho sakta hai. Phir bhi issue karein?")) return;
+      seq = Billing.localMax(fy) + 1;
+    }
+    const number = `${prefix}/${fy}/${String(seq).padStart(4, "0")}`;
+    const inv = blBuildInvoice(number, fy, seq);
+    Billing.invoices.unshift(inv);
+    Billing.saveLocal();
+    let cloudSaved = true;
+    try { await Billing.saveInvoice(inv); } catch (e) { cloudSaved = false; }
+    Billing.saveClient({ ...inv.client, updatedAt: Date.now() }).catch(() => {});
+    billingRenderRegister();
+    billingResetDraft();
+    blMsg(`✅ Invoice ${number} issue ho gaya${cloudSaved ? "" : " (abhi sirf is device pe — cloud sync baad mein ho jaayega)"}`, cloudSaved ? "success" : "error");
+    billingOpenViewer(inv, false);
+  } finally {
+    blIssuing = false;
+    btn.disabled = false; btn.textContent = "✅ Issue Invoice";
+  }
+}
+
+// ── register ─────────────────────────────────────────────────────
+function billingRenderRegister() {
+  const q = (document.getElementById("blRegSearch").value || "").toLowerCase().trim();
+  const st = document.getElementById("blRegStatus").value;
+  const list = Billing.invoices.filter(i =>
+    (!st || i.status === st) &&
+    (!q || [i.number, i.client && i.client.name, i.client && i.client.gstin, i.client && i.client.key].some(x => String(x || "").toLowerCase().includes(q))));
+  const sum = (arr, f) => arr.reduce((t, i) => t + f(i), 0);
+  const live = Billing.invoices.filter(i => i.status !== "cancelled");
+  document.getElementById("blRegSummary").textContent =
+    `${Billing.invoices.length} invoices · Billed ${blMoney(sum(live, i => i.totals.total))} · Due ${blMoney(sum(live.filter(i => i.status === "unpaid"), i => i.totals.total))}`;
+  const box = document.getElementById("blRegister");
+  if (!list.length) { box.innerHTML = `<div style="color:#64748b;font-size:13px;padding:10px 0">Koi invoice nahi mila.</div>`; return; }
+  box.innerHTML = list.slice(0, 300).map(i => {
+    const overdue = i.status === "unpaid" && i.dueDate < blToday();
+    const badge = i.status === "paid" ? `<span class="bl-badge bl-b-paid">PAID</span>` :
+      i.status === "cancelled" ? `<span class="bl-badge bl-b-cancelled">CANCELLED</span>` :
+      `<span class="bl-badge bl-b-unpaid">${overdue ? "OVERDUE" : "DUE"}</span>`;
+    return `<div class="key-row">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+        <div style="font-weight:800;font-size:14px">${blEsc(i.number)} ${badge}</div>
+        <div style="font-weight:800">${blMoney(i.totals.total)}</div>
+      </div>
+      <div style="font-size:12px;color:#94a3b8;margin:4px 0 10px">${blEsc(i.client.name)} · ${blEsc(blFmtDate(i.date))}${i.status === "unpaid" ? " · Due " + blEsc(blFmtDate(i.dueDate)) : ""}</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn btn-outline" onclick="billingOpenViewerById('${blEsc(i.id)}')">👁️ View / Send</button>
+        ${i.status === "unpaid" ? `<button class="btn btn-outline" onclick="billingOpenViewerById('${blEsc(i.id)}');billingOpenPay()">✅ Mark Paid</button>` : ""}
+        ${i.status !== "cancelled" ? `<button class="btn btn-outline" style="color:#f87171" onclick="billingCancel('${blEsc(i.id)}')">✕ Cancel</button>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function blUpdateInvoice(inv) {
+  inv.updatedAt = Date.now();
+  const idx = Billing.invoices.findIndex(x => x.id === inv.id);
+  if (idx >= 0) Billing.invoices[idx] = inv;
+  Billing.saveLocal();
+  try { await Billing.saveInvoice(inv); return true; } catch (e) { return false; }
+}
+
+async function billingCancel(id) {
+  const inv = Billing.invoices.find(x => x.id === id);
+  if (!inv) return;
+  const reason = prompt(`Invoice ${inv.number} cancel karne ka kaaran likho:\n(Number series mein yeh CANCELLED ke roop mein rahega, delete nahi hoga)`);
+  if (reason === null) return;
+  inv.status = "cancelled";
+  inv.cancelled = { date: blToday(), reason: reason.trim() || "Cancelled" };
+  const ok = await blUpdateInvoice(inv);
+  billingRenderRegister();
+  if (blViewerInv && blViewerInv.id === id) billingOpenViewer(inv, false);
+  blMsg(`Invoice ${inv.number} cancelled${ok ? "" : " (cloud sync baad mein)"}`, ok ? "success" : "error");
+}
+
+function billingOpenPay() {
+  if (!blViewerInv || blViewerInv._preview) return;
+  document.getElementById("blMpDate").value = blToday();
+  document.getElementById("blMpRef").value = "";
+  document.getElementById("blPayModal").style.display = "flex";
+}
+async function billingConfirmPaid() {
+  const inv = blViewerInv; if (!inv) return;
+  inv.status = "paid";
+  inv.payment = {
+    date: document.getElementById("blMpDate").value || blToday(),
+    mode: document.getElementById("blMpMode").value,
+    ref: document.getElementById("blMpRef").value.trim()
+  };
+  document.getElementById("blPayModal").style.display = "none";
+  const ok = await blUpdateInvoice(inv);
+  billingRenderRegister();
+  billingOpenViewer(inv, false);
+  blMsg(`✅ ${inv.number} PAID mark ho gaya${ok ? "" : " (cloud sync baad mein)"}`, ok ? "success" : "error");
+}
+
+function billingExportCSV() {
+  const cols = ["Invoice No", "Invoice Date", "Due Date", "Client", "Client GSTIN", "Place of Supply", "State Code", "Taxable Value", "CGST", "SGST", "IGST", "Round Off", "Total", "Status", "Payment Date", "Payment Mode", "Payment Ref", "License Key"];
+  const q = v => { const s = String(v == null ? "" : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const r = p => (p / 100).toFixed(2);
+  const rows = Billing.invoices.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)).map(i => {
+    const t = i.totals, cancelled = i.status === "cancelled";
+    return [i.number, i.date, i.dueDate, i.client.name, i.client.gstin, blStateName(t.posCode), t.posCode,
+      r(cancelled ? 0 : t.taxable), r(cancelled ? 0 : t.cgst), r(cancelled ? 0 : t.sgst), r(cancelled ? 0 : t.igst), r(cancelled ? 0 : t.roundOff), r(cancelled ? 0 : t.total),
+      i.status.toUpperCase(), i.payment ? i.payment.date : "", i.payment ? i.payment.mode : "", i.payment ? i.payment.ref : "", i.client.key].map(q).join(",");
+  });
+  const blob = new Blob(["\uFEFF" + [cols.join(","), ...rows].join("\n")], { type: "text/csv;charset=utf-8" });
+  blDownload(blob, "BizzSathi_Invoice_Register_" + blToday() + ".csv");
+}
+
+// ── viewer ───────────────────────────────────────────────────────
+function billingOpenViewerById(id) {
+  const inv = Billing.invoices.find(x => x.id === id);
+  if (inv) billingOpenViewer(inv, false);
+}
+function billingOpenViewer(inv, isPreview) {
+  blViewerInv = isPreview ? { ...inv, _preview: true } : inv;
+  const doc = document.getElementById("blViewerDoc");
+  doc.innerHTML = blInvoiceHTML(inv);
+  document.getElementById("blViewer").style.display = "block";
+  document.getElementById("blVMarkPaid").style.display = (!isPreview && inv.status === "unpaid") ? "" : "none";
+  document.getElementById("blViewerHint").textContent = isPreview
+    ? "👁️ Yeh sirf preview hai — number abhi allocate nahi hua. Bhejne ke liye pehle 'Issue Invoice' dabao."
+    : "📤 Share: mobile pe PDF seedha WhatsApp/Email mein attach ho jaata hai. 💬 WhatsApp / ✉️ Email (desktop): PDF download hoga + message khulega — PDF attach karke bhejo.";
+  const inner = doc.querySelector(".bzinv");
+  const fit = () => {
+    const s = Math.min(1, doc.clientWidth / 794);
+    inner.style.transformOrigin = "top left";
+    inner.style.transform = s < 1 ? `scale(${s})` : "";
+    doc.style.height = s < 1 ? Math.ceil(inner.offsetHeight * s) + "px" : "";
+  };
+  requestAnimationFrame(fit);
+  window.onresize = () => { if (document.getElementById("blViewer").style.display === "block") fit(); };
+}
+function billingCloseViewer() { document.getElementById("blViewer").style.display = "none"; blViewerInv = null; }
+
+async function billingViewerAction(kind) {
+  const inv = blViewerInv; if (!inv) return;
+  if (inv._preview && kind !== "print") { alert("Yeh preview hai — pehle 'Issue Invoice' karo, phir bhejo."); return; }
+  const c = inv.client;
+  try {
+    if (kind === "print") { blPrint(inv); return; }
+    if (kind === "wa") {
+      const digits = String(c.phone || "").replace(/\D/g, "").slice(-10);
+      const url = "https://wa.me/" + (digits.length === 10 ? "91" + digits : "") + "?text=" + encodeURIComponent(blShareText(inv));
+      window.open(url, "_blank");
+      blMsg("⏳ PDF ban raha hai — download hone ke baad WhatsApp chat mein attach karo", "success");
+      blDownload(await blInvoicePDF(inv), blFileName(inv));
+      return;
+    }
+    if (kind === "email") {
+      const url = "mailto:" + encodeURIComponent(c.email || "") + "?subject=" + encodeURIComponent(`Invoice ${inv.number} from ${inv.seller.businessName}`) + "&body=" + encodeURIComponent(blShareText(inv));
+      window.location.href = url;
+      blDownload(await blInvoicePDF(inv), blFileName(inv));
+      return;
+    }
+    blMsg("⏳ PDF ban raha hai...", "success");
+    const blob = await blInvoicePDF(inv);
+    if (kind === "share") {
+      const file = new File([blob], blFileName(inv), { type: "application/pdf" });
+      if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+        await navigator.share({ files: [file], title: "Invoice " + inv.number, text: blShareText(inv) });
+        return;
+      }
+      blMsg("Is device pe direct share support nahi hai — PDF download ho gaya, WhatsApp/Email mein attach karo.", "success");
+    }
+    blDownload(blob, blFileName(inv));
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    blMsg("❌ PDF nahi ban paaya: " + (e && e.message ? e.message : e), "error");
+  }
+}
+
+// ── settings form ────────────────────────────────────────────────
+const BL_SETTING_FIELDS = [
+  ["businessName", "Business / brand name *"], ["legalName", "Legal name (GST/PAN ke hisaab se)"],
+  ["address", "Registered address", "textarea"], ["stateCode", "State", "state"],
+  ["gstin", "GSTIN (GST registered nahi ho to khaali chhodo)"], ["pan", "PAN"],
+  ["email", "Email"], ["phone", "Phone"], ["website", "Website"],
+  ["productName", "Product name (invoice pe)"],
+  ["sac", "SAC code"], ["gstRate", "GST rate (%)", "number"],
+  ["prefix", "Invoice number prefix (max 5 letters/numbers)"], ["termsDays", "Default payment terms (days)", "number"],
+  ["accountName", "Bank — Account holder name"], ["accountNo", "Bank — Account number"], ["ifsc", "Bank — IFSC"], ["bankName", "Bank name & branch"],
+  ["upiId", "UPI ID"], ["signatory", "Authorised signatory name"],
+  ["notes", "Default note (har invoice pe)", "textarea"], ["terms", "Terms & conditions", "textarea"]
+];
+function billingRenderSettings() {
+  const s = Billing.settings;
+  const f = BL_SETTING_FIELDS.map(([k, label, type]) => {
+    const id = "blSet_" + k, v = blEsc(s[k] == null ? "" : s[k]);
+    let input;
+    if (type === "textarea") input = `<textarea id="${id}" rows="${k === "terms" ? 4 : 2}">${v}</textarea>`;
+    else if (type === "state") input = `<select id="${id}">${BL_STATES.map(([c, n]) => `<option value="${c}"${c === s.stateCode ? " selected" : ""}>${blEsc(n)} (${c})</option>`).join("")}</select>`;
+    else input = `<input id="${id}" type="${type === "number" ? "number" : "text"}" value="${v}"/>`;
+    const hint = k === "sac" ? `<div style="font-size:11px;color:#f59e0b;margin:-8px 0 12px">997331 = software licensing ka SAC. Aapke case ke liye sahi SAC apne CA se confirm karo.</div>` : "";
+    return `<div${type === "textarea" ? ' style="grid-column:1/-1"' : ""}><label class="bl-lbl">${label}</label>${input}${hint}</div>`;
+  }).join("");
+  document.getElementById("blSettingsFields").innerHTML = `<div class="bl-grid2">${f}</div>`;
+}
+function billingToggleSettings() {
+  const b = document.getElementById("blSettingsBody");
+  const open = b.style.display === "none";
+  b.style.display = open ? "block" : "none";
+  document.getElementById("blSetArrow").textContent = open ? "▾" : "▸";
+}
+async function billingSaveSettings() {
+  const s = {};
+  BL_SETTING_FIELDS.forEach(([k, , type]) => {
+    const v = document.getElementById("blSet_" + k).value;
+    s[k] = type === "number" ? Number(v) || 0 : v.trim();
+  });
+  s.gstin = s.gstin.toUpperCase().replace(/\s/g, "");
+  s.pan = s.pan.toUpperCase().replace(/\s/g, "");
+  s.ifsc = s.ifsc.toUpperCase().replace(/\s/g, "");
+  s.prefix = s.prefix.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5) || "INV";
+  if (!s.businessName) { blMsg("⚠️ Business name zaroori hai", "error"); return; }
+  if (s.gstin && !BL_GSTIN_RE.test(s.gstin)) { blMsg("⚠️ GSTIN format galat hai (15 characters, jaise 09AAACB1234C1Z5)", "error"); return; }
+  if (s.gstin && s.gstin.slice(0, 2) !== s.stateCode) { blMsg("⚠️ GSTIN ke pehle 2 digit (state code) chune hue state se match nahi kar rahe", "error"); return; }
+  if (s.gstRate < 0 || s.gstRate > 28) { blMsg("⚠️ GST rate 0–28% ke beech hona chahiye", "error"); return; }
+  try {
+    await Billing.saveSettings(s);
+    blMsg("✅ Billing settings save ho gayi" + (Billing.root() ? "" : " (sirf is device pe)"), "success");
+  } catch (e) {
+    blMsg(blIsDenied(e) ? "⚠️ Settings is device pe save ho gayi, lekin cloud ne permission deny kiya — Firestore rules mein 'billing' block publish karo." : "⚠️ Settings is device pe save ho gayi, cloud sync fail: " + e.message, "error");
+  }
+  billingRenderSettings();
+  document.getElementById("blTerms").value = Billing.settings.termsDays;
+  billingRecalc();
+}
+async function billingUseVault() {
+  const v = document.getElementById("blVaultInput").value.trim().toUpperCase();
+  if (!/^V[A-Z0-9]{23}$/.test(v)) { blMsg("⚠️ Vault ID galat hai (V se shuru, 24 characters)", "error"); return; }
+  if (v === Billing.vault()) { blMsg("Yahi vault already use ho raha hai", "success"); return; }
+  if (Billing.invoices.length && !confirm("Is device ke invoices naye vault mein bhi upload ho jaayenge. Continue?")) return;
+  localStorage.setItem("ab_billing_vault", v);
+  document.getElementById("blVaultId").textContent = v;
+  document.getElementById("blVaultInput").value = "";
+  await billingSyncCloud(true);
+}
+
+</script>
 </body>
 </html>
