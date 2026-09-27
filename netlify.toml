@@ -23,9 +23,13 @@
   #   pattern Google uses for Gemini keys too, which is what trips the scan.
   # - ADMIN_SECRET: never hardcoded — only appears as an input-field
   #   placeholder string in admin.html, never assigned a real value.
-  # - ADMIN_PASSWORD: admin.html's client-side panel-login default was
-  #   deliberately changed to a DIFFERENT value than the server-side env var
-  #   specifically so the two would never collide (see admin.html comments).
+  # - ADMIN_PASSWORD: the admin-panel login password, verified ONLY inside
+  #   netlify/functions/admin-auth.mjs via process.env. admin.html contains
+  #   no password at all (the old client-side default was removed in the
+  #   2026-09 security audit).
+  # - FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY are deliberately NOT
+  #   listed here: they are never written into any file, so the scanner has
+  #   nothing to flag — if it ever does, treat it as a genuine leak.
   # - VALID_LICENSES: a list of CUSTOMER-FACING license keys meant to be
   #   shared with hotels via WhatsApp — not a true secret like a password or
   #   API key. admin.html's demo/seed license data (e.g. "ATITHI-TRIAL001")
@@ -51,6 +55,23 @@
   from = "/api/verify-access"
   to = "/.netlify/functions/verify-access"
   status = 200
+
+[[redirects]]
+  from = "/api/admin-auth"
+  to = "/.netlify/functions/admin-auth"
+  status = 200
+
+[[redirects]]
+  from = "/api/license-status"
+  to = "/.netlify/functions/license-status"
+  status = 200
+
+# Test suite ships in the repo but must never be served from the site.
+[[redirects]]
+  from = "/tests/*"
+  to = "/index.html"
+  status = 404
+  force = true
 
 [[redirects]]
   from = "/*"

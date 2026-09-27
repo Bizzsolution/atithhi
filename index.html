@@ -1024,8 +1024,8 @@ const generateInvoiceNumber = () => generateDocumentNumber("INV");
 const generateCreditNoteNumber = () => generateDocumentNumber("CN");
 
 // ── LICENSE EXPIRY CHECK — in-app reminder ──────────────────────
-// Reads this hotel's own license entry directly from Firestore (same
-// public-read /admin/licenses doc scan.mjs uses) so the app itself can
+// Reads this hotel's own license status via /api/license-status (server
+// reads Firestore with a service account, returns no PII) so the app itself can
 // warn the hotel BEFORE their trial/subscription runs out, instead of
 // them only finding out when scanning suddenly stops working.
 async function checkLicenseExpiry() {
@@ -1046,13 +1046,36 @@ async function checkLicenseExpiry() {
     if (daysLeft <= 3) return { status: "expiring_soon", plan, expiry, daysLeft, features };
     return { status: "ok", plan, expiry, daysLeft, features };
   };
-  // NEW scalable path — one small direct document per hotel (O(1) lookup
-  // no matter how many hotels exist), tried first. The OLD single-array
-  // document (all hotels' licenses in one doc) is kept only as a fallback
-  // for a hotel not yet migrated via the admin panel's migration tool —
-  // that array has Firestore's hard 1 MiB-per-document ceiling and was
-  // being downloaded in FULL by every hotel's app just to check its own
-  // one entry, which stops working entirely once enough hotels exist.
+  // SECURITY (audit 2026-09): the server endpoint is now the primary
+  // source. It reads with the service account and returns ONLY
+  // active/plan/expiry/features — never the owner name or the registered
+  // phones. The old code also fell back to downloading the legacy
+  // `admin/licenses` document, i.e. EVERY hotel's record, onto every
+  // hotel's device; that fallback is removed from the client entirely
+  // (the endpoint does it server-side for unmigrated hotels).
+  try {
+    const r = await fetch("/api/license-status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ licenseKey: key }),
+      cache: "no-store"
+    });
+    if (r.ok) {
+      const d = await r.json();
+      if (d && d.found === true) {
+        return statusFromFields({
+          active: { booleanValue: d.active !== false },
+          plan: { stringValue: typeof d.plan === "string" ? d.plan : "" },
+          expiry: typeof d.expiry === "string" ? { stringValue: d.expiry } : undefined,
+          features: { arrayValue: { values: (Array.isArray(d.features) ? d.features : []).filter(x => typeof x === "string").map(x => ({ stringValue: x })) } }
+        });
+      }
+      if (d && d.found === false) return null; // not in cloud — don't alarm over a sync gap
+    }
+  } catch (e) { /* fall through to the transitional direct read */ }
+  // Transitional fallback: this hotel's OWN document only. Works while the
+  // pre-audit rules are still published; returns 403 (→ null, no banner)
+  // once the hardened rules are live, which is the intended end state.
   try {
     const directUrl = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/licenses/${encodeURIComponent(key)}`;
     const directRes = await fetch(directUrl);
@@ -1060,24 +1083,10 @@ async function checkLicenseExpiry() {
       const doc = await directRes.json();
       if (doc.fields?.key?.stringValue) return statusFromFields(doc.fields);
     }
-  } catch (e) { /* fall through to the old path below */ }
-  try {
-    const url = `https://firestore.googleapis.com/v1/projects/atithibook-saas/databases/(default)/documents/admin/licenses`;
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const doc = await r.json();
-    const values = doc?.fields?.list?.arrayValue?.values || [];
-    for (const v of values) {
-      const f = v.mapValue?.fields || {};
-      const entryKey = (f.key?.stringValue || "").toUpperCase();
-      if (entryKey !== key) continue;
-      return statusFromFields(f);
-    }
-    return null; // key not found in cloud list — don't alarm the user over a transient sync gap
   } catch (e) {
     console.warn("License expiry check:", e.message);
-    return null;
   }
+  return null;
 }
 // Synced with App's `enabledFeatures` state — lets top-level functions (and
 // components far from App) check feature gating without prop-drilling.

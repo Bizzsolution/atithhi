@@ -160,6 +160,25 @@ Agar customer bolta hai "kaam nahi kar raha":
 | `netlify/functions/verify-access.mjs` | Phone-bound license verification |
 | `netlify/functions/admin.mjs` | Admin panel's server-side auth check |
 | `netlify/functions/manage-keys.mjs` | API-key status checker (Settings tab) |
+| `netlify/functions/admin-auth.mjs` | Admin panel login — password server pe check, Firebase session issue karta hai |
+| `netlify/functions/license-status.mjs` | Hotel app ko sirf plan/expiry/features batata hai (phone/owner nahi) |
+| `SECURITY_AUDIT.md` | Poora security audit, findings, deploy order |
+| `tests/` | Automated security + regression tests (`npm test`) |
+
+---
+
+## 🔐 Security Setup (Sept 2026 audit ke baad — ZAROORI, isi order mein)
+
+1. Firebase Console → **Authentication → Get started** (ek baar).
+2. Firebase Console → Project settings → **Service accounts → Generate new private key** (JSON download hoga).
+3. Netlify → Environment variables mein add karo:
+   - `FIREBASE_CLIENT_EMAIL` = JSON ka `client_email`
+   - `FIREBASE_PRIVATE_KEY` = JSON ka `private_key` (poora, BEGIN/END lines ke saath)
+   - `ADMIN_PASSWORD` = naya strong password (12+ characters) — **ab yahi admin panel ka login hai**
+4. Naya zip deploy karo → admin login + ek scan test karo.
+5. **Sab theek chale tabhi** nayi `firestore.rules` publish karo. (Pehle rules publish kiye to scanning ruk jaayegi.)
+
+Admin panel ka purana default password aur "Reset to Default" button ab **hata diye gaye hain** — password sirf Netlify env var se badalta hai.
 
 ---
 

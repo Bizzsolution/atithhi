@@ -7,11 +7,12 @@ rules_version = '2';
 //
 //  ⚠️  READ THIS FIRST — WHAT THESE RULES CAN AND CANNOT DO
 //
-//  This app currently uses NO Firebase Authentication. Only the
-//  firebase-app and firebase-firestore SDKs are loaded — firebase-auth
-//  is not. Every request Firestore receives from the app is therefore
-//  ANONYMOUS, which means `request.auth` is ALWAYS null inside these
-//  rules. There is no identity to check against.
+//  UPDATE (2026-09 audit): the ADMIN PANEL now signs in with a
+//  server-minted custom token (see isAdmin() below and
+//  netlify/functions/admin-auth.mjs). The HOTEL APP (index.html) still
+//  uses no Firebase Authentication, so every hotel-app request is
+//  ANONYMOUS and `request.auth` is null for it. The rest of this note
+//  describes that hotel-side situation.
 //
 //  The practical consequence, stated plainly: these rules CANNOT tell
 //  "Hotel A's staff" apart from "a stranger on the internet who has
@@ -67,6 +68,17 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // ---- helpers -------------------------------------------------
+
+    // BizzSathi admin identity. The ONLY way to obtain it is the
+    // /api/admin-auth Netlify function, which verifies ADMIN_PASSWORD
+    // server-side (constant-time, rate-limited) and mints a Firebase
+    // Custom Token with { admin: true } signed by the project's service
+    // account. Custom claims cannot be set or forged by a client.
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.uid == 'bizzsathi-admin'
+        && request.auth.token.admin == true;
+    }
 
     // License keys are generated as ATITHI- followed by random
     // alphanumerics. Constraining the shape stops junk/probe documents
@@ -153,30 +165,28 @@ service cloud.firestore {
     }
 
     // ---- licenses (new, per-document storage) --------------------
-    // Read by: the app's own expiry/feature check, and the Netlify
-    // functions (scan / verify-access) which call the REST API without
-    // a service account and are therefore also subject to these rules.
+    // `list` stays denied even for the admin: the panel discovers its
+    // hotels through the admin_vault index (below), never a collection
+    // scan, so a stolen admin session still cannot bulk-dump by query.
     //
-    // `get` is allowed because those paths need it. `list` is NOT —
-    // that is what stops an attacker from dumping every license key on
-    // the platform and then walking into every hotel's data.
+    // HARDENED (audit 2026-09): this collection used to be world-readable
+    // AND world-writable. Anyone could create "ATITHI-ANYTHING" with
+    // plan PRO / active true and get free OCR billed to BizzSathi,
+    // re-activate a revoked hotel, enable paid features, or overwrite the
+    // registered phone (the verify-access second factor) with their own.
+    // Reads leaked each hotel's registered phones and owner name.
     //
-    // ⚠️ KNOWN TRADE-OFF: denying `list` also breaks the admin panel's
-    // "Load More" pagination, which does a collection query. "Find by
-    // Key" (a direct get) keeps working. Fixing pagination properly
-    // means moving that read into the password-protected Netlify
-    // function using a service account, so it bypasses these rules —
-    // that is the correct place for an all-hotels query to live anyway,
-    // since a client-side admin panel cannot prove it is the admin.
+    // Now: only the authenticated admin reads/writes from a browser. The
+    // Netlify functions (scan, verify-access, license-status) read with
+    // the service account, which bypasses rules by design. The hotel app
+    // gets its expiry/features via /api/license-status (no PII).
     match /licenses/{licenseKey} {
-      allow get: if true;
+      allow get: if isAdmin();
       allow list: if false;
-
-      // Licenses are issued and revoked from the admin panel. Until
-      // that panel writes through an authenticated server path, writes
-      // have to remain open for it to function at all — but they are at
-      // least shape- and size-checked here.
-      allow create, update: if validHotelId(licenseKey);
+      allow create, update: if isAdmin()
+        && validHotelId(licenseKey)
+        && request.resource.data.key == licenseKey
+        && request.resource.data.size() <= 40;
       allow delete: if false;
     }
 
@@ -185,19 +195,19 @@ service cloud.firestore {
     // one place. One read of it leaks the entire customer list, so it
     // is the highest-value target in the database.
     //
-    // It is left readable ONLY because the app and the Netlify
-    // functions still fall back to it for hotels that have not been
-    // migrated yet.
+    // Still read (server-side only) as a fallback for hotels not yet
+    // migrated. Once every hotel is migrated, delete the document from
+    // the Firebase console — nothing will need it.
     //
-    // 🔴 ACTION REQUIRED: after running "Migrate to Scalable Storage"
-    // in the admin panel and confirming hotels work, change the line
-    // below to `allow read: if false;` and then delete the document.
-    // Leaving it readable indefinitely keeps a single-request breach of
-    // your whole customer list permanently available.
+    // HARDENED (audit 2026-09): was `allow get: if true` + `allow create,
+    // update: if true` — one anonymous GET dumped every customer, and one
+    // anonymous PUT could inject a forged license (scan.mjs and
+    // verify-access trusted this array) or wipe it (outage for every
+    // not-yet-migrated hotel). Functions now read it via service account.
     match /admin/{docId} {
-      allow get: if true;
+      allow get: if isAdmin();
       allow list: if false;
-      allow create, update: if true;
+      allow create, update: if isAdmin();
       allow delete: if false;
     }
 
@@ -264,24 +274,29 @@ service cloud.firestore {
     // the admin panel only ever does direct .doc(id).get()/.collection()
     // .orderBy().limit() reads scoped to its OWN vaultId, so this costs
     // it nothing.
+    //
+    // HARDENED (audit 2026-09): the Vault ID is kept as the namespace, but
+    // is no longer the ONLY credential — an authenticated admin session
+    // is required as well (defence in depth: a leaked Vault ID alone no
+    // longer exposes BizzSathi's invoices or client GSTINs).
     match /billing/{vaultId} {
-      allow get: if validVaultId(vaultId);
+      allow get: if isAdmin() && validVaultId(vaultId);
       allow list: if false;
-      allow create, update: if validVaultId(vaultId);
+      allow create, update: if isAdmin() && validVaultId(vaultId);
       allow delete: if false;
     }
     match /billing/{vaultId}/invoices/{invoiceId} {
-      allow get, list: if validVaultId(vaultId);
+      allow get, list: if isAdmin() && validVaultId(vaultId);
       // Issued invoices are immutable in the app's own logic (status can
       // move to paid/cancelled, but the number/amounts never change) —
       // rules don't re-derive GST math to enforce that server-side, so
       // this is app-level, not rules-level, discipline.
-      allow create, update: if validVaultId(vaultId);
+      allow create, update: if isAdmin() && validVaultId(vaultId);
       allow delete: if false;
     }
     match /billing/{vaultId}/clients/{clientKey} {
-      allow get, list: if validVaultId(vaultId);
-      allow create, update: if validVaultId(vaultId);
+      allow get, list: if isAdmin() && validVaultId(vaultId);
+      allow create, update: if isAdmin() && validVaultId(vaultId);
       allow delete: if false;
     }
 
@@ -294,9 +309,9 @@ service cloud.firestore {
     // Holds keys only — each hotel's data is still read from its own
     // licenses/{key} document.
     match /admin_vault/{vaultId} {
-      allow get: if validVaultId(vaultId);
+      allow get: if isAdmin() && validVaultId(vaultId);
       allow list: if false;
-      allow create, update: if validVaultId(vaultId)
+      allow create, update: if isAdmin() && validVaultId(vaultId)
         && request.resource.data.keys().hasOnly(['licenseKeys', 'updatedAt']);
       allow delete: if false;
     }

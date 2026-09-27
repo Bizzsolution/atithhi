@@ -11,6 +11,14 @@
 // be set/changed in Netlify dashboard → Environment Variables (takes ~10-20 sec
 // to go live after "Deploy" → "Trigger deploy" → "Clear cache and deploy").
 
+import { createHash, timingSafeEqual } from "node:crypto";
+
+function safeEqual(a, b) {
+  const ha = createHash("sha256").update(String(a ?? ""), "utf8").digest();
+  const hb = createHash("sha256").update(String(b ?? ""), "utf8").digest();
+  return timingSafeEqual(ha, hb);
+}
+
 const rateMap = new Map();
 function checkRateLimit(ip) {
   const entry = rateMap.get(ip) || { attempts: 0, lockUntil: 0 };
@@ -30,11 +38,14 @@ function clearAttempts(ip) { rateMap.delete(ip); }
 
 export async function handler(event) {
   const headers = {
-    "Access-Control-Allow-Origin": process.env.URL || process.env.DEPLOY_PRIME_URL || "*",
     "Access-Control-Allow-Headers": "Content-Type, x-admin-key",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store"
   };
+  // Same-origin callers need no CORS header; never fall back to "*".
+  if (process.env.URL || process.env.DEPLOY_PRIME_URL) headers["Access-Control-Allow-Origin"] = process.env.URL || process.env.DEPLOY_PRIME_URL;
   if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers, body: "" };
 
   const validAdminKey = process.env.ADMIN_SECRET || process.env.ADMIN_PASSWORD;
@@ -48,26 +59,14 @@ export async function handler(event) {
     return { statusCode: 429, headers, body: JSON.stringify({ error: rl.message }) };
   }
 
-  const adminKey = (event.headers["x-admin-key"] || event.headers["X-Admin-Key"] || "").trim();
-  if (adminKey !== validAdminKey.trim()) {
+  const adminKey = String(event.headers["x-admin-key"] || event.headers["X-Admin-Key"] || "").trim();
+  // Constant-time compare. The former 401 "diagnostic" block disclosed the
+  // secret's length plus its first and last characters — ADMIN_SECRET is
+  // also verify-access's bypass code, so that was a partial credential
+  // leak to any unauthenticated caller. Removed entirely.
+  if (!adminKey || adminKey.length > 256 || !safeEqual(adminKey, validAdminKey.trim())) {
     recordFailure(ip, rl.entry);
-    // TEMPORARY DIAGNOSTIC — safe info only (lengths, not actual values) to
-    // pinpoint the mismatch cause. Remove once issue is resolved.
-    return {
-      statusCode: 401, headers,
-      body: JSON.stringify({
-        error: "Unauthorized",
-        diagnostic: {
-          adminSecretEnvSet: !!process.env.ADMIN_SECRET,
-          adminPasswordEnvSet: !!process.env.ADMIN_PASSWORD,
-          usingSource: process.env.ADMIN_SECRET ? "ADMIN_SECRET" : "ADMIN_PASSWORD",
-          expectedLength: validAdminKey.trim().length,
-          receivedLength: adminKey.length,
-          expectedFirstLast: validAdminKey.trim().length > 4 ? validAdminKey.trim()[0] + "..." + validAdminKey.trim().slice(-1) : "(too short)",
-          receivedFirstLast: adminKey.length > 4 ? adminKey[0] + "..." + adminKey.slice(-1) : adminKey.length ? "(too short: '" + adminKey + "')" : "(empty)"
-        }
-      })
-    };
+    return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
   }
   clearAttempts(ip);
 

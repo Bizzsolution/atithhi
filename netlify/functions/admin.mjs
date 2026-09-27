@@ -3,6 +3,14 @@
 // SECURITY: No hardcoded fallback password. Fails closed if env var missing.
 // Rate-limited (in-memory, best-effort) against brute-force guessing.
 
+import { createHash, timingSafeEqual } from "node:crypto";
+
+function safeEqual(a, b) {
+  const ha = createHash("sha256").update(String(a ?? ""), "utf8").digest();
+  const hb = createHash("sha256").update(String(b ?? ""), "utf8").digest();
+  return timingSafeEqual(ha, hb);
+}
+
 const rateMap = new Map(); // ip -> { attempts, lockUntil }
 function checkRateLimit(ip) {
   const entry = rateMap.get(ip) || { attempts: 0, lockUntil: 0 };
@@ -22,10 +30,12 @@ function clearAttempts(ip) { rateMap.delete(ip); }
 
 export async function handler(event) {
   const headers = {
-    "Access-Control-Allow-Origin": process.env.URL || process.env.DEPLOY_PRIME_URL || "*",
     "Access-Control-Allow-Headers": "Content-Type,x-admin-key",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store"
   };
+  if (process.env.URL || process.env.DEPLOY_PRIME_URL) headers["Access-Control-Allow-Origin"] = process.env.URL || process.env.DEPLOY_PRIME_URL;
   if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers, body: "" };
 
   // ── FAIL CLOSED: if ADMIN_PASSWORD not configured server-side, deny all access ──
@@ -42,8 +52,8 @@ export async function handler(event) {
   }
 
   // ── AUTH CHECK ──
-  const adminKey = event.headers["x-admin-key"] || "";
-  if (adminKey !== ADMIN_PASSWORD) {
+  const adminKey = String(event.headers["x-admin-key"] || "");
+  if (!adminKey || adminKey.length > 256 || !safeEqual(adminKey, ADMIN_PASSWORD)) {
     recordFailure(ip, rl.entry);
     return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
   }

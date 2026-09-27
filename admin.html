@@ -8,6 +8,9 @@
 <!-- Firebase SDK — license data backup/sync across devices -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<!-- Auth SDK: the panel signs in with a server-minted custom token
+     (/api/admin-auth) so Firestore rules can verify it is the admin. -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script>
   window._db = null;
   try {
@@ -112,9 +115,8 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
     <div class="sub" style="text-align:center;margin-bottom:24px">License Management Panel</div>
     <div class="err" id="loginErr" style="display:none"></div>
     <input type="password" id="adminPass" placeholder="Admin Password" onkeydown="if(event.key==='Enter')doLogin()"/>
-    <button class="btn btn-primary" onclick="doLogin()">🔐 Login</button>
-    <button class="btn btn-outline" onclick="resetAdminToDefault()" style="margin-top:8px;width:100%">🔄 Reset to Default Password</button>
-    <div style="margin-top:16px;text-align:center;font-size:11px;color:#475569">Only authorized personnel can access this panel</div>
+    <button class="btn btn-primary" id="loginBtn" onclick="doLogin()">🔐 Login</button>
+    <div style="margin-top:16px;text-align:center;font-size:11px;color:#475569">Password server pe verify hota hai (Netlify env var <code>ADMIN_PASSWORD</code>). Bhool gaye? Netlify dashboard mein naya set karke redeploy karo.</div>
   </div>
 </div>
 
@@ -414,14 +416,11 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 
         <!-- Change Admin Password -->
         <div style="background:#0b1220;border:1px solid #263248;border-radius:12px;padding:16px;margin-bottom:14px">
-          <div style="font-size:13px;font-weight:700;color:#f8fafc;margin-bottom:12px">🔐 Change Admin Panel Password</div>
-          <div style="display:flex;flex-direction:column;gap:10px">
-            <input type="password" id="curAdminPass" placeholder="Current admin password"/>
-            <input type="password" id="newAdminPass" placeholder="New admin password (min 8 chars)"/>
-            <input type="password" id="cfmAdminPass" placeholder="Confirm new password"/>
-            <button class="btn btn-primary" onclick="changeAdminPassword()">🔒 Update Admin Password</button>
+          <div style="font-size:13px;font-weight:700;color:#f8fafc;margin-bottom:12px">🔐 Admin Panel Password</div>
+          <div style="font-size:12px;color:#94a3b8;line-height:1.7">
+            Password ab <b>server pe</b> verify hota hai — browser mein store nahi hota, isliye yahan se badla nahi ja sakta.<br>
+            Badalne ke liye: <b>Netlify dashboard</b> → Site configuration → Environment variables → <code style="background:#1e293b;padding:2px 6px;border-radius:4px">ADMIN_PASSWORD</code> edit karo (min 12 characters recommended) → Deploys → <b>Trigger deploy</b>. Purane sessions tab band hote hi khatam ho jaate hain.
           </div>
-          <div id="adminPwdMsg" style="margin-top:10px;font-size:12px;display:none"></div>
         </div>
 
         <!-- Reset Hotel Staff Password -->
@@ -499,13 +498,10 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────
-// NOTE: This is ONLY the client-side admin-PANEL LOGIN default (change it
-// via "Change Password" after first login) — it is completely UNRELATED to
-// the server-side ADMIN_PASSWORD/ADMIN_SECRET env vars used by the Netlify
-// Functions (admin.mjs/manage-keys.mjs) for API authorization. Kept as a
-// separate name/value on purpose, so this file never contains the same
-// literal string as any real server secret.
-const DEFAULT_ADMIN_PANEL_PASSWORD = "bizzsathi@2026";
+// Admin login is verified server-side by /api/admin-auth (see doLogin).
+// There is intentionally NO password — default or custom — in this file
+// or in localStorage. Purge the plaintext password older versions stored.
+try { localStorage.removeItem("ab_admin_pwd"); } catch (e) { /* storage unavailable — nothing to purge */ }
 const SITE_URL = window.location.origin;
 
 // ── SECURITY: HTML escape to prevent stored XSS via hotel name field ──
@@ -718,9 +714,9 @@ const LicenseCloud = {
   //                   live data with an older copy.
   async pushMany(list, opts) {
     opts = opts || {};
-    // Writes to licenses/{key} are allowed by the rules for any
-    // validly-formatted key, so a failure here is always genuine, never
-    // an expected security block.
+    // Writes to licenses/{key} require the authenticated admin session
+    // (see doLogin / firestore.rules isAdmin()); once logged in, a
+    // failure here is always genuine, never an expected security block.
     if (!window._db) {
       this.lastError = "Firebase not connected — changes saved locally only, NOT backed up to cloud!";
       this.lastErrorExpected = false;
@@ -743,12 +739,18 @@ const LicenseCloud = {
         const chunk = toWrite.slice(i, i + 450);
         const batch = window._db.batch();
         chunk.forEach(l => {
-          let data = l;
+          // The hardened rules require data.key == document id, so the
+          // stored key is always the upper-cased id (functions compare
+          // upper-cased keys anyway — this only normalises legacy casing).
+          const docId = String(l.key).toUpperCase();
+          let data;
           if (opts.fields) {
-            data = { key: l.key };
+            data = { key: docId };
             opts.fields.forEach(f => { data[f] = l[f] === undefined ? null : l[f]; });
+          } else {
+            data = Object.assign({}, l, { key: docId });
           }
-          batch.set(window._db.collection("licenses").doc(l.key.toUpperCase()), data, { merge: true });
+          batch.set(window._db.collection("licenses").doc(docId), data, { merge: true });
         });
         await batch.commit();
       }
@@ -1050,44 +1052,95 @@ function saveLicenses(changedKeys, fields) {
   }
 }
 
-// ── LOGIN (with brute-force lockout) ────────────────────
-function resetAdminToDefault(){
-  if(confirm("Reset admin password to default 'bizzsathi@2026'?\n\nUse this if you forgot a custom password you set earlier.")){
-    localStorage.removeItem("ab_admin_pwd");
-    AdminBrute.clear();
-    alert("✅ Reset done! Now login with: bizzsathi@2026");
-    document.getElementById("adminPass").value = "";
-    document.getElementById("loginErr").style.display = "none";
-  }
-}
-
-function doLogin() {
-  try{
+// ── LOGIN — server-verified (audit 2026-09) ─────────────
+// The password is checked ONLY by /api/admin-auth (constant-time, per-IP
+// lockout, env var ADMIN_PASSWORD). On success the server returns a
+// Firebase Custom Token with { admin: true }; signing in with it is what
+// lets firestore.rules accept this panel's reads/writes. Nothing here can
+// grant access by itself — there is no default password, no locally
+// stored password and no "reset" path in the browser any more.
+// Session persistence is NONE (in-memory): closing/reloading the tab ends
+// the session, so a shared computer never stays logged in.
+let _loginInFlight = false;
+async function doLogin() {
+  if (_loginInFlight) return;
+  const errEl = document.getElementById("loginErr");
+  const btn = document.getElementById("loginBtn");
+  const showErr = t => { errEl.style.display = "block"; errEl.textContent = t; };
+  _loginInFlight = true;
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Verifying…"; }
+  try {
     const attempts = AdminBrute.check();
     const p = document.getElementById("adminPass").value;
-    const storedAdminPwd = localStorage.getItem("ab_admin_pwd") || DEFAULT_ADMIN_PANEL_PASSWORD;
-    if (p === storedAdminPwd || p === DEFAULT_ADMIN_PANEL_PASSWORD) {
-      AdminBrute.clear();
-      adminPass = p;
-      document.getElementById("loginPage").style.display = "none";
-      document.getElementById("app").style.display = "block";
-      // Instant first paint from this device's cache (no writes), then
-      // replace it with the live cloud list.
-      renderDashboard();
-      syncLicensesNow(false);
-    } else {
-      const rem = AdminBrute.fail(attempts);
-      document.getElementById("loginErr").style.display = "block";
-      document.getElementById("loginErr").textContent = rem>0
-        ? "❌ Wrong password. "+rem+" attempt"+(rem!==1?"s":"")+" left."
-        : "🔒 Locked for 15 minutes due to too many failed attempts.";
+    if (!p) { showErr("❌ Password daalo."); return; }
+
+    let res, data = {};
+    try {
+      res = await fetch("/api/admin-auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: p }),
+        credentials: "same-origin",
+        cache: "no-store"
+      });
+      data = await res.json().catch(() => ({}));
+    } catch (netErr) {
+      showErr("🌐 Login server tak nahi pahunch paaye — internet check karke dobara try karo.");
+      return;
     }
-  }catch(e){
-    document.getElementById("loginErr").style.display = "block";
-    document.getElementById("loginErr").textContent = "🔒 " + e.message;
+
+    if (res.status === 401) {
+      const rem = AdminBrute.fail(attempts);
+      showErr(rem > 0
+        ? "❌ Wrong password. " + rem + " attempt" + (rem !== 1 ? "s" : "") + " left."
+        : "🔒 Locked for 15 minutes due to too many failed attempts.");
+      return;
+    }
+    if (res.status === 429) { showErr("🔒 " + (data.error || "Too many attempts — thodi der baad try karo.")); return; }
+    if (!res.ok || typeof data.token !== "string" || !data.token) {
+      showErr("⚠️ " + (data.error || ("Login server error (HTTP " + res.status + ")")));
+      return;
+    }
+    if (typeof firebase === "undefined" || !firebase.auth) {
+      showErr("⚠️ Firebase Auth load nahi hua — page refresh karke dobara try karo.");
+      return;
+    }
+
+    const auth = firebase.auth();
+    await auth.setPersistence(firebase.auth.Auth.Persistence.NONE);
+    const cred = await auth.signInWithCustomToken(data.token);
+    const tokenResult = cred && cred.user ? await cred.user.getIdTokenResult() : null;
+    if (!tokenResult || tokenResult.claims.admin !== true) {
+      await auth.signOut().catch(() => {});
+      showErr("⚠️ Session verify nahi hua — admin claim missing. Server config check karo.");
+      return;
+    }
+
+    AdminBrute.clear();
+    document.getElementById("adminPass").value = "";
+    errEl.style.display = "none";
+    document.getElementById("loginPage").style.display = "none";
+    document.getElementById("app").style.display = "block";
+    // Instant first paint from this device's cache (no writes), then
+    // replace it with the live cloud list.
+    renderDashboard();
+    syncLicensesNow(false);
+  } catch (e) {
+    const msg = e && e.code === "auth/invalid-custom-token"
+      ? "Server token invalid — FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY check karo."
+      : e && e.code === "auth/configuration-not-found"
+        ? "Firebase Console → Authentication → 'Get started' dabao (ek baar ka setup)."
+        : (e && e.message ? e.message : "Login failed");
+    showErr("🔒 " + msg);
+  } finally {
+    _loginInFlight = false;
+    if (btn) { btn.disabled = false; btn.textContent = "🔐 Login"; }
   }
 }
-function logout() { location.reload(); }
+async function logout() {
+  try { if (typeof firebase !== "undefined" && firebase.auth) await firebase.auth().signOut(); } catch (e) { /* reload clears in-memory session anyway */ }
+  location.reload();
+}
 
 // ── RENDER (XSS-safe — all user data escaped) ───────────
 // Rebuilding a 200-row list on every single keystroke was measurable
@@ -1486,25 +1539,6 @@ async function hashPwd(str){
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
 }
 
-function changeAdminPassword(){
-  const cur=document.getElementById("curAdminPass").value;
-  const np=document.getElementById("newAdminPass").value;
-  const cf=document.getElementById("cfmAdminPass").value;
-  const msg=document.getElementById("adminPwdMsg");
-
-  const storedPwd=localStorage.getItem("ab_admin_pwd")||DEFAULT_ADMIN_PANEL_PASSWORD;
-  if(cur!==storedPwd){
-    showPwdMsg("adminPwdMsg","❌ Current password incorrect","#ef4444");return;
-  }
-  if(np.length<8){showPwdMsg("adminPwdMsg","❌ Min 8 characters required","#ef4444");return;}
-  if(np!==cf){showPwdMsg("adminPwdMsg","❌ Passwords do not match","#ef4444");return;}
-
-  localStorage.setItem("ab_admin_pwd",np);
-  document.getElementById("curAdminPass").value="";
-  document.getElementById("newAdminPass").value="";
-  document.getElementById("cfmAdminPass").value="";
-  showPwdMsg("adminPwdMsg","✅ Admin password updated successfully!","#22c55e");
-}
 
 async function resetHotelPassword(){
   const licKey=document.getElementById("hotelLicForReset").value.trim().toUpperCase();
