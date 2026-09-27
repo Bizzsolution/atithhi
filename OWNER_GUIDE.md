@@ -181,6 +181,13 @@ Client (hotel) ko professional GST invoice banane/bhejне ke liye — Admin
 Panel ke andar, Dashboard/Settings ke saamne wala tab.
 
 **🔴 Vault ID — ise zaroor samjho:**
+Yahi Vault ID **hotel license list** ko bhi sab devices pe sync karta hai
+(Dashboard pe "🔐 Admin Vault ID" card). Naye device / incognito pe login
+karo to pehle wahan purane device ka Vault ID paste karo — tabhi poori
+hotel list aur unke features dikhenge. Top-bar mein "☁️ Synced" = live
+cloud data; "⚠️ Rules Update Needed" = nayi `firestore.rules` publish karni
+baaki hai.
+
 Saare invoices ek secret "Vault ID" (jaise `VABC123...`, 24 characters,
 `V` se shuru) ke peeche cloud mein save hote hain. Yeh ID is browser ke
 `localStorage` mein rehta hai — kahin doosri jagah automatically backup

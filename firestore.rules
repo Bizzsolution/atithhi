@@ -285,6 +285,22 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ---- Admin Vault license index (internal — admin panel only) --
+    // Path: admin_vault/{vaultId}  — ONE document: { licenseKeys: [...] }
+    // Lets the admin panel load the real hotel list on any device without
+    // opening `list` on licenses/ (which would let anyone dump every key).
+    // vaultId is the same 24-char random secret the billing vault uses,
+    // so this document is only reachable by someone who already holds it.
+    // Holds keys only — each hotel's data is still read from its own
+    // licenses/{key} document.
+    match /admin_vault/{vaultId} {
+      allow get: if validVaultId(vaultId);
+      allow list: if false;
+      allow create, update: if validVaultId(vaultId)
+        && request.resource.data.keys().hasOnly(['licenseKeys', 'updatedAt']);
+      allow delete: if false;
+    }
+
     // ---- default deny --------------------------------------------
     // Anything not explicitly matched above is refused. New collections
     // added later start closed and must be opened deliberately, rather

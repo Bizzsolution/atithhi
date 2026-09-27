@@ -1,0 +1,332 @@
+// AtithiBook SaaS — Secure Scan Function
+// No external npm dependencies — safe for drag-and-drop Netlify deploys.
+// License validated against TWO sources (either one passing = allowed):
+//   1. Firestore /admin/licenses (live — updates instantly when admin panel
+//      generates/revokes a key, via plain REST fetch, no SDK needed)
+//   2. VALID_LICENSES env var (fallback if Firestore is unreachable)
+
+const FIREBASE_PROJECT_ID = "atithibook-saas";
+
+// ── PER-LICENSE RATE LIMITING (in-memory, no external deps) ──
+const rateMap = new Map();
+function checkScanRateLimit(license) {
+  const now = Date.now();
+  const entry = rateMap.get(license) || { count: 0, windowStart: now };
+  if (now - entry.windowStart > 60000) { entry.count = 0; entry.windowStart = now; }
+  if (entry.count >= 20) return false;
+  entry.count++;
+  rateMap.set(license, entry);
+  if (rateMap.size > 5000) rateMap.clear();
+  return true;
+}
+
+// ── Parse a Firestore REST "mapValue" license entry into plain JS ──
+function parseLicenseEntry(mapValue) {
+  const f = mapValue?.fields || {};
+  return {
+    key: (f.key?.stringValue || "").toUpperCase(),
+    active: f.active?.booleanValue !== false, // default true if missing
+    plan: f.plan?.stringValue || "",
+    expiry: f.expiry?.stringValue || f.expiry?.nullValue !== undefined ? (f.expiry?.stringValue || null) : null,
+    features: (f.features?.arrayValue?.values || []).map(x => x.stringValue).filter(Boolean)
+  };
+}
+
+// ── Check license — NEW scalable path first, OLD array as fallback ──
+// A license lives at its OWN document `licenses/{KEY}` now, not as one
+// entry inside a single giant `admin/licenses` array — that array doc
+// has Firestore's hard 1 MiB-per-document ceiling, and EVERY hotel's
+// EVERY scan/verify call was downloading that WHOLE document just to
+// find its own one entry. At real scale (thousands of hotels, let alone
+// the ten-lakh target) that document would eventually stop accepting
+// writes entirely, and every check gets slower as more hotels sign up —
+// the opposite of what a per-hotel document gives, which is a single
+// small O(1) read no matter how many other hotels exist.
+// The OLD array is still checked as a fallback ONLY so a hotel that
+// hasn't been migrated yet (via the admin panel's migration button)
+// keeps working exactly as before — nothing breaks mid-transition.
+async function checkFirestoreLicense(licenseUpper) {
+  try {
+    const directUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/licenses/${encodeURIComponent(licenseUpper)}`;
+    const directRes = await fetch(directUrl);
+    if (directRes.ok) {
+      const doc = await directRes.json();
+      const entry = parseLicenseEntry({ fields: doc.fields });
+      if (entry.key === licenseUpper) {
+        if (entry.expiry && Date.now() > new Date(entry.expiry + "T23:59:59Z").getTime()) {
+          return { found: true, active: false, expired: true, expiry: entry.expiry };
+        }
+        return { found: true, active: entry.active, features: entry.features };
+      }
+    }
+    // 404 (not found at the new path) is expected for not-yet-migrated
+    // hotels and falls through to the old lookup below — only a genuine
+    // network/server error should be treated as "couldn't check".
+    if (directRes.status !== 404 && !directRes.ok) return { found: false, error: true };
+  } catch (e) {
+    // Network-level failure on the fast path — still try the old path
+    // below before giving up entirely.
+  }
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin/licenses`;
+    const r = await fetch(url);
+    // A non-OK HTTP response means we genuinely COULDN'T check — this is
+    // different from checking and finding the key absent. Collapsing both
+    // into the same "found: false" shape (as before) meant a transient
+    // Firestore hiccup got reported to the guest-facing app as "your
+    // license is invalid, contact support" instead of "try again in a
+    // moment" — the earlier code below now relies on this `error` flag to
+    // tell the two apart.
+    if (!r.ok) return { found: false, error: true };
+    const doc = await r.json();
+    const values = doc?.fields?.list?.arrayValue?.values || [];
+    for (const v of values) {
+      const entry = parseLicenseEntry(v.mapValue);
+      if (entry.key === licenseUpper) {
+        if (entry.expiry && Date.now() > new Date(entry.expiry + "T23:59:59Z").getTime()) {
+          return { found: true, active: false, expired: true, expiry: entry.expiry };
+        }
+        return { found: true, active: entry.active, features: entry.features };
+      }
+    }
+    return { found: false };
+  } catch (e) {
+    console.warn("Firestore license check unavailable:", e.message);
+    return { found: false, error: true };
+  }
+}
+
+// ── Check license against static env var (fallback) ──
+function checkEnvLicense(licenseUpper) {
+  const validEntries = (process.env.VALID_LICENSES || "")
+    .split(",")
+    .map(e => { const [k, d] = e.trim().split(":"); return { key: k?.toUpperCase(), expiry: d || null }; })
+    .filter(e => e.key);
+  const entry = validEntries.find(e => e.key === licenseUpper);
+  if (!entry) return { found: false };
+  if (entry.expiry && Date.now() > new Date(entry.expiry + "T23:59:59Z").getTime()) {
+    return { found: true, expired: true };
+  }
+  return { found: true, active: true };
+}
+
+export async function handler(event) {
+  const headers = {
+    "Access-Control-Allow-Origin": process.env.URL || process.env.DEPLOY_PRIME_URL || "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Content-Type": "application/json",
+    "X-Content-Type-Options": "nosniff"
+  };
+
+  if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers, body: "" };
+  if (event.httpMethod !== "POST") return { statusCode: 405, headers, body: JSON.stringify({ error: "Method not allowed" }) };
+
+  try {
+    const { image, prompt, license, scanContext } = JSON.parse(event.body || "{}");
+
+    if (!license) return { statusCode: 400, headers, body: JSON.stringify({ error: "License required" }) };
+    if (image && image.length > 4 * 1024 * 1024) return { statusCode: 413, headers, body: JSON.stringify({ error: "Image too large (max 4MB)" }) };
+    if (prompt && prompt.length > 1000) return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid request" }) };
+
+    // ── LICENSE VALIDATION — Firestore (live) checked first, env var as fallback ──
+    const licenseUpper = license.trim().toUpperCase();
+    const [fsResult, envResult] = await Promise.all([
+      checkFirestoreLicense(licenseUpper),
+      Promise.resolve(checkEnvLicense(licenseUpper))
+    ]);
+
+    let valid = false;
+    let expired = false;
+
+    if (fsResult.found) {
+      valid = fsResult.active;
+      if (fsResult.expired) expired = true;
+    }
+    if (!valid && envResult.found) {
+      valid = envResult.active && !envResult.expired;
+      expired = expired || envResult.expired;
+    }
+
+    if (!valid && expired) {
+      return { statusCode: 403, headers, body: JSON.stringify({ error: "EXPIRED_LICENSE", message: "License expired. Please renew." }) };
+    }
+    // Only say "invalid" when we ACTUALLY checked the live list and the
+    // key genuinely wasn't on it. If Firestore couldn't be reached (and
+    // the static env-var fallback — which normally only has a handful of
+    // legacy/manually-added keys — also doesn't have this key, which is
+    // the common case for any key generated later through the admin
+    // panel), we don't know either way: this is a connectivity problem,
+    // not evidence the license is bad, so it must not be reported as one.
+    if (!valid && fsResult.error && !envResult.found) {
+      return { statusCode: 503, headers, body: JSON.stringify({ error: "VERIFICATION_UNAVAILABLE", message: "Could not verify license right now — internet/server issue, not your license. Try again in a moment." }) };
+    }
+    if (!valid) {
+      return { statusCode: 403, headers, body: JSON.stringify({ error: "INVALID_LICENSE", message: "Invalid license key. Contact support." }) };
+    }
+
+    // ── FEATURE GATE — server-side enforcement, not just UI hiding.
+    // This is the ONE thing in the app that genuinely can't be bypassed via
+    // browser console, since the OCR call itself goes through here. Only
+    // enforced when Firestore was reachable and returned a definitive
+    // features list — if we fell back to the env-var check (Firestore was
+    // down), we fail OPEN on the feature check specifically, so a transient
+    // outage never blocks a paying customer's family scan.
+    if (scanContext === "family" && fsResult.found && Array.isArray(fsResult.features)) {
+      if (!fsResult.features.includes("family")) {
+        return { statusCode: 403, headers, body: JSON.stringify({ error: "FEATURE_NOT_ENABLED", message: "Family member scanning is not enabled on this plan." }) };
+      }
+    }
+
+    // ── RATE LIMIT: max 20 scans/min per license ──
+    if (!checkScanRateLimit(licenseUpper)) {
+      return { statusCode: 429, headers, body: JSON.stringify({ error: "RATE_LIMITED", message: "Too many scans. Wait a moment and try again." }) };
+    }
+
+    // License valid — if no image (test call), return OK
+    if (!image || !prompt) {
+      return { statusCode: 200, headers, body: JSON.stringify({ ok: true, licensed: true }) };
+    }
+
+    // ── OCR: GEMINI PRIMARY ──
+    // Chosen as primary for accuracy on structured ID-document extraction —
+    // Gemini's vision pipeline is purpose-built for document/OCR tasks,
+    // whereas Groq's strength is raw inference speed on open-weight models
+    // (vision is a secondary capability there). Groq below is the fallback
+    // for outages, not for lower per-scan accuracy.
+    // MODEL NAMES ARE CONFIGURABLE — if a provider deprecates a model, fix it
+    // in Netlify dashboard (env var) instead of editing code:
+    //   Site settings → Environment variables → GEMINI_MODELS
+    //   Comma-separated list, tried in order.
+    // Current as of Sept 2026 — gemini-2.0-flash was already shut down
+    // 1 June 2026, and gemini-2.5-flash retires 16 Oct 2026, so neither
+    // belongs in the default list any more. "gemini-flash-latest" is a
+    // Google-maintained alias that tracks whatever the current Flash
+    // model is, kept first so this list needs less manual upkeep over
+    // time; the other two are explicit, confirmed-GA pins (NOT
+    // "gemini-3-flash" — that name only exists as the PREVIEW-stage
+    // "gemini-3-flash-preview"; the bare, no-suffix form isn't a real
+    // model ID and would just fail and fall through every time) in case
+    // the alias ever points somewhere temporarily unavailable.
+    //
+    // thinkingConfig matters here as much as the model name does. Gemini
+    // 3-generation models turn "thinking" on by default (medium level for
+    // Flash) — before this was set, the model was spending its output-token
+    // budget on invisible reasoning before ever writing the JSON answer,
+    // which is what was producing "Parse error" on the client: not a
+    // parsing bug, but a response that got cut off mid-thought and never
+    // contained an actual answer. thinkingBudget (older/2.5-series field)
+    // and thinkingLevel (3.x-series field) are both sent together since
+    // different models in this list read different ones — an unrecognised
+    // field is harmless, so this is safe across the whole list. Google's
+    // own docs note Gemini 3 Flash/Flash-Lite "do not support full
+    // thinking-off", so maxOutputTokens is raised as a safety margin for
+    // whatever minimum thinking still happens even at the lowest level.
+    let result = null;
+    const lastErrors = { groq: null, gemini: null };
+    const gKey = process.env.GEMINI_API_KEY;
+    const geminiModels = (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite")
+      .split(",").map(m => m.trim()).filter(Boolean);
+    if (gKey) {
+      for (const model of geminiModels) {
+        if (result) break;
+        try {
+          // The API rejects a request outright if BOTH thinkingBudget AND
+          // thinkingLevel are set together ("You can only set only one of
+          // thinking budget and thinking level") — sending both, assuming
+          // the model would just ignore whichever didn't apply, was wrong
+          // and broke every single Gemini call regardless of model. The
+          // two fields belong to different model generations and are
+          // mutually exclusive per request, so pick ONE based on the
+          // model name: 2.x-series models take thinkingBudget (0 = off),
+          // 3.x-series models (and the "-latest" aliases, which currently
+          // resolve to a 3.x model) take thinkingLevel and cannot go fully
+          // to zero, only as low as "low".
+          const isGen3 = /^gemini-3/.test(model) || /-latest$/.test(model);
+          const thinkingConfig = isGen3 ? { thinkingLevel: "low" } : { thinkingBudget: 0 };
+          const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gKey}`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ inlineData: { mimeType: "image/jpeg", data: image } }, { text: prompt }] }],
+              generationConfig: { temperature: 0, maxOutputTokens: 1000, thinkingConfig }
+            })
+          });
+          const d = await r.json();
+          // Require actual extractable text, not just a truthy `candidates`
+          // array — a response that hit MAX_TOKENS mid-thought still has
+          // `candidates`, just with empty/partial content, and treating
+          // that as a success meant a bad result was returned instead of
+          // this loop correctly moving on to the next model.
+          const text = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (r.ok && text) { result = d; break; }
+          if (d.error) { lastErrors.gemini = d.error?.message; console.warn("Gemini API error:", d.error?.message); }
+          else if (r.ok) { lastErrors.gemini = `[${model}] empty response (finishReason: ${d?.candidates?.[0]?.finishReason || "unknown"})`; }
+        } catch (e) { lastErrors.gemini = e.message; console.warn("Gemini:", e.message); }
+      }
+    }
+
+    // ── OCR: GROQ FALLBACK ──
+    // Only reached if Gemini returned nothing usable (bad/missing key,
+    // rate limit, outage) — a safety net for availability, not a second
+    // attempt at higher accuracy.
+    //   Site settings → Environment variables → GROQ_MODELS
+    //   Comma-separated list, tried in order.
+    // Current as of Sept 2026 — Llama 4 Scout/Maverick are confirmed,
+    // widely-available vision models on Groq. qwen/qwen3.6-27b is kept as
+    // a last option only: Groq's own docs mark it a PREVIEW model ("not
+    // for production"), and it was in fact returning "does not exist or
+    // you do not have access to it" in practice — trying the two Llama
+    // models first means a working fallback even on accounts where Qwen
+    // access isn't (or is no longer) available.
+    if (!result) {
+      const groqKey = process.env.GROQ_API_KEY;
+      const groqModels = (process.env.GROQ_MODELS || "meta-llama/llama-4-scout-17b-16e-instruct,meta-llama/llama-4-maverick-17b-128e-instruct,qwen/qwen3.6-27b")
+        .split(",").map(m => m.trim()).filter(Boolean);
+      if (groqKey) {
+        for (const model of groqModels) {
+          if (result) break;
+          try {
+            const body = {
+              model,
+              messages: [{ role: "user", content: [
+                { type: "image_url", image_url: { url: "data:image/jpeg;base64," + image } },
+                { type: "text", text: prompt }
+              ]}],
+              max_tokens: 1000, temperature: 0
+            };
+            // Learned the hard way (from the identical mistake on the
+            // Gemini side above) not to assume a provider silently
+            // ignores a parameter that doesn't apply to a given model —
+            // only send reasoning_effort to the one model family it's
+            // actually documented for (Qwen's "thinking mode" toggle),
+            // rather than sending it unconditionally to every Groq model
+            // in this list and risking the same kind of outright
+            // rejection on models it doesn't apply to.
+            if (/^qwen\//.test(model)) body.reasoning_effort = "none";
+            const gr = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": "Bearer " + groqKey },
+              body: JSON.stringify(body)
+            });
+            const gd = await gr.json();
+            if (gr.ok && gd.choices?.[0]?.message?.content) {
+              result = { _groq: true, _text: gd.choices[0].message.content };
+            } else if (gd.error) {
+              lastErrors.groq = `[${model}] ` + (gd.error?.message || gd.error?.code || JSON.stringify(gd.error));
+              console.warn("Groq API error:", lastErrors.groq);
+            }
+          } catch (e) { lastErrors.groq = `[${model}] ` + e.message; console.warn("Groq:", e.message); }
+        }
+      }
+    }
+
+    if (!result) return { statusCode: 503, headers, body: JSON.stringify({
+      error: "OCR service unavailable. API keys may need updating — contact admin.",
+      details: { groq: lastErrors.groq, gemini: lastErrors.gemini }
+    }) };
+    return { statusCode: 200, headers, body: JSON.stringify(result) };
+
+  } catch (e) {
+    return { statusCode: 500, headers, body: JSON.stringify({ error: "Server error. Try again." }) };
+  }
+}

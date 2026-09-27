@@ -154,6 +154,23 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
         Counts reflect the hotels currently loaded below (200 at a time) — use "Load More" or "Find by Key" to look beyond that, this is not a platform-wide total.
       </div>
 
+      <!-- Admin Vault — shown until the admin confirms it's backed up.
+           See the ADMIN VAULT comment in the script for why it exists. -->
+      <div id="vaultCard" class="section" style="display:none;border:1px solid #1d4ed8">
+        <div class="section-title">🔐 Admin Vault ID — sab devices pe same hotel list</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.6;margin-bottom:10px">Aapki poori hotel list aur saare invoices is secret ID se cloud mein jude hain. <b>Isko abhi kahin surakshit save karo</b> (phone notes / password manager) — kisi aur ke saath share mat karna.</div>
+        <div id="vaultCardId" class="netlify-box" style="margin:0 0 10px"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+          <button class="btn btn-outline" style="width:auto" onclick="copyAdminVault()">📋 Copy</button>
+          <button class="btn btn-success" style="width:auto;padding:10px 14px" onclick="confirmAdminVaultBackedUp()">✅ Save kar liya — yahi mera main device hai</button>
+        </div>
+        <div style="font-size:12px;color:#fbbf24;margin-bottom:6px">📱 Naya device / incognito / browser data clear hua? Pehle device ka Vault ID yahan paste karo — poori list aa jaayegi:</div>
+        <div style="display:flex;gap:8px">
+          <input id="vaultPasteInput" placeholder="V xxxxxxxxxxxxxxxxxxxxxxx" style="margin-bottom:0"/>
+          <button class="btn btn-primary" style="width:auto;white-space:nowrap;padding:0 16px" onclick="useAdminVaultFromDashboard()">Use</button>
+        </div>
+      </div>
+
       <!-- Generate New Key -->
       <div class="section">
         <div class="section-title">🔑 Generate New License Key</div>
@@ -200,10 +217,10 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
           <button class="btn-outline btn" style="width:auto;white-space:nowrap;padding:0 16px"
             onclick="findLicenseByKey(document.getElementById('findKeyBox').value).then(f=>showMsg(f?('✅ Found: '+(f.hotel||f.key)):'❌ Not found (checked new + old storage)', f?'success':'error'))">🔎 Find</button>
         </div>
-        <button class="btn-outline btn" onclick="hydrateLicensesFromCloud().then(()=>{initDefaultLicenses();renderDashboard();const denied=LicenseCloud.lastError&&LicenseCloud.lastErrorExpected;updateSyncIndicator(LicenseCloud.lastError?(denied?'denied':false):true);showMsg(LicenseCloud.lastError?((denied?'🔒 ':'⚠️ ')+LicenseCloud.lastError):'☁️ Synced from cloud', LicenseCloud.lastError?(denied?'success':'error'):'success')})"
+        <button class="btn-outline btn" onclick="syncLicensesNow(true)"
           style="width:100%;margin-bottom:8px">🔄 Sync licenses from cloud (other devices)</button>
         <button class="btn-outline btn" style="width:100%;margin-bottom:14px;border-color:#fbbf24;color:#fbbf24"
-          onclick="if(confirm('Copy every license from the old storage into the new scalable one? Safe to run more than once — nothing is deleted.')){showMsg('⏳ Migrating...','success');LicenseCloud.migrateOldArrayToNew().then(r=>{if(r.ok){showMsg('✅ Migrated '+r.migrated+' license(s) to scalable storage','success');hydrateLicensesFromCloud().then(renderDashboard);}else{showMsg('⚠️ Migration failed: '+r.error,'error');}})}">🔄 Migrate to Scalable Storage (one-time)</button>
+          onclick="if(confirm('Purani storage ke jo hotels abhi naye system mein nahi hain, sirf unhe copy karein? Jo hotel pehle se naye system mein hai uska data (features, plan) bilkul nahi badlega. Kuch delete nahi hota.')){showMsg('⏳ Migrating...','success');LicenseCloud.migrateOldArrayToNew().then(r=>{if(r.ok){showMsg('✅ '+r.migrated+' naye hotel copy hue · '+r.skipped+' pehle se the (unka naya data safe rakha)','success');syncLicensesNow(false);}else{showMsg('⚠️ Migration failed: '+r.error,'error');}})}">🔄 Migrate to Scalable Storage (one-time)</button>
         <div id="msg" class="msg"></div>
         <div id="licenseList">Loading...</div>
         <button id="loadMoreBtn" class="btn-outline btn" style="width:100%;margin-top:10px;display:none" onclick="loadMoreLicenses()">⬇️ Load More Hotels</button>
@@ -230,7 +247,7 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
            would ever see it before issuing their first invoice). -->
       <div id="blVaultBanner" style="display:none;background:#422006;border:1px solid #92400e;border-radius:12px;padding:14px 16px;margin-bottom:16px">
         <div style="font-weight:800;font-size:13px;color:#fcd34d;margin-bottom:6px">⚠️ Pehle yeh Vault ID save kar lo</div>
-        <div style="font-size:12px;color:#fde68a;line-height:1.6;margin-bottom:10px">Aapke saare invoices is ID ke peeche cloud mein save hote hain. Agar is browser ka data kabhi clear ho gaya aur yeh ID kahin save nahi kiya, toh poora invoice-history access nahi ho payega (data delete nahi hoga, bas is device ke bina usse dobara jodna mushkil hoga). Isko abhi kahin surakshit jagah (jaise apne phone ke notes ya password manager) copy karke rakh lo.</div>
+        <div style="font-size:12px;color:#fde68a;line-height:1.6;margin-bottom:10px">Aapki hotel list aur saare invoices is ID ke peeche cloud mein save hote hain. Agar is browser ka data kabhi clear ho gaya aur yeh ID kahin save nahi kiya, toh hotel list aur invoice-history access nahi ho payegi (data delete nahi hoga, bas is device ke bina usse dobara jodna mushkil hoga). Isko abhi kahin surakshit jagah (jaise apne phone ke notes ya password manager) copy karke rakh lo.</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <div id="blVaultBannerId" class="netlify-box" style="margin:0;flex:1;min-width:200px"></div>
           <button class="btn btn-outline" style="width:auto;white-space:nowrap" onclick="billingCopyVaultFromBanner()">📋 Copy</button>
@@ -330,7 +347,7 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 
           <div style="margin-top:18px;padding:14px;background:#0b1220;border:1px solid #263248;border-radius:12px">
             <div style="font-weight:700;font-size:13px;margin-bottom:6px">🔐 Billing Vault ID</div>
-            <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;line-height:1.6">Aapke saare invoices is secret ID ke andar cloud mein save hote hain. Doosre device pe same invoices dekhne ke liye wahan yahi ID daalo. <b>Ise password ki tarah kisi ke saath share mat karo.</b></div>
+            <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;line-height:1.6">Aapki hotel list aur saare invoices is secret ID ke andar cloud mein save hote hain. Doosre device pe same data dekhne ke liye wahan yahi ID daalo. <b>Ise password ki tarah kisi ke saath share mat karo.</b></div>
             <div id="blVaultId" class="netlify-box" style="margin-top:0;margin-bottom:10px"></div>
             <div style="display:flex;gap:8px">
               <input id="blVaultInput" placeholder="Doosre device ka Vault ID paste karo" style="margin-bottom:0"/>
@@ -522,6 +539,92 @@ let licenses = JSON.parse(localStorage.getItem("ab_admin_licenses") || "[]");
 let adminPass = "";
 let licensesHasMore = false;
 let licensesLastDoc = null; // Firestore cursor for "load more" pagination
+// Full ordered key list (newest first) read from the Admin Vault index,
+// and how far into it the dashboard has loaded — see LicenseIndex below.
+let licenseIndexKeys = [];
+let licensesPageEnd = 0;
+const LICENSE_PAGE = 200;
+
+// ── ADMIN VAULT — how the panel gets a REAL cross-device license list ──
+// The security rules deny `list` on licenses/ (otherwise anyone could
+// dump every key). That's correct, but it meant this panel could never
+// read the list back either — it only ever showed whatever THIS device
+// had cached, which is why the header said "List Protected", why a new
+// browser/incognito window showed demo hotels instead of real ones, and
+// why edits made on one device silently vanished on another.
+//
+// Fix: a single private index document, admin_vault/{vaultId}, holding
+// just the license KEYS. vaultId is a 24-char random secret (the same one
+// Billing uses — one thing to back up), so the index is only reachable
+// by someone who already has it; `list` stays denied everywhere. The
+// panel reads the index, then fetches each hotel's own live document by
+// exact key (an allowed `get`), so what's shown is always the cloud's
+// current data, never a stale local copy.
+//
+// Capacity note: one Firestore doc caps at 1 MiB; at ~20 bytes per key
+// this index holds roughly 40,000 hotels before it would need sharding.
+const VAULT_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function adminVaultId() {
+  let v = localStorage.getItem("ab_billing_vault");
+  if (!v || !/^V[A-Z0-9]{23}$/.test(v)) {
+    const b = new Uint8Array(23);
+    crypto.getRandomValues(b);
+    v = "V" + Array.from(b, x => VAULT_ALPHABET[x % VAULT_ALPHABET.length]).join("");
+    localStorage.setItem("ab_billing_vault", v);
+  }
+  return v;
+}
+const isDeniedError = e => /permission|insufficient|PERMISSION_DENIED/i.test(((e && e.code) || "") + " " + ((e && e.message) || ""));
+const LicenseIndex = {
+  ref() { return window._db ? window._db.collection("admin_vault").doc(adminVaultId()) : null; },
+  async load() {
+    const r = this.ref();
+    if (!r) return { ok: false, error: "Firebase not connected in this browser" };
+    try {
+      const snap = await r.get();
+      const raw = snap.exists && Array.isArray(snap.data().licenseKeys) ? snap.data().licenseKeys : [];
+      return { ok: true, exists: !!snap.exists, keys: raw.map(k => String(k).toUpperCase()) };
+    } catch (e) {
+      return { ok: false, denied: isDeniedError(e), error: e.message };
+    }
+  },
+  // Appends keys (no duplicates). arrayUnion makes concurrent adds from
+  // two devices safe; the read-merge-write path is only a fallback for
+  // environments without FieldValue.
+  async add(keys) {
+    const uniq = [...new Set((keys || []).map(k => String(k || "").toUpperCase()).filter(Boolean))];
+    if (!uniq.length) return true;
+    const r = this.ref();
+    if (!r) return false;
+    try {
+      const FV = window.firebase && firebase.firestore && firebase.firestore.FieldValue;
+      if (FV && FV.arrayUnion) {
+        await r.set({ licenseKeys: FV.arrayUnion(...uniq), updatedAt: Date.now() }, { merge: true });
+      } else {
+        const snap = await r.get();
+        const cur = snap.exists && Array.isArray(snap.data().licenseKeys) ? snap.data().licenseKeys : [];
+        const merged = [...cur];
+        uniq.forEach(k => { if (!merged.includes(k)) merged.push(k); });
+        await r.set({ licenseKeys: merged, updatedAt: Date.now() }, { merge: true });
+      }
+      return true;
+    } catch (e) {
+      console.warn("License index add:", e.message);
+      return false;
+    }
+  }
+};
+// Reads hotels' own documents by exact key, 50 in parallel at a time.
+// Order of `found` follows the order of `keys`.
+async function fetchLicenseDocs(keys) {
+  const found = [], missing = [];
+  for (let i = 0; i < keys.length; i += 50) {
+    const chunk = keys.slice(i, i + 50);
+    const snaps = await Promise.all(chunk.map(k => window._db.collection("licenses").doc(k).get()));
+    snaps.forEach((snap, j) => { if (snap.exists) found.push(snap.data()); else missing.push(chunk[j]); });
+  }
+  return { found, missing };
+}
 
 // ── FIRESTORE SYNC for licenses ──────────────────────────
 // Each hotel now lives at its OWN document — collection `licenses`,
@@ -595,33 +698,59 @@ const LicenseCloud = {
   },
   // Writes EACH given license as its OWN document — batched (Firestore
   // caps a batch at 500 writes), never as one shared array anymore.
-  async pushMany(list) {
+  // opts.fields     — write ONLY these fields (plus `key`). Used for every
+  //                   single-hotel edit, so saving (say) features never
+  //                   rewrites owner/plan/expiry with this device's copy,
+  //                   which may be older than another device's change.
+  // opts.createOnly  — skip any hotel whose document already exists. Used
+  //                   by migration/seeding, which must never overwrite
+  //                   live data with an older copy.
+  async pushMany(list, opts) {
+    opts = opts || {};
     // Writes to licenses/{key} are allowed by the rules for any
-    // validly-formatted key, so — same reasoning as pullByKey above — a
-    // failure here is always genuine, never an expected security block.
+    // validly-formatted key, so a failure here is always genuine, never
+    // an expected security block.
     if (!window._db) {
       this.lastError = "Firebase not connected — changes saved locally only, NOT backed up to cloud!";
       this.lastErrorExpected = false;
       showMsg("⚠️ Cloud sync failed: Firebase not connected. Changes saved on THIS device only.", "error");
-      return;
+      return { ok: false, error: this.lastError };
     }
     try {
-      for (let i = 0; i < list.length; i += 450) {
-        const chunk = list.slice(i, i + 450);
+      let toWrite = (list || []).filter(l => l && l.key);
+      let skipped = 0;
+      if (opts.createOnly) {
+        const kept = [];
+        for (let i = 0; i < toWrite.length; i += 50) {
+          const chunk = toWrite.slice(i, i + 50);
+          const snaps = await Promise.all(chunk.map(l => window._db.collection("licenses").doc(l.key.toUpperCase()).get()));
+          snaps.forEach((snap, j) => { if (snap.exists) skipped++; else kept.push(chunk[j]); });
+        }
+        toWrite = kept;
+      }
+      for (let i = 0; i < toWrite.length; i += 450) {
+        const chunk = toWrite.slice(i, i + 450);
         const batch = window._db.batch();
         chunk.forEach(l => {
-          if (!l.key) return;
-          batch.set(window._db.collection("licenses").doc(l.key.toUpperCase()), l, { merge: true });
+          let data = l;
+          if (opts.fields) {
+            data = { key: l.key };
+            opts.fields.forEach(f => { data[f] = l[f] === undefined ? null : l[f]; });
+          }
+          batch.set(window._db.collection("licenses").doc(l.key.toUpperCase()), data, { merge: true });
         });
         await batch.commit();
       }
       this.lastError = null; this.lastErrorExpected = false;
       updateSyncIndicator(true);
+      await LicenseIndex.add(toWrite.map(l => l.key));
+      return { ok: true, written: toWrite.length, skipped };
     } catch (e) {
       console.warn("License push:", e.message);
       this.lastError = e.message; this.lastErrorExpected = false;
       updateSyncIndicator(false);
       showMsg("⚠️ Cloud sync failed: " + e.message + " — changes saved on THIS device only, won't work from other devices/servers!", "error");
+      return { ok: false, error: e.message };
     }
   },
   async deleteOne(key) {
@@ -629,19 +758,30 @@ const LicenseCloud = {
     try { await window._db.collection("licenses").doc(key.toUpperCase()).delete(); }
     catch (e) { console.warn("License delete:", e.message); }
   },
-  // One-time migration: reads the OLD array doc and writes each entry
-  // into the NEW per-document collection. Safe to run more than once
-  // (merge:true means re-running just re-writes the same data) and does
-  // NOT delete the old doc — nothing is lost even if this needs re-running.
-  async migrateOldArrayToNew(onProgress) {
+  // Reads the legacy single-array document. [] if missing/unreadable.
+  async readOldArray() {
+    if (!window._db) return [];
+    try {
+      const snap = await window._db.collection("admin").doc("licenses").get();
+      return snap.exists ? (snap.data().list || []) : [];
+    } catch (e) { return []; }
+  },
+  // Copies hotels from the OLD array doc into per-hotel documents —
+  // CREATE-ONLY. The old array is never updated by current code, so its
+  // copy of a hotel is almost always older than the live document (e.g.
+  // missing features added since). The previous version wrote every
+  // entry with merge:true, which overwrote those newer values — that is
+  // exactly how features "disappeared" after clicking Migrate. Now a
+  // hotel that already has its own document is left untouched.
+  async migrateOldArrayToNew() {
     if (!window._db) return { ok: false, error: "Firebase not connected" };
     try {
       const snap = await window._db.collection("admin").doc("licenses").get();
       const oldList = snap.exists ? (snap.data().list || []) : [];
-      if (!oldList.length) return { ok: true, migrated: 0 };
-      await this.pushMany(oldList);
-      if (onProgress) onProgress(oldList.length, oldList.length);
-      return { ok: true, migrated: oldList.length };
+      if (!oldList.length) return { ok: true, migrated: 0, skipped: 0 };
+      const r = await this.pushMany(oldList, { createOnly: true });
+      if (!r.ok) return { ok: false, error: r.error };
+      return { ok: true, migrated: r.written, skipped: r.skipped };
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -649,16 +789,15 @@ const LicenseCloud = {
 };
 
 function updateSyncIndicator(state) {
-  // state: true (real success) | false (genuine failure) | "denied" (rules
-  // correctly blocking bulk-list — not a failure, panel still works via
-  // Find-by-Key). Accepting the old boolean calling convention too, so
-  // nothing elsewhere needs to change unless it wants the nuance.
+  // state: true (live cloud list loaded) | false (genuine failure) |
+  // "rules" (Firebase refused the Admin Vault read — the updated
+  // firestore.rules haven't been published yet).
   const el = document.getElementById("cloudSyncStatus");
   if (!el) return;
-  if (state === "denied") {
-    el.textContent = "🔒 List Protected";
-    el.style.color = "#60a5fa";
-    el.title = "Bulk-listing is intentionally blocked by security rules. Licenses shown below are from this device's last successful sync — use 'Find by Key' for a live lookup on any specific hotel.";
+  if (state === "rules") {
+    el.textContent = "⚠️ Rules Update Needed";
+    el.style.color = "#fbbf24";
+    el.title = "Nayi firestore.rules (admin_vault block) Firebase Console mein publish karo — tab tak list sirf is device ki copy hai.";
   } else {
     el.textContent = state ? "☁️ Synced" : "🔴 Sync Failed";
     el.style.color = state ? "#4ade80" : "#f87171";
@@ -666,67 +805,175 @@ function updateSyncIndicator(state) {
   }
 }
 
-function initDefaultLicenses() {
-  if (licenses.length === 0) {
-    licenses = [
-      { key: "ATITHI-TRIAL001", hotel: "Trial Hotel 1", owner: "", phone: "", plan: "TRIAL", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.TRIAL] },
-      { key: "ATITHI-TRIAL002", hotel: "Trial Hotel 2", owner: "", phone: "", plan: "TRIAL", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.TRIAL] },
-      { key: "ATITHI-TRIAL003", hotel: "Trial Hotel 3", owner: "", phone: "", plan: "TRIAL", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.TRIAL] },
-      { key: "ATITHI-BASIC001", hotel: "Basic Hotel 1", owner: "", phone: "", plan: "BASIC", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.BASIC] },
-      { key: "ATITHI-BASIC002", hotel: "Basic Hotel 2", owner: "", phone: "", plan: "BASIC", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.BASIC] },
-      { key: "ATITHI-BASIC003", hotel: "Basic Hotel 3", owner: "", phone: "", plan: "BASIC", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.BASIC] },
-      { key: "ATITHI-PRO00001", hotel: "Pro Hotel 1",   owner: "", phone: "", plan: "PRO",   date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.PRO] },
-      { key: "ATITHI-PRO00002", hotel: "Pro Hotel 2",   owner: "", phone: "", plan: "PRO",   date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.PRO] },
-      { key: "ATITHI-DEMO0001", hotel: "Demo Hotel",    owner: "", phone: "", plan: "TRIAL", date: new Date().toISOString().split("T")[0], active: true, features: [...PLAN_DEFAULT_FEATURES.TRIAL] },
-    ];
-    saveLicenses();
-  }
-  // Migrate old licenses that don't have owner/phone/features fields yet
-  let migrated = false;
+// Fills fields that very old license records may lack. Writes ONLY the
+// fields that were actually missing, and only after a fresh cloud read.
+//
+// This used to also seed nine hard-coded demo licenses (ATITHI-TRIAL001,
+// ATITHI-DEMO0001, ...) whenever this device's list was empty — i.e. on
+// every new browser or incognito window — and PUSH them to the cloud,
+// overwriting any real hotel using one of those keys with plan-default
+// features. That seeding is gone: an empty list now just means "no
+// hotels yet / paste your Vault ID".
+function backfillLicenseFields() {
+  const partials = [];
   licenses.forEach(l => {
-    if (l.owner === undefined) { l.owner = ""; migrated = true; }
-    if (l.phone === undefined) { l.phone = ""; migrated = true; }
-    if (!Array.isArray(l.features)) { l.features = [...(PLAN_DEFAULT_FEATURES[l.plan] || [])]; migrated = true; }
+    const p = { key: l.key };
+    let changed = false;
+    if (l.owner === undefined) { l.owner = ""; p.owner = ""; changed = true; }
+    if (l.phone === undefined) { l.phone = ""; p.phone = ""; changed = true; }
+    if (!Array.isArray(l.features)) { l.features = [...(PLAN_DEFAULT_FEATURES[l.plan] || [])]; p.features = l.features; changed = true; }
+    if (changed) partials.push(p);
   });
-  if (migrated) saveLicenses();
+  if (partials.length) {
+    localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+    LicenseCloud.pushMany(partials);
+  }
 }
 
-// Pull the first page from the NEW scalable collection on login. Local
-// cache is used as an instant first paint; the first cloud page then
-// replaces it once it arrives (same "cloud is source of truth" rule as
-// before, just paginated now instead of "the whole dataset").
+// Loads the real, current license list from the cloud via the Admin
+// Vault index. Returns { state: true | false | "rules", message }.
 async function hydrateLicensesFromCloud() {
-  const page = await LicenseCloud.pullPage(200, null);
-  if (page.list.length) {
-    licenses = page.list;
-    licensesHasMore = page.hasMore;
-    licensesLastDoc = page.lastDoc;
-    localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
-  } else if (page.denied) {
-    // "Permission denied" is NOT the same as "the collection is empty".
-    // Treating it as empty would fall through to the seeding branch
-    // below and re-upload this device's possibly-stale local cache over
-    // whatever is currently live — silently reverting newer changes
-    // made from another device. Keep the local cache for display only
-    // and touch nothing in the cloud.
+  if (!window._db) {
+    LicenseCloud.lastError = "Firebase not connected in this browser"; LicenseCloud.lastErrorExpected = false;
+    return { state: false, message: "⚠️ Cloud se connect nahi ho paaya — list is device ki purani copy hai." };
+  }
+  const idx = await LicenseIndex.load();
+  if (!idx.ok) {
+    LicenseCloud.lastError = idx.error; LicenseCloud.lastErrorExpected = false;
+    // Keep this device's cached list on screen; write nothing.
     licensesHasMore = false;
+    return idx.denied
+      ? { state: "rules", message: "⚠️ Firebase ne Admin Vault padhne se mana kiya — nayi firestore.rules (admin_vault block) Firebase Console mein publish karo. Tab tak list sirf is device ki copy hai." }
+      : { state: false, message: "⚠️ Cloud sync fail: " + idx.error };
+  }
+  try {
+    let keys = idx.keys; // oldest → newest
+    const known = new Set(keys);
+    const extra = [];
+    // Hotels this device knows about that the vault index doesn't yet —
+    // e.g. created here while offline, or before the index existed.
+    licenses.forEach(l => { const k = String(l.key || "").toUpperCase(); if (k && !known.has(k)) { known.add(k); extra.push(k); } });
+    let oldList = [];
+    if (!idx.exists) {
+      // First sync for this vault: also pull in the legacy array's hotels.
+      oldList = await LicenseCloud.readOldArray();
+      oldList.forEach(l => { const k = String(l.key || "").toUpperCase(); if (k && !known.has(k)) { known.add(k); extra.push(k); } });
+    }
+    if (extra.length) {
+      const localByKey = new Map(licenses.map(l => [String(l.key || "").toUpperCase(), l]));
+      const oldByKey = new Map(oldList.map(l => [String(l.key || "").toUpperCase(), l]));
+      const { missing } = await fetchLicenseDocs(extra);
+      const missingSet = new Set(missing);
+      // Keys with no cloud document yet get one — create-only, so a live
+      // document is never replaced. Keys with nothing to create from are
+      // dropped rather than indexed as dangling entries.
+      const toCreate = missing.map(k => localByKey.get(k) || oldByKey.get(k)).filter(Boolean);
+      if (toCreate.length) {
+        const r = await LicenseCloud.pushMany(toCreate, { createOnly: true });
+        if (!r.ok) throw new Error(r.error);
+      }
+      const creatable = new Set(toCreate.map(l => String(l.key).toUpperCase()));
+      const resolved = extra.filter(k => !missingSet.has(k) || creatable.has(k));
+      if (resolved.length) {
+        const ok = await LicenseIndex.add(resolved);
+        if (!ok) throw new Error("Admin Vault index update fail hua");
+      }
+      keys = [...keys, ...resolved];
+    }
+    licenseIndexKeys = [...keys].reverse(); // newest first on screen
+    const first = licenseIndexKeys.slice(0, LICENSE_PAGE);
+    const { found } = await fetchLicenseDocs(first);
+    licenses = found;
+    licensesPageEnd = first.length;
+    licensesHasMore = licenseIndexKeys.length > licensesPageEnd;
     licensesLastDoc = null;
-  } else if (licenses.length) {
-    // Collection genuinely read back empty but local cache has data
-    // (fresh install, or not-yet-migrated old install) — push local up
-    // to seed it, same "seed from whatever we have" behaviour as before.
-    LicenseCloud.pushMany(licenses);
+    localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+    LicenseCloud.lastError = null; LicenseCloud.lastErrorExpected = false;
+    return { state: true, message: "☁️ " + licenseIndexKeys.length + " hotel(s) cloud se sync ho gaye" };
+  } catch (e) {
+    LicenseCloud.lastError = e.message; LicenseCloud.lastErrorExpected = false;
+    return isDeniedError(e)
+      ? { state: "rules", message: "⚠️ Firebase ne permission deny kiya — nayi firestore.rules publish karo. (" + e.message + ")" }
+      : { state: false, message: "⚠️ Cloud sync fail: " + e.message };
+  }
+}
+
+// One entry point for login, the Sync button and vault switches.
+async function syncLicensesNow(showSuccess) {
+  const r = await hydrateLicensesFromCloud();
+  if (r.state === true) backfillLicenseFields();
+  renderDashboard();
+  if (typeof renderVaultCard === "function") renderVaultCard();
+  updateSyncIndicator(r.state);
+  if (r.state !== true) showMsg(r.message, "error");
+  else if (showSuccess) showMsg(r.message, "success");
+  return r;
+}
+
+function renderVaultCard() {
+  const card = document.getElementById("vaultCard");
+  if (!card) return;
+  const v = adminVaultId();
+  const backedUp = localStorage.getItem("ab_billing_vault_backedup") === v;
+  card.style.display = backedUp ? "none" : "block";
+  document.getElementById("vaultCardId").textContent = v;
+}
+function copyAdminVault() {
+  const v = adminVaultId();
+  (navigator.clipboard ? navigator.clipboard.writeText(v) : Promise.reject())
+    .then(() => showMsg("📋 Vault ID copy ho gaya — kahin surakshit save kar lo", "success"))
+    .catch(() => prompt("Vault ID copy karo:", v));
+}
+function confirmAdminVaultBackedUp() {
+  localStorage.setItem("ab_billing_vault_backedup", adminVaultId());
+  renderVaultCard();
+  if (typeof billingRenderVaultBanner === "function" && document.getElementById("blVaultBanner")) billingRenderVaultBanner();
+  showMsg("✅ Theek hai — Vault ID yaad se sambhal ke rakhna", "success");
+}
+// Switch this device to an existing vault (from another device). The
+// licenses this device already had are merged into that vault's index
+// (create-only), so nothing made here is lost by switching.
+async function useAdminVault(raw) {
+  const v = String(raw || "").trim().toUpperCase().replace(/\s/g, "");
+  if (!/^V[A-Z0-9]{23}$/.test(v)) return { ok: false, message: "⚠️ Vault ID galat hai (V se shuru, 24 characters)" };
+  if (v === adminVaultId()) return { ok: true, same: true, message: "Yahi vault already use ho raha hai" };
+  localStorage.setItem("ab_billing_vault", v);
+  // Pasting it here means it's already written down somewhere.
+  localStorage.setItem("ab_billing_vault_backedup", v);
+  const r = await syncLicensesNow(true);
+  return { ok: r.state === true, message: r.message };
+}
+async function useAdminVaultFromDashboard() {
+  const input = document.getElementById("vaultPasteInput");
+  let pendingInvoices = [];
+  try { pendingInvoices = JSON.parse(localStorage.getItem("ab_billing_invoices") || "[]"); } catch (e) {}
+  if (pendingInvoices.length && !confirm("Is device ke " + pendingInvoices.length + " invoice(s) bhi naye vault mein jud jaayenge. Continue?")) return;
+  const r = await useAdminVault(input.value);
+  if (!r.ok && !r.same) { showMsg(r.message, "error"); return; }
+  input.value = "";
+  if (r.same) showMsg(r.message, "success");
+  // Billing shares this vault — reload it if the tab was already opened.
+  if (typeof blInited !== "undefined" && blInited && typeof billingSyncCloud === "function") {
+    document.getElementById("blVaultId").textContent = adminVaultId();
+    billingRenderVaultBanner();
+    billingSyncCloud(false);
   }
 }
 
 async function loadMoreLicenses() {
   if (!licensesHasMore) return;
-  const page = await LicenseCloud.pullPage(200, licensesLastDoc);
-  licenses = [...licenses, ...page.list];
-  licensesHasMore = page.hasMore;
-  licensesLastDoc = page.lastDoc;
-  localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
-  renderDashboard();
+  const next = licenseIndexKeys.slice(licensesPageEnd, licensesPageEnd + LICENSE_PAGE);
+  try {
+    const { found } = await fetchLicenseDocs(next);
+    const have = new Set(licenses.map(l => String(l.key || "").toUpperCase()));
+    licenses = [...licenses, ...found.filter(l => !have.has(String(l.key || "").toUpperCase()))];
+    licensesPageEnd += next.length;
+    licensesHasMore = licenseIndexKeys.length > licensesPageEnd;
+    localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+    renderDashboard();
+  } catch (e) {
+    showMsg("⚠️ Aur hotels load nahi ho paaye: " + e.message, "error");
+  }
 }
 
 // Instant lookup by exact key — works regardless of how many hotels
@@ -737,6 +984,7 @@ async function findLicenseByKey(rawKey) {
   const key = (rawKey || "").trim().toUpperCase();
   if (!key) return null;
   let found = await LicenseCloud.pullByKey(key);
+  let fromOldArray = false;
   if (!found) {
     // Not in the new per-document collection — check the old array doc
     // too, so "Find" still works for a hotel that hasn't been migrated
@@ -745,12 +993,19 @@ async function findLicenseByKey(rawKey) {
       const snap = await window._db.collection("admin").doc("licenses").get();
       const oldList = snap.exists ? (snap.data().list || []) : [];
       found = oldList.find(l => (l.key || "").toUpperCase() === key) || null;
+      fromOldArray = !!found;
     } catch (e) { /* leave found as null */ }
   }
   if (found) {
     const idx = licenses.findIndex(l => (l.key || "").toUpperCase() === key);
     if (idx >= 0) licenses[idx] = found; else licenses.unshift(found);
+    if (!licenseIndexKeys.includes(key)) { licenseIndexKeys.unshift(key); licensesPageEnd++; }
+    localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
     renderDashboard();
+    // Remember it in the vault so every device sees it from now on. A
+    // legacy-only hotel also gets its own document (create-only).
+    if (fromOldArray) LicenseCloud.pushMany([found], { createOnly: true });
+    else LicenseIndex.add([key]);
   }
   return found;
 }
@@ -764,12 +1019,14 @@ async function findLicenseByKey(rawKey) {
 // Left unspecified for the bulk first-run seed / legacy-field-backfill
 // paths below, where more than one entry can genuinely change at once
 // and writing the full in-memory list is correct, not wasteful.
-function saveLicenses(changedKeys) {
+// fields (optional): write only these fields for the changed key(s) —
+// see pushMany's opts.fields for why that matters across devices.
+function saveLicenses(changedKeys, fields) {
   localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
   if (changedKeys) {
     const keys = new Set((Array.isArray(changedKeys) ? changedKeys : [changedKeys]).map(k => (k || "").toUpperCase()));
     const toWrite = licenses.filter(l => keys.has((l.key || "").toUpperCase()));
-    LicenseCloud.pushMany(toWrite);
+    LicenseCloud.pushMany(toWrite, fields ? { fields } : undefined);
   } else {
     LicenseCloud.pushMany(licenses); // fire-and-forget cloud backup, one doc per license
   }
@@ -796,17 +1053,10 @@ function doLogin() {
       adminPass = p;
       document.getElementById("loginPage").style.display = "none";
       document.getElementById("app").style.display = "block";
-      initDefaultLicenses();
+      // Instant first paint from this device's cache (no writes), then
+      // replace it with the live cloud list.
       renderDashboard();
-      // Pull latest licenses from cloud (other devices may have added/revoked) then re-render
-      hydrateLicensesFromCloud().then(() => {
-        initDefaultLicenses();
-        renderDashboard();
-        updateSyncIndicator(LicenseCloud.lastError ? (LicenseCloud.lastErrorExpected ? "denied" : false) : true);
-        if (LicenseCloud.lastError && !LicenseCloud.lastErrorExpected) {
-          showMsg("⚠️ Cloud sync issue: " + LicenseCloud.lastError + " — licenses generated here may not reach the scan server!", "error");
-        }
-      });
+      syncLicensesNow(false);
     } else {
       const rem = AdminBrute.fail(attempts);
       document.getElementById("loginErr").style.display = "block";
@@ -975,7 +1225,7 @@ function saveEditHotel() {
   if (planChanged) {
     l.features = [...(PLAN_DEFAULT_FEATURES[newPlan] || [])];
   }
-  saveLicenses(l.key);
+  saveLicenses(l.key, ["owner", "phone", "plan", "expiry", "active"].concat(planChanged ? ["features"] : []));
   renderDashboard();
   closeEditHotelModal();
   const planLabels = { TRIAL: "Trial", BASIC: "Basic ₹499/mo", PRO: "Pro ₹999/mo", PREM: "Premium ₹1499/mo" };
@@ -1036,7 +1286,7 @@ function saveFeatureControl() {
   if (!l) return;
   const checked = [...document.querySelectorAll('#featureList input[type=checkbox]:checked')].map(cb => cb.dataset.feat);
   l.features = checked;
-  saveLicenses(l.key);
+  saveLicenses(l.key, ["features"]);
   renderDashboard();
   closeFeatureModal();
   showMsg("✅ Features updated for " + (l.hotel || l.key) + " (" + checked.length + " enabled)", "success");
@@ -1182,12 +1432,12 @@ function generateInvoiceForLicense(i) {
 function revokeKey(i) {
   if (!confirm("Revoke key " + licenses[i].key + "? Customer ka access band ho jayega.")) return;
   licenses[i].active = false;
-  saveLicenses(licenses[i].key); renderDashboard();
+  saveLicenses(licenses[i].key, ["active"]); renderDashboard();
   showMsg("🔴 Key revoked: " + licenses[i].key, "error");
 }
 function restoreKey(i) {
   licenses[i].active = true;
-  saveLicenses(licenses[i].key); renderDashboard();
+  saveLicenses(licenses[i].key, ["active"]); renderDashboard();
   showMsg("✅ Key restored: " + licenses[i].key, "success");
 }
 
@@ -1935,6 +2185,8 @@ function billingConfirmVaultBackedUp() {
   // than staying silently dismissed forever.
   localStorage.setItem("ab_billing_vault_backedup", Billing.vault());
   document.getElementById("blVaultBanner").style.display = "none";
+  // Same vault, same flag — the Dashboard's vault card must hide too.
+  if (typeof renderVaultCard === "function") renderVaultCard();
   blMsg("✅ Theek hai — ab yaad rakhna isko kahin likh ke rakha hai", "success");
 }
 
@@ -2431,12 +2683,9 @@ async function billingUseVault() {
   if (!/^V[A-Z0-9]{23}$/.test(v)) { blMsg("⚠️ Vault ID galat hai (V se shuru, 24 characters)", "error"); return; }
   if (v === Billing.vault()) { blMsg("Yahi vault already use ho raha hai", "success"); return; }
   if (Billing.invoices.length && !confirm("Is device ke invoices naye vault mein bhi upload ho jaayenge. Continue?")) return;
-  localStorage.setItem("ab_billing_vault", v);
-  // Typing/pasting a specific vault ID in here is itself evidence the
-  // admin already has a record of it somewhere (that's how they got it
-  // to paste) — so, unlike a freshly auto-generated vault, this one
-  // doesn't need the "go save this" reminder repeated at them.
-  localStorage.setItem("ab_billing_vault_backedup", v);
+  // Same vault drives the hotel license list too — switch both together
+  // (useAdminVault also marks it as backed up and re-syncs licenses).
+  await useAdminVault(v);
   document.getElementById("blVaultId").textContent = v;
   document.getElementById("blVaultInput").value = "";
   billingRenderVaultBanner();
