@@ -10895,7 +10895,6 @@ function App() {
     let unsubBk = () => {};
     let unsubProfile = () => {};
     let unsubPerms = () => {};
-    let unsubBookingRequests = () => {};
     let cancelled = false;
     let pollTimer = null;
 
@@ -10960,7 +10959,20 @@ function App() {
       setTimeout(() => {
         if (cancelled) return;
         unsubProfile = WS.onSnapshot("profile", data => {
-          if (data) setProfile(p => ({ ...p, ...data }));
+          if (!data) return;
+          setProfile(p => ({ ...p, ...data }));
+          // BUG FIX (2026-09): this listener used to update ONLY React state.
+          // The booking-requests listener and handleRequestDecision below both
+          // read localStorage.publicBookingToken directly (not React state) —
+          // so a SECOND device, which never generated the link itself and only
+          // ever received it through this cloud listener, had the token in
+          // `profile` but an empty localStorage key forever, silently missing
+          // every new booking-request notification and failing to save
+          // approve/decline decisions. Persisting it here (same key saveProfile
+          // already uses) keeps every device's localStorage copy correct too.
+          if (typeof data.publicBookingToken === "string") {
+            try { localStorage.setItem("publicBookingToken", data.publicBookingToken); } catch {}
+          }
         });
       }, 600);
       // Access-control permissions need a live listener too. Without one,
@@ -10975,33 +10987,9 @@ function App() {
           if (data) setPermissions(data);
         });
       }, 900);
-      // Booking requests (from the public direct-booking link) live in
-      // the token-scoped `public_booking/{token}/requests` subcollection,
-      // NOT under this hotel's own data tree — see PublicBookingPage for
-      // why that separation exists (the public link must not be able to
-      // reach anything the license key protects). So this listener is set
-      // up separately from the WS helpers, which are all hardwired to
-      // hotels/{licenseKey}/data/*.
-      //
-      // Only registered when the hotel actually has a public token —
-      // hotels that never created a booking link do no extra reads.
-      setTimeout(() => {
-        if (cancelled) return;
-        const tok = (localStorage.getItem("publicBookingToken") || "").trim();
-        if (!tok || !window._db) return;
-        try {
-          unsubBookingRequests = window._db.collection("public_booking").doc(tok)
-            .collection("requests").onSnapshot(snap => {
-              const list = [];
-              snap.forEach(d => list.push(d.data()));
-              // Newest first, so the Dashboard shows the most recent
-              // enquiries at the top of the pending queue.
-              list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-              setBookingRequests(list);
-              try { localStorage.setItem("ab_bookingRequests", JSON.stringify(list)); } catch {}
-            }, err => console.warn("Booking requests listener:", err.message));
-        } catch (e) { console.warn("Booking requests listener setup:", e.message); }
-      }, 1200);
+      // Booking requests listener moved to its own effect below, keyed on
+      // profile.publicBookingToken — see that effect's comment for why a
+      // one-time, mount-only subscription here missed a second device.
       // Connection state monitor
       window._db.enableNetwork().then(() => setSyncErr(false)).catch(() => setSyncErr(true));
     };
@@ -11061,9 +11049,46 @@ function App() {
       unsubBk();
       unsubProfile();
       unsubPerms();
-      unsubBookingRequests();
     };
   }, []);
+
+  // Booking requests (from the public direct-booking link) live in the
+  // token-scoped `public_booking/{token}/requests` subcollection, NOT
+  // under this hotel's own data tree — see PublicBookingPage for why that
+  // separation exists (the public link must not be able to reach anything
+  // the license key protects). So this listener is set up separately from
+  // the WS helpers, which are all hardwired to hotels/{licenseKey}/data/*.
+  //
+  // BUG FIX (2026-09): this used to be a ONE-TIME subscription inside the
+  // mount-only effect above, reading localStorage.publicBookingToken at
+  // that single moment. On the device that generated the link, the token
+  // was already in localStorage by then, so it worked. On a SECOND device
+  // logged in with the same license key, the token only ever arrives later
+  // via the cloud profile sync — so the one-time read saw an empty string,
+  // never subscribed, and no amount of later syncing fixed it because the
+  // effect never ran again. Keying this effect on `profile.publicBookingToken`
+  // (React state, kept current by the profile listener above) makes it
+  // (re)subscribe the moment the token becomes known on ANY device,
+  // including one where it arrives seconds after login rather than at
+  // mount. Also runs again correctly if the token itself is ever rotated.
+  useEffect(() => {
+    const tok = (profile?.publicBookingToken || "").trim();
+    if (!tok || !window._db) { setBookingRequests([]); return; }
+    let unsub = () => {};
+    try {
+      unsub = window._db.collection("public_booking").doc(tok)
+        .collection("requests").onSnapshot(snap => {
+          const list = [];
+          snap.forEach(d => list.push(d.data()));
+          // Newest first, so the Dashboard shows the most recent
+          // enquiries at the top of the pending queue.
+          list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+          setBookingRequests(list);
+          try { localStorage.setItem("ab_bookingRequests", JSON.stringify(list)); } catch {}
+        }, err => console.warn("Booking requests listener:", err.message));
+    } catch (e) { console.warn("Booking requests listener setup:", e.message); }
+    return () => unsub();
+  }, [profile?.publicBookingToken]);
 
   // Strips everything that must NEVER leave this device before syncing to
   // Firestore: raw Aadhaar/ID numbers (masked instead) and all photos
@@ -11433,7 +11458,11 @@ function App() {
     // public page created the request), updating only that ONE request's
     // document — not a whole-array rewrite, so two staff members acting
     // on two different requests can't clobber each other's decision.
-    const tok = (localStorage.getItem("publicBookingToken") || "").trim();
+    // Reads from React state (kept current on every device by the profile
+    // listener), not localStorage directly — see the booking-requests
+    // listener effect's comment for why a device that never generated the
+    // link locally could otherwise have an empty localStorage copy.
+    const tok = (profile?.publicBookingToken || localStorage.getItem("publicBookingToken") || "").trim();
     if (tok && window._db) {
       try {
         await window._db.collection("public_booking").doc(tok)

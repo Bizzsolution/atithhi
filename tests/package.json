@@ -2,7 +2,7 @@
   "name": "atithibook-security-tests",
   "private": true,
   "scripts": {
-    "test": "node functions_test.mjs && node admin_login_security_test.js && node license_expiry_client_test.js && node flow_test.js && node billing_regression.js",
+    "test": "node functions_test.mjs && node admin_login_security_test.js && node license_expiry_client_test.js && node booking_notify_second_device_test.js && node flow_test.js && node billing_regression.js",
     "test:rules": "firebase emulators:exec --only firestore --project atithibook-saas \"node firestore.rules.test.mjs\""
   },
   "devDependencies": {

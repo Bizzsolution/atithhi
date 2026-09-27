@@ -9,6 +9,7 @@
 | `tests/functions_test.mjs` (Netlify functions, real RSA keys, fake Google APIs enforcing hardened rules) | 3 pass / **17 fail** | **36 / 36** |
 | `tests/admin_login_security_test.js` (admin.html in jsdom) | 4 pass / **9 fail** | **13 / 13** |
 | `tests/license_expiry_client_test.js` (index.html license check) | 0 pass / **5 fail** | **5 / 5** |
+| `tests/booking_notify_second_device_test.js` (index.html — 2nd-device booking notifications, found during this audit's own multi-device testing) | 2 pass / **6 fail** | **8 / 8** |
 | `tests/flow_test.js` + `tests/billing_regression.js` (no-regression: vault sync, migrate, billing) | — | **42 / 42** |
 | `tests/firestore.rules.test.mjs` (real rules engine via emulator) | written; **not executable in the audit sandbox** (emulator download blocked) — run locally, see bottom | — |
 
@@ -165,6 +166,21 @@
 - **Staff passwords:** SHA-256 with a static salt (`|AtithiSalt2024!`) — fast hash; anyone with the key can read hashes and crack short PINs offline. Since the key already grants the data, impact is low today; after AD-1, move to PBKDF2 (WebCrypto, ≥ 210 000 iterations, per-user salt).
 - **Admin "Reset Hotel Staff Password"** writes to the admin device's own `localStorage`, which the hotel app never reads — the feature does nothing and sends the new password over WhatsApp. Replace with a server-side reset once AD-1 exists.
 - **CSP `script-src 'unsafe-inline'`** is required by the single-file architecture; mitigated by consistent output escaping (`escHtml`/`blEsc` reviewed — no unescaped sinks found in invoice/booking templates). Long-term: move scripts to external files and use hashes/nonces.
+
+---
+
+## Bug fix found during this audit's own multi-device testing — 2nd device never got booking-request notifications
+
+Not a security hole (both devices already had legitimate access to the same hotel), but reported by the owner while re-testing after this audit and root-caused/fixed in the same pass, so it is recorded here rather than opened separately.
+
+1. **Mechanics** (`index.html`) — the booking-requests real-time listener and `handleRequestDecision` both read `localStorage.getItem("publicBookingToken")` directly. That key is written only by `saveProfile()`, called on the device that **generates** the public booking link. The cloud `profile` listener (`WS.onSnapshot("profile", ...)`) only ever called `setProfile(...)` — React state — never `localStorage.setItem`. The listener subscription itself lived inside a mount-only `useEffect(..., [])`, reading that (empty) localStorage value exactly once.
+2. **Impact** — a second device logged in with the same license key had the token correctly displayed in the UI (React state was fine) but its `localStorage` copy stayed empty forever, since it never generated the link itself. Its booking-requests listener never subscribed, so new enquiries from the public link never appeared — and if staff on that device tried to approve/decline a request they'd seen some other way, `handleRequestDecision` also read the empty localStorage key and silently failed to write the decision back.
+3. **Patch:**
+   - Profile listener now also persists `publicBookingToken` to `localStorage` (same key `saveProfile` already uses), so every device's local copy converges with the cloud value.
+   - The booking-requests subscription moved out of the mount-only effect into its own `useEffect(..., [profile?.publicBookingToken])` — it (re)subscribes the moment the token becomes known via React state, on any device, rather than only at the exact millisecond of mount.
+   - `handleRequestDecision` now reads `profile?.publicBookingToken` (React state) with the old localStorage read kept only as a fallback.
+4. **Invariant** — *A value the UI already displays correctly must come from the same source of truth every code path reads.* Two independent copies of the same fact (React state vs. localStorage) drift the moment only one of them is updated.
+5. **Tests** — `tests/booking_notify_second_device_test.js`: static checks that the profile listener persists the token, that the subscription is no longer inside the `[]` effect, and that it now lives in an effect keyed on `profile?.publicBookingToken`; behavioral simulation of "device A" (generated the link, already had it in localStorage) and "device B" (only ever received it via cloud sync) — pre-audit code: 2/8 pass (device B never subscribes); patched: 8/8.
 
 ---
 
