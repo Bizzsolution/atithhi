@@ -360,6 +360,16 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 
     <!-- ═══ TAB: SETTINGS ═══ -->
     <div class="tabpanel" id="panel-settings">
+      <!-- Admin Vault ID — ALWAYS visible here (unlike the Dashboard/Billing
+           reminder cards, which auto-hide once "backed up" is confirmed).
+           This is the one permanent place to look up your ID later. -->
+      <div class="section" style="border:1px solid #1d4ed8">
+        <div class="section-title">🔐 Your Admin Vault ID</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.6;margin-bottom:10px">Yeh ID aapki poori hotel list aur invoices ko cloud se jodti hai. Naye device/incognito pe isi ID ko "Dashboard → Vault paste box" mein daalo taaki poori list wahan bhi aa jaaye.</div>
+        <div id="settingsVaultId" class="netlify-box" style="margin:0 0 10px"></div>
+        <button class="btn btn-outline" style="width:auto" onclick="copyAdminVault()">📋 Copy Vault ID</button>
+      </div>
+
       <!-- API Key Status -->
       <div class="section">
         <div class="section-title">🔌 API Key Status</div>
@@ -512,6 +522,7 @@ function switchTab(name){
     document.getElementById("panel-"+t).classList.toggle("active", t===name);
   });
   if (name === "billing" && typeof billingInit === "function") billingInit();
+  if (name === "settings" && typeof renderSettingsVaultId === "function") renderSettingsVaultId();
 }
 
 // ── SECURITY: Brute-force lockout for admin login ──
@@ -917,6 +928,13 @@ function renderVaultCard() {
   const backedUp = localStorage.getItem("ab_billing_vault_backedup") === v;
   card.style.display = backedUp ? "none" : "block";
   document.getElementById("vaultCardId").textContent = v;
+  renderSettingsVaultId();
+}
+// Unlike vaultCard (which hides once backed up), this box in Settings is
+// always visible — the one permanent place to look up the Vault ID later.
+function renderSettingsVaultId() {
+  const el = document.getElementById("settingsVaultId");
+  if (el) el.textContent = adminVaultId();
 }
 function copyAdminVault() {
   const v = adminVaultId();
