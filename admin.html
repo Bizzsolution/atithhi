@@ -1979,6 +1979,16 @@ function blCompute(draft, s) {
 }
 
 // ── invoice document (self-contained HTML, A4 width 794px) ───────
+// NOTE: this template deliberately does NOT print the hotel's License Key
+// anywhere on the customer-facing invoice (PDF, print, share text). The
+// license key is that hotel's access secret — see SECURITY_AUDIT.md AD-1:
+// knowing it alone is currently enough to read/write that hotel's guest
+// data — so it must never leave the admin panel over WhatsApp/email/print
+// as part of a bill. `c.key`/`client.key` still appears in purely INTERNAL
+// admin surfaces (the client picker dropdown, the register search box, the
+// GST CSV export for bookkeeping) — those are fine, they never reach the
+// customer. If you ever add a new field to this invoice template, don't
+// reintroduce `c.key` here.
 function blInvoiceHTML(inv, opts) {
   opts = opts || {};
   const s = inv.seller, c = inv.client, t = inv.totals, e = blEsc;
@@ -2118,7 +2128,6 @@ function blInvoiceHTML(inv, opts) {
     <div class="card"><div class="lbl">SUBSCRIPTION</div>
       <div class="nm">${e(s.productName || "AtithiBook")}</div>
       ${inv.plan ? `<div><b>Plan:</b> ${e(BL_PLAN_LABELS[inv.plan] || inv.plan)}</div>` : ""}
-      ${c.key ? `<div><b>License Key:</b> ${e(c.key)}</div>` : ""}
       ${t.items[0] && t.items[0].period ? `<div><b>Period:</b> ${e(t.items[0].period)}</div>` : ""}
     </div>
   </div>
