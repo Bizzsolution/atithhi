@@ -486,6 +486,12 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
           1. Key ke saamne "Revoke" button dabao<br/>
           2. VALID_LICENSES copy karo → Netlify → Update → Deploy<br/>
           3. Customer ka app automatically block ho jayega<br/><br/>
+          <b style="color:#f8fafc">Kisi Hotel Ka Cloud Data Dekhna / Edit / Export / Delete:</b><br/>
+          1. License card mein "🗂️ Data" button dabao — us hotel ke saare documents (rooms, bookings, archives, staff, profile...) dikhenge<br/>
+          2. "Open / Edit" se record search karke edit/delete karo — galti ho to "↩️ Undo"<br/>
+          3. "⬇️ Full Backup" (JSON) ya "📊 Guest Register" (CSV/Excel) download karo<br/>
+          4. Hotel band ho gaya ho to "🗑️ Delete ALL Data" — pehle backup apne-aap download hota hai, license key type karke confirm karna padta hai<br/>
+          5. Galti se delete hua? Usi backup file ko "♻️ Restore from Backup" se wapas daalo<br/><br/>
           <b style="color:#f8fafc">Customer ko App kaise use karna hai:</b><br/>
           URL: <span style="color:#60a5fa">https://atithhi.netlify.app</span><br/>
           License Key: Jo aapne generate ki<br/>
@@ -1197,6 +1203,7 @@ function renderDashboard() {
           <button class="btn btn-copy" onclick="copyKey(${i})">📋</button>
           <button class="btn" style="background:#1e293b;color:#93c5fd" onclick="openEditHotelModal(${i})">✏️ Edit</button>
           <button class="btn" style="background:#3730a3;color:#c7d2fe" onclick="openFeatureControl(${i})">🎛️ Features</button>
+          <button class="btn" style="background:#134e4a;color:#5eead4" onclick="openDataManager(${i})">🗂️ Data</button>
           ${l.plan !== "TRIAL" ? `<button class="btn" style="background:#78350f;color:#fcd34d" onclick="generateInvoiceForLicense(${i})">🧾 Invoice</button>` : ''}
           ${l.active
             ? `<button class="btn btn-danger" onclick="revokeKey(${i})">Revoke</button>`
@@ -2754,5 +2761,791 @@ async function billingUseVault() {
 }
 
 </script>
+<!-- ═══════════════════════════════════════════════════════════════════
+     HOTEL DATA MANAGER — view / edit / export / delete one client's
+     Firestore data (hotels/{KEY}/**, plus its public booking page).
+     Opened from a license card → "🗂️ Data". Requires the authenticated
+     admin session (isAdmin() in firestore.rules): list + delete on a
+     hotel's data are granted ONLY to that identity.
+
+     Safety rails (all enforced in code below):
+       • Every write re-reads the document from the server first and
+         refuses if the hotel changed it since you opened it (no silent
+         overwrite of a check-in that happened a second ago).
+       • Every edit/delete is undoable for the rest of this session
+         (↩️ Undo keeps the previous version in memory).
+       • Deleting a document auto-downloads its JSON backup first.
+       • "Delete ALL data" downloads a full backup, then requires typing
+         the license key exactly, and (by default) revokes the license —
+         otherwise the hotel's own device would simply re-upload its
+         local copy on the next save.
+       • Document ids are never interpolated into HTML/onclick (they are
+         hotel-writable strings) — everything is referenced by index and
+         all text goes through escHtml().
+     ═══════════════════════════════════════════════════════════════════ -->
+<style>
+.dm-ov{position:fixed;inset:0;background:rgba(2,6,23,.86);z-index:250;display:none;overflow-y:auto}
+.dm-ov.open{display:block}
+.dm-box{max-width:920px;margin:24px auto;background:#111a2b;border:1px solid #263248;border-radius:18px;padding:18px 18px 22px;box-shadow:0 24px 70px rgba(0,0,0,.55)}
+@media(max-width:640px){.dm-box{margin:0;border-radius:0;min-height:100vh;padding:14px}}
+.dm-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:4px}
+.dm-title{font-size:17px;font-weight:800;color:#f8fafc}
+.dm-sub{font-size:12px;color:#64748b;margin-top:2px;word-break:break-all}
+.dm-x{background:none;border:none;color:#94a3b8;font-size:26px;cursor:pointer;line-height:1;padding:2px 6px}
+.dm-bar{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 10px}
+.dm-b{padding:8px 12px;border:none;border-radius:9px;font-weight:700;font-size:12.5px;cursor:pointer;background:#1e293b;color:#e2e8f0;display:inline-flex;align-items:center;gap:5px}
+.dm-b:hover{filter:brightness(1.15)}
+.dm-b:disabled{opacity:.45;cursor:not-allowed;filter:none}
+.dm-b.pri{background:#2563eb;color:#fff}.dm-b.grn{background:#15803d;color:#fff}
+.dm-b.red{background:#7f1d1d;color:#fecaca}.dm-b.amb{background:#78350f;color:#fde68a}
+.dm-b.sm{padding:6px 9px;font-size:11.5px}
+.dm-note{font-size:12px;line-height:1.55;color:#94a3b8;background:#0b1220;border:1px solid #1e2c48;border-radius:10px;padding:9px 11px;margin-bottom:10px}
+.dm-note.warn{color:#fde68a;background:#2a1a05;border-color:#78350f}
+.dm-note.err{color:#fecaca;background:#2a0e0e;border-color:#7f1d1d}
+.dm-msg{display:none;font-size:13px;border-radius:10px;padding:9px 12px;margin-bottom:10px}
+.dm-msg.ok{display:block;background:#052e16;color:#4ade80;border:1px solid #14532d}
+.dm-msg.bad{display:block;background:#3f1d1d;color:#fca5a5;border:1px solid #7f1d1d}
+.dm-msg.inf{display:block;background:#0c1d3a;color:#93c5fd;border:1px solid #1e3a8a}
+.dm-row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 13px;background:#0f1830;border:1px solid #1e2c48;border-radius:12px;margin-bottom:8px}
+.dm-row:hover{border-color:#2d4470}
+.dm-id{font-family:'SF Mono',ui-monospace,monospace;font-size:13px;color:#60a5fa;font-weight:700;word-break:break-all}
+.dm-lbl{font-size:12px;color:#cbd5e1;margin-top:2px}
+.dm-meta{font-size:11px;color:#64748b;margin-top:3px}
+.dm-meta b{color:#94a3b8;font-weight:700}
+.dm-acts{display:flex;gap:5px;flex-wrap:wrap}
+.dm-pill{display:inline-block;font-size:10px;font-weight:800;padding:2px 7px;border-radius:999px;margin-left:6px;vertical-align:middle}
+.dm-pill.big{background:#422006;color:#fbbf24}.dm-pill.huge{background:#450a0a;color:#f87171}
+.dm-rec{padding:9px 12px;background:#0b1220;border:1px solid #1e2c48;border-radius:10px;margin-bottom:6px;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.dm-rec-t{font-size:13px;font-weight:700;color:#e2e8f0}
+.dm-rec-s{font-size:11px;color:#64748b;margin-top:2px}
+.dm-ta{width:100%;min-height:340px;font-family:'SF Mono',ui-monospace,monospace;font-size:12px;line-height:1.5;background:#060b16;color:#e2e8f0;border:1.5px solid #263248;border-radius:10px;padding:10px;resize:vertical;white-space:pre;tab-size:2}
+.dm-in{margin-bottom:0}
+.dm-busy{display:none;font-size:12.5px;color:#93c5fd;margin:6px 0 10px}
+.dm-busy.on{display:block}
+.dm-sec{font-size:11px;font-weight:800;color:#64748b;text-transform:uppercase;letter-spacing:.6px;margin:16px 0 8px}
+</style>
+
+<!-- Main data manager -->
+<div class="dm-ov" id="dmModal" role="dialog" aria-modal="true" aria-labelledby="dmTitle">
+  <div class="dm-box">
+    <div class="dm-head">
+      <div>
+        <div class="dm-title" id="dmTitle">🗂️ Hotel Data</div>
+        <div class="dm-sub" id="dmSub"></div>
+      </div>
+      <button class="dm-x" onclick="dmClose()" aria-label="Close">×</button>
+    </div>
+    <div class="dm-bar" id="dmBar">
+      <button class="dm-b" onclick="dmRefresh()">🔄 Refresh</button>
+      <button class="dm-b pri" onclick="dmExportFull()">⬇️ Full Backup (JSON)</button>
+      <button class="dm-b grn" onclick="dmExportRegister()">📊 Guest Register (CSV)</button>
+      <button class="dm-b" onclick="document.getElementById('dmRestoreFile').click()">♻️ Restore from Backup</button>
+      <button class="dm-b amb" id="dmUndoBtn" onclick="dmUndo()" disabled>↩️ Undo</button>
+      <button class="dm-b red" style="margin-left:auto" onclick="dmOpenDeleteAll()">🗑️ Delete ALL Data</button>
+      <input type="file" id="dmRestoreFile" accept="application/json,.json" style="display:none" onchange="dmRestoreFromFile(this)"/>
+    </div>
+    <div class="dm-msg" id="dmMsg"></div>
+    <div class="dm-busy" id="dmBusy"></div>
+    <div id="dmBody"></div>
+  </div>
+</div>
+
+<!-- JSON editor (record or whole document) -->
+<div class="dm-ov" id="dmEditor" style="z-index:260" role="dialog" aria-modal="true" aria-labelledby="dmEdTitle">
+  <div class="dm-box" style="max-width:760px">
+    <div class="dm-head">
+      <div>
+        <div class="dm-title" id="dmEdTitle">✏️ Edit</div>
+        <div class="dm-sub" id="dmEdSub"></div>
+      </div>
+      <button class="dm-x" onclick="dmCloseEditor()" aria-label="Close">×</button>
+    </div>
+    <div class="dm-note" style="margin-top:10px">JSON format me edit karo. Save se pehle format check hoga, aur server pe dobara check hoga ki hotel ne is beech yeh data badla to nahi. Galti ho jaaye to <b>↩️ Undo</b> se wapas le sakte ho.</div>
+    <textarea class="dm-ta" id="dmEdText" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+    <div class="dm-msg" id="dmEdErr" style="margin-top:8px"></div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="dm-b" onclick="dmFormatEditor()">{ } Format</button>
+      <button class="dm-b" style="margin-left:auto" onclick="dmCloseEditor()">Cancel</button>
+      <button class="dm-b grn" id="dmEdSave" onclick="dmSaveEditor()">💾 Save to Cloud</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete ALL confirmation -->
+<div class="dm-ov" id="dmDelAll" style="z-index:270" role="dialog" aria-modal="true" aria-labelledby="dmDaTitle">
+  <div class="dm-box" style="max-width:520px">
+    <div class="dm-head">
+      <div class="dm-title" id="dmDaTitle" style="color:#fca5a5">🗑️ Is hotel ka SARA cloud data delete karo?</div>
+      <button class="dm-x" onclick="dmCloseDeleteAll()" aria-label="Close">×</button>
+    </div>
+    <div id="dmDaInfo" class="dm-note err" style="margin-top:12px"></div>
+    <div class="dm-note warn">⚖️ Guest register (C-Form / police record) kanoonan kuch saal rakhna pad sakta hai. Delete se pehle <b>poora backup apne-aap download hoga</b> — usko surakshit rakhna. Yeh delete wapas nahi hota (sirf us backup file se ♻️ Restore ho sakta hai).</div>
+    <label class="bl-check" style="margin:12px 0;align-items:flex-start"><input type="checkbox" id="dmDaRevoke" checked style="margin-top:3px"/><span>License bhi <b>revoke</b> karo (recommended — warna hotel ka device apni local copy agli save pe dobara upload kar dega)</span></label>
+    <label class="bl-lbl" for="dmDaConfirm">Confirm karne ke liye license key type karo: <span id="dmDaKey" style="color:#fca5a5;font-family:monospace;text-transform:none"></span></label>
+    <input id="dmDaConfirm" autocomplete="off" autocapitalize="characters" spellcheck="false" oninput="dmDeleteAllCheck()" placeholder="ATITHI-..."/>
+    <div style="display:flex;gap:8px">
+      <button class="dm-b" style="flex:1;justify-content:center;padding:12px" onclick="dmCloseDeleteAll()">Cancel</button>
+      <button class="dm-b red" id="dmDaGo" style="flex:2;justify-content:center;padding:12px" onclick="dmDeleteAllRun()" disabled>🗑️ Backup lo &amp; Delete karo</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  HOTEL DATA MANAGER (admin) — see the comment block above the markup
+// ═══════════════════════════════════════════════════════════════════
+const DM_MAX_DOC_BYTES = 1000000;      // Firestore hard limit is 1 MiB per doc; keep headroom
+const DM_BIG_DOC_BYTES = 700000;       // warn when a doc is approaching the limit
+const DM_ID_RE = /^[A-Za-z0-9_-]{1,120}$/; // safe Firestore doc id (no '/', no dots-only)
+const DM_PAGE = 100;
+// Documents whose loss would really hurt — deleting these needs a typed "DELETE".
+const DM_CRITICAL = /^(bookings|bookings_archive_\d{4}_\d{2}|rooms|users|profile|creditNotes)$/;
+// Docs the hotel app reacts to LIVE (onSnapshot) vs. only on next app open.
+const DM_LIVE = /^(rooms|bookings|profile|permissions)$/;
+
+const DM = {
+  licIdx: -1, key: "", hotel: "",
+  docs: [],          // [{ id, data, raw, ts, bytes, kind, count }]
+  root: null,        // hotels/{KEY} document data (rarely used)
+  pub: null,         // { token, data, requests: [{id, data}] } — public booking page
+  listMode: "full",  // "full" (rules allow admin list) | "probe" (fallback: known ids)
+  cur: -1,           // index of the doc being viewed, -1 = document list
+  q: "", limit: DM_PAGE,
+  undo: [],          // [{ id, prev (full doc data or null), label }]
+  editor: null,      // { kind: "record"|"raw", docIdx, recIdx }
+  busy: false
+};
+
+// ── small utils ──────────────────────────────────────────────────
+function dmStable(v) {
+  // Key-order-independent JSON, so "did the server copy change?" is a
+  // real content comparison and not an accident of field ordering.
+  if (Array.isArray(v)) return "[" + v.map(dmStable).join(",") + "]";
+  if (v && typeof v === "object") {
+    if (typeof v.toDate === "function" && "seconds" in v) return JSON.stringify({ seconds: v.seconds, nanoseconds: v.nanoseconds });
+    return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + dmStable(v[k])).join(",") + "}";
+  }
+  return JSON.stringify(v === undefined ? null : v);
+}
+function dmBytes(v) { try { return new Blob([JSON.stringify(v)]).size; } catch (e) { return 0; } }
+function dmFmtBytes(n) { return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB"; }
+function dmFmtTime(ts) {
+  if (!ts || typeof ts !== "number") return "—";
+  try { return new Date(ts).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }); } catch (e) { return "—"; }
+}
+function dmToday() { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+function dmKind(v) { return Array.isArray(v) ? "array" : v === null || v === undefined ? "empty" : typeof v === "object" ? "object" : typeof v; }
+const DM_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function dmLabel(id) {
+  const fixed = {
+    rooms: "Rooms — kamron ki list",
+    bookings: "Bookings — live guest register (active + last ~90 din)",
+    users: "Staff users (logins / roles)",
+    audit: "Audit log (kisne kya kiya)",
+    profile: "Hotel profile (naam, address, GSTIN, settings)",
+    permissions: "Role permissions (Manager/Receptionist access)",
+    creditNotes: "Credit notes",
+    cu: "Current logged-in user (session)",
+    authVersion: "Secure sign-in status (device ne verified login kiya)"
+  };
+  if (fixed[id]) return fixed[id];
+  let m = id.match(/^bookings_archive_(\d{4})_(\d{2})$/);
+  if (m) return "Archived bookings — " + (DM_MONTHS[+m[2] - 1] || m[2]) + " " + m[1];
+  m = id.match(/^(inv|cn|dn)Counter_(\d{2}-\d{2})$/i);
+  if (m) return ({ inv: "Invoice", cn: "Credit note", dn: "Debit note" }[m[1].toLowerCase()]) + " number counter — FY 20" + m[2];
+  return "Other document";
+}
+function dmSortKey(id) {
+  const order = ["profile", "rooms", "bookings", "users", "permissions", "creditNotes", "audit", "cu", "authVersion"];
+  const i = order.indexOf(id);
+  if (i >= 0) return "0" + String(i).padStart(2, "0");
+  if (/^bookings_archive_/.test(id)) return "1" + (9999 - +id.slice(17, 21)) + (99 - +id.slice(22, 24)); // newest month first
+  if (/Counter_/.test(id)) return "2" + id;
+  return "3" + id;
+}
+function dmMsg(text, type) {
+  const el = document.getElementById("dmMsg");
+  el.textContent = text || "";
+  el.className = "dm-msg" + (text ? " " + (type || "inf") : "");
+}
+function dmSetBusy(text) {
+  DM.busy = !!text;
+  const el = document.getElementById("dmBusy");
+  el.textContent = text ? "⏳ " + text : "";
+  el.className = "dm-busy" + (text ? " on" : "");
+  document.querySelectorAll("#dmBar .dm-b").forEach(b => { if (b.id !== "dmUndoBtn") b.disabled = !!text; });
+  dmUpdateUndoBtn();
+}
+function dmErrText(e) {
+  const code = e && e.code ? String(e.code) : "";
+  if (code.includes("permission-denied"))
+    return "Firebase ne permission deny kiya. Naye firestore.rules publish karo (Firebase Console → Firestore → Rules) aur admin panel me dobara login karo.";
+  if (code.includes("unavailable")) return "Internet / Firebase se connection nahi ho pa raha — thodi der me try karo.";
+  if (code.includes("unauthenticated")) return "Admin session expire ho gaya — logout karke dobara login karo.";
+  return (e && e.message) ? e.message : String(e);
+}
+function dmDownload(name, text, mime) {
+  const blob = new Blob([text], { type: mime || "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+function dmSafeName(s) { return String(s || "").replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "data"; }
+// CSV (RFC 4180) with a UTF-8 BOM so Excel shows Hindi names correctly, and
+// formula-injection protection: a guest named "=HYPERLINK(...)" must not
+// become a live formula when the register is opened in Excel/Sheets.
+function dmCsv(records) {
+  const rows = records.filter(r => r && typeof r === "object" && !Array.isArray(r));
+  const cols = [];
+  rows.forEach(r => Object.keys(r).forEach(k => { if (!cols.includes(k)) cols.push(k); }));
+  const cell = v => {
+    if (v === null || v === undefined) return "";
+    let s = typeof v === "object" ? JSON.stringify(v) : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return "﻿" + [cols.map(cell).join(",")].concat(rows.map(r => cols.map(c => cell(r[c])).join(","))).join("\r\n");
+}
+function dmRef(id) { return window._db.collection("hotels").doc(DM.key).collection("data").doc(id); }
+function dmUpdateUndoBtn() {
+  const b = document.getElementById("dmUndoBtn");
+  if (!b) return;
+  const last = DM.undo[DM.undo.length - 1];
+  b.disabled = !last || DM.busy;
+  b.textContent = last ? "↩️ Undo (" + last.label + ")" : "↩️ Undo";
+}
+
+// ── open / close ─────────────────────────────────────────────────
+async function openDataManager(i) {
+  const l = licenses[i];
+  if (!l) return;
+  if (!window._db) { showMsg("❌ Firebase connected nahi hai — Data Manager nahi khul sakta.", "error"); return; }
+  const key = String(l.key || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
+  if (!/^ATITHI-[A-Z0-9]+$/.test(key)) { showMsg("❌ Is license ki key format galat hai.", "error"); return; }
+  if (DM.key !== key) DM.undo = []; // undo history is per hotel
+  Object.assign(DM, { licIdx: i, key, hotel: l.hotel || "", docs: [], root: null, pub: null, cur: -1, q: "", limit: DM_PAGE });
+  document.getElementById("dmTitle").textContent = "🗂️ " + (l.hotel || "Hotel") + " — Cloud Data";
+  document.getElementById("dmSub").textContent = key + (l.owner ? " · " + l.owner : "") + (l.active === false ? " · REVOKED" : "");
+  document.getElementById("dmBody").innerHTML = "";
+  dmMsg("");
+  document.getElementById("dmModal").classList.add("open");
+  document.body.style.overflow = "hidden";
+  await dmRefresh();
+}
+function dmClose() {
+  if (DM.busy) return;
+  document.getElementById("dmModal").classList.remove("open");
+  document.body.style.overflow = "";
+  DM.cur = -1;
+}
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (document.getElementById("dmDelAll").classList.contains("open")) return dmCloseDeleteAll();
+  if (document.getElementById("dmEditor").classList.contains("open")) return dmCloseEditor();
+  if (document.getElementById("dmModal").classList.contains("open")) return DM.cur >= 0 ? dmBackToList() : dmClose();
+});
+
+// ── load everything for this hotel ───────────────────────────────
+async function dmProbeIds() {
+  // Fallback when list isn't permitted (rules not yet published): ask for
+  // every document id the hotel app is known to write.
+  const ids = ["rooms", "bookings", "users", "audit", "profile", "permissions", "creditNotes", "cu", "authVersion"];
+  const now = new Date();
+  for (let m = 0; m < 60; m++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - m, 1);
+    ids.push("bookings_archive_" + d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0"));
+  }
+  const fyStart = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+  for (let y = fyStart; y > fyStart - 6; y--) {
+    const fy = String(y).slice(-2) + "-" + String(y + 1).slice(-2);
+    ids.push("invCounter_" + fy, "cnCounter_" + fy, "dnCounter_" + fy);
+  }
+  const found = [];
+  for (let i = 0; i < ids.length; i += 20) {
+    const snaps = await Promise.all(ids.slice(i, i + 20).map(id => dmRef(id).get({ source: "server" }).catch(() => null)));
+    snaps.forEach(s => { if (s && s.exists) found.push(s); });
+  }
+  return found;
+}
+function dmMakeDoc(id, data) {
+  data = data || {};
+  const value = data.value;
+  return {
+    id, data, raw: dmStable(data),
+    ts: typeof data.ts === "number" ? data.ts : null,
+    bytes: dmBytes(data),
+    kind: dmKind(value),
+    count: Array.isArray(value) ? value.length : null
+  };
+}
+async function dmRefresh() {
+  if (!DM.key) return;
+  dmSetBusy("Cloud se data laa raha hoon...");
+  try {
+    let snaps;
+    try {
+      const qs = await window._db.collection("hotels").doc(DM.key).collection("data").get({ source: "server" });
+      snaps = qs.docs; DM.listMode = "full";
+    } catch (e) {
+      if (!String(e && e.code).includes("permission-denied")) throw e;
+      snaps = await dmProbeIds(); DM.listMode = "probe";
+    }
+    DM.docs = snaps.filter(s => DM_ID_RE.test(s.id)).map(s => dmMakeDoc(s.id, s.data()))
+      .sort((a, b) => dmSortKey(a.id).localeCompare(dmSortKey(b.id)));
+    const skipped = snaps.length - DM.docs.length;
+
+    DM.root = null;
+    try { const r = await window._db.collection("hotels").doc(DM.key).get({ source: "server" }); if (r.exists) DM.root = r.data(); } catch (e) { /* optional */ }
+
+    // Public booking page (token lives in the hotel profile, never in the key).
+    DM.pub = null;
+    const prof = DM.docs.find(d => d.id === "profile");
+    const tok = prof && prof.data.value && typeof prof.data.value.publicBookingToken === "string" ? prof.data.value.publicBookingToken.trim() : "";
+    if (/^[A-Za-z0-9]{8,64}$/.test(tok)) {
+      try {
+        const pref = window._db.collection("public_booking").doc(tok);
+        const [ps, rq] = await Promise.all([pref.get({ source: "server" }), pref.collection("requests").get({ source: "server" })]);
+        DM.pub = { token: tok, data: ps.exists ? ps.data() : null, requests: rq.docs.map(d => ({ id: d.id, data: d.data() })) };
+      } catch (e) { DM.pub = { token: tok, data: null, requests: [], error: dmErrText(e) }; }
+    }
+
+    if (DM.cur >= 0) {
+      // Stay on the same document after a refresh if it still exists.
+      const id = DM._curId;
+      DM.cur = DM.docs.findIndex(d => d.id === id);
+    }
+    dmSetBusy("");
+    if (skipped) dmMsg("⚠️ " + skipped + " document(s) ka naam ajeeb tha (special characters) — suraksha ke liye skip kiye.", "bad");
+    DM.cur >= 0 ? dmRenderDoc() : dmRenderList();
+  } catch (e) {
+    dmSetBusy("");
+    dmMsg("❌ Data load nahi hua: " + dmErrText(e), "bad");
+    document.getElementById("dmBody").innerHTML = "";
+  }
+}
+
+// ── document list view ──────────────────────────────────────────
+function dmRenderList() {
+  DM.cur = -1;
+  const docs = DM.docs;
+  const total = docs.reduce((s, d) => s + d.bytes, 0);
+  const lastTs = docs.reduce((m, d) => Math.max(m, d.ts || 0), 0);
+  const bk = docs.find(d => d.id === "bookings");
+  const archived = docs.filter(d => /^bookings_archive_/.test(d.id)).reduce((s, d) => s + (d.count || 0), 0);
+  let h = "";
+  if (DM.listMode === "probe")
+    h += `<div class="dm-note warn">⚠️ Naye firestore.rules abhi publish nahi hue, isliye sirf jaane-pehchaane documents dhoonde gaye hain. Edit/Delete ke liye bhi naye rules zaroori hain.</div>`;
+  h += `<div class="dm-note">📦 <b>${docs.length}</b> documents · <b>${dmFmtBytes(total)}</b> · Last activity: <b>${escHtml(dmFmtTime(lastTs))}</b>`
+    + (bk ? ` · Live bookings: <b>${bk.count || 0}</b>` : "") + (archived ? ` · Archived: <b>${archived}</b>` : "")
+    + `<br>Edit karne pe <b>Rooms / Bookings / Profile / Permissions</b> hotel app me turant update hote hain; baaki documents hotel ke agli baar app kholne pe.</div>`;
+  if (!docs.length) h += `<div class="dm-note" style="text-align:center;padding:22px">Is hotel ka cloud me koi data nahi mila.<br><span style="font-size:11px">(Hotel ne abhi tak app activate nahi kiya, ya data pehle hi delete ho chuka hai.)</span></div>`;
+
+  h += docs.map((d, i) => {
+    const pill = d.bytes >= DM_BIG_DOC_BYTES
+      ? `<span class="dm-pill ${d.bytes >= 900000 ? "huge" : "big"}">${d.bytes >= 900000 ? "1 MB limit ke bilkul paas!" : "1 MB limit ke paas"}</span>` : "";
+    const what = d.kind === "array" ? `<b>${d.count}</b> records` : d.kind === "object" ? `${Object.keys(d.data.value || {}).length} fields` : d.kind === "empty" ? "khaali" : "Value: " + escHtml(String(d.data.value).slice(0, 40));
+    const hasRows = d.kind === "array" && (d.data.value || []).some(r => r && typeof r === "object");
+    return `<div class="dm-row">
+      <div style="min-width:0;flex:1">
+        <div class="dm-id">${escHtml(d.id)}${pill}</div>
+        <div class="dm-lbl">${escHtml(dmLabel(d.id))}</div>
+        <div class="dm-meta">${what} · ${dmFmtBytes(d.bytes)} · Updated: <b>${escHtml(dmFmtTime(d.ts))}</b></div>
+      </div>
+      <div class="dm-acts">
+        <button class="dm-b sm pri" onclick="dmOpenDoc(${i})">👁️ Open / Edit</button>
+        <button class="dm-b sm" onclick="dmExportDoc(${i},'json')" title="JSON download">⬇️ JSON</button>
+        ${hasRows ? `<button class="dm-b sm" onclick="dmExportDoc(${i},'csv')" title="Excel me kholne layak">⬇️ CSV</button>` : ""}
+        <button class="dm-b sm red" onclick="dmDeleteDoc(${i})" title="Document delete">🗑️</button>
+      </div>
+    </div>`;
+  }).join("");
+
+  if (DM.pub) {
+    const p = DM.pub;
+    h += `<div class="dm-sec">Public booking page</div>
+      <div class="dm-row"><div style="min-width:0;flex:1">
+        <div class="dm-id">public_booking/${escHtml(p.token)}</div>
+        <div class="dm-lbl">Facebook/WhatsApp pe share hone wala booking page + guests ki enquiries</div>
+        <div class="dm-meta">${p.data ? "Page published" : "Page abhi publish nahi hua"} · Enquiries: <b>${p.requests.length}</b>${p.error ? " · ⚠️ " + escHtml(p.error) : ""}</div>
+      </div>
+      <div class="dm-acts"><span class="dm-meta">Full Backup me shaamil · Delete ALL ke saath delete hota hai</span></div></div>`;
+  }
+  document.getElementById("dmBody").innerHTML = h;
+}
+
+// ── single document view ────────────────────────────────────────
+function dmOpenDoc(i) {
+  if (!DM.docs[i]) return;
+  DM.cur = i; DM._curId = DM.docs[i].id; DM.q = ""; DM.limit = DM_PAGE;
+  dmMsg("");
+  dmRenderDoc();
+  document.getElementById("dmModal").scrollTop = 0;
+}
+function dmBackToList() { DM.cur = -1; DM._curId = null; dmMsg(""); dmRenderList(); }
+function dmRecTitle(r) {
+  if (!r || typeof r !== "object") return String(r);
+  const t = r.name || r.guestName || r.username || r.userName || r.number || r.roomNo || r.invoiceNo || r.title || r.label || r.action || r.id;
+  return t === undefined || t === null || t === "" ? "(record)" : String(t);
+}
+function dmRecSub(r) {
+  if (!r || typeof r !== "object") return "";
+  const pick = [["roomId", "Room"], ["room", "Room"], ["type", "Type"], ["mobile", "📱"], ["phone", "📱"], ["checkIn", "In"], ["checkOut", "Out"],
+    ["status", "Status"], ["role", "Role"], ["total", "₹"], ["amount", "₹"], ["date", "Date"], ["by", "By"], ["user", "By"], ["id", "ID"]];
+  const out = [];
+  for (const [k, lbl] of pick) {
+    if (out.length >= 5) break;
+    const v = r[k];
+    if (v === undefined || v === null || v === "" || typeof v === "object") continue;
+    if (k === "id" && dmRecTitle(r) === String(v)) continue;
+    let s = String(v);
+    if (/^(checkIn|checkOut|date)$/.test(k) && /^\d{12,13}$/.test(s)) s = dmFmtTime(+s);
+    out.push(lbl + ": " + s.slice(0, 40));
+  }
+  return out.join(" · ");
+}
+function dmRenderDoc() {
+  const d = DM.docs[DM.cur];
+  if (!d) return dmBackToList();
+  const v = d.data.value;
+  let h = `<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+      <button class="dm-b" onclick="dmBackToList()">← Sab documents</button>
+      <div style="min-width:0;flex:1"><div class="dm-id">${escHtml(d.id)}</div><div class="dm-lbl">${escHtml(dmLabel(d.id))}</div></div>
+    </div>
+    <div class="dm-acts" style="margin-bottom:10px">
+      <button class="dm-b sm" onclick="dmRawEdit()">{ } Raw JSON Edit</button>
+      <button class="dm-b sm" onclick="dmExportDoc(${DM.cur},'json')">⬇️ JSON</button>
+      ${d.kind === "array" ? `<button class="dm-b sm" onclick="dmExportDoc(${DM.cur},'csv')">⬇️ CSV</button>` : ""}
+      <button class="dm-b sm red" onclick="dmDeleteDoc(${DM.cur})">🗑️ Document</button>
+    </div>
+    <div class="dm-meta" style="margin-bottom:10px">${dmFmtBytes(d.bytes)} · Updated: <b>${escHtml(dmFmtTime(d.ts))}</b>${DM_LIVE.test(d.id) ? " · 🔴 Live — hotel app me turant dikhega" : ""}</div>`;
+
+  if (d.kind === "array") {
+    const all = v.map((r, idx) => ({ r, idx }));
+    const q = DM.q.trim().toLowerCase();
+    const hits = q ? all.filter(x => JSON.stringify(x.r).toLowerCase().includes(q)) : all;
+    // Newest first is what an admin almost always wants to see.
+    hits.reverse();
+    const shown = hits.slice(0, DM.limit);
+    h += `<input class="dm-in" id="dmSearch" placeholder="🔍 Search — naam, mobile, room, ID..." value="${escHtml(DM.q)}" oninput="dmSearch(this.value)" style="margin-bottom:8px"/>
+      <div class="dm-meta" style="margin-bottom:8px">${q ? hits.length + " / " : ""}${v.length} records${hits.length > shown.length ? " · pehle " + shown.length + " dikh rahe hain" : ""}</div>`;
+    h += shown.map(({ r, idx }) => `<div class="dm-rec">
+        <div style="min-width:0;flex:1"><div class="dm-rec-t">${escHtml(dmRecTitle(r))}</div><div class="dm-rec-s">${escHtml(dmRecSub(r))}</div></div>
+        <div class="dm-acts">
+          <button class="dm-b sm" onclick="dmEditRecord(${idx})">✏️ Edit</button>
+          <button class="dm-b sm red" onclick="dmDeleteRecord(${idx})">🗑️</button>
+        </div></div>`).join("") || `<div class="dm-note" style="text-align:center">Koi record nahi mila.</div>`;
+    if (hits.length > shown.length) h += `<button class="dm-b" style="width:100%;justify-content:center;margin-top:6px" onclick="dmMore()">⬇️ Aur dikhao (${hits.length - shown.length} baaki)</button>`;
+  } else {
+    h += `<div class="dm-note">Yeh document ek ${d.kind === "object" ? "settings object" : "single value"} hai — <b>{ } Raw JSON Edit</b> se badlo.</div>
+      <pre class="dm-ta" style="min-height:0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word">${escHtml(JSON.stringify(v, null, 2))}</pre>`;
+  }
+  document.getElementById("dmBody").innerHTML = h;
+}
+function dmSearch(val) {
+  DM.q = val; DM.limit = DM_PAGE;
+  const el = document.getElementById("dmSearch");
+  const pos = el ? el.selectionStart : null;
+  dmRenderDoc();
+  const n = document.getElementById("dmSearch");
+  if (n) { n.focus(); if (pos !== null) n.setSelectionRange(pos, pos); }
+}
+function dmMore() { DM.limit += DM_PAGE; dmRenderDoc(); }
+
+// ── editor ───────────────────────────────────────────────────────
+function dmOpenEditor(title, sub, value, ctx) {
+  DM.editor = ctx;
+  document.getElementById("dmEdTitle").textContent = title;
+  document.getElementById("dmEdSub").textContent = sub;
+  document.getElementById("dmEdText").value = JSON.stringify(value, null, 2);
+  const err = document.getElementById("dmEdErr"); err.className = "dm-msg"; err.textContent = "";
+  document.getElementById("dmEdSave").disabled = false;
+  document.getElementById("dmEditor").classList.add("open");
+  setTimeout(() => document.getElementById("dmEdText").focus(), 50);
+}
+function dmCloseEditor() { document.getElementById("dmEditor").classList.remove("open"); DM.editor = null; }
+function dmEdErr(t) { const e = document.getElementById("dmEdErr"); e.textContent = t; e.className = "dm-msg bad"; }
+function dmFormatEditor() {
+  const ta = document.getElementById("dmEdText");
+  try { ta.value = JSON.stringify(JSON.parse(ta.value), null, 2); document.getElementById("dmEdErr").className = "dm-msg"; }
+  catch (e) { dmEdErr("❌ JSON galat hai: " + e.message); }
+}
+function dmEditRecord(idx) {
+  const d = DM.docs[DM.cur]; if (!d || !Array.isArray(d.data.value)) return;
+  const r = d.data.value[idx];
+  dmOpenEditor("✏️ Record edit — " + dmRecTitle(r), d.id + " · record #" + (idx + 1), r, { kind: "record", docIdx: DM.cur, recIdx: idx, docId: d.id });
+}
+function dmRawEdit() {
+  const d = DM.docs[DM.cur]; if (!d) return;
+  dmOpenEditor("{ } Poora document edit — " + d.id, dmLabel(d.id), d.data.value === undefined ? null : d.data.value, { kind: "raw", docIdx: DM.cur, docId: d.id });
+}
+async function dmSaveEditor() {
+  const ctx = DM.editor; if (!ctx) return;
+  const d = DM.docs[ctx.docIdx];
+  if (!d || d.id !== ctx.docId) { dmEdErr("Document list badal gayi — editor band karke dobara kholo."); return; }
+  let parsed;
+  try { parsed = JSON.parse(document.getElementById("dmEdText").value); }
+  catch (e) { dmEdErr("❌ JSON galat hai: " + e.message); return; }
+  let newValue;
+  if (ctx.kind === "record") {
+    const old = d.data.value[ctx.recIdx];
+    if (dmKind(parsed) !== dmKind(old) && !confirm("Record ka type badal raha hai (" + dmKind(old) + " → " + dmKind(parsed) + "). Hotel app me problem ho sakti hai. Phir bhi save karein?")) return;
+    if (old && typeof old === "object" && parsed && typeof parsed === "object" && old.id !== undefined && parsed.id !== old.id
+        && !confirm("Record ki 'id' badal rahi hai (" + old.id + " → " + parsed.id + "). Hotel ke device pe photos/links is id se jude hote hain. Pakka?")) return;
+    if (dmStable(parsed) === dmStable(old)) { dmCloseEditor(); dmMsg("Kuch badla nahi — save ki zaroorat nahi.", "inf"); return; }
+    newValue = d.data.value.slice();
+    newValue[ctx.recIdx] = parsed;
+  } else {
+    const old = d.data.value;
+    if (dmKind(parsed) !== dmKind(old) && !confirm("Document ka type badal raha hai (" + dmKind(old) + " → " + dmKind(parsed) + "). Hotel app is document ko pehle jaisa expect karta hai — galat type se app toot sakta hai. Phir bhi save karein?")) return;
+    if (dmStable(parsed) === dmStable(old)) { dmCloseEditor(); dmMsg("Kuch badla nahi — save ki zaroorat nahi.", "inf"); return; }
+    newValue = parsed;
+  }
+  document.getElementById("dmEdSave").disabled = true;
+  const ok = await dmWrite(ctx.docIdx, newValue, ctx.kind === "record" ? "record edit" : d.id + " edit");
+  document.getElementById("dmEdSave").disabled = false;
+  if (ok) dmCloseEditor();
+  else { const m = document.getElementById("dmMsg").textContent; if (m) dmEdErr(m); }
+}
+async function dmDeleteRecord(idx) {
+  const d = DM.docs[DM.cur]; if (!d || !Array.isArray(d.data.value)) return;
+  const r = d.data.value[idx];
+  if (!confirm("Yeh record delete karein?\n\n" + dmRecTitle(r) + "\n" + dmRecSub(r) + "\n\n(↩️ Undo se wapas la sakte ho jab tak yeh panel khula hai.)")) return;
+  const newValue = d.data.value.slice(); newValue.splice(idx, 1);
+  await dmWrite(DM.cur, newValue, "record delete");
+}
+
+// ── the ONE write path (concurrency check + undo + size guard) ──
+async function dmWrite(docIdx, newValue, label) {
+  const d = DM.docs[docIdx]; if (!d) return false;
+  const newData = Object.assign({}, d.data, { value: newValue, ts: Date.now() });
+  const size = dmBytes(newData);
+  if (size > DM_MAX_DOC_BYTES) { dmMsg("❌ Document " + dmFmtBytes(size) + " ka ho jaayega — Firestore ki 1 MB limit se zyada. Save nahi kiya.", "bad"); return false; }
+  dmSetBusy("Save ho raha hai...");
+  try {
+    const ref = dmRef(d.id);
+    const fresh = await ref.get({ source: "server" });
+    if (!fresh.exists || dmStable(fresh.data()) !== d.raw) {
+      dmSetBusy("");
+      dmMsg("⚠️ Hotel ne is beech yeh data badal diya hai (ya delete kar diya). Aapka change save NAHI kiya — 🔄 Refresh karke latest data pe dobara edit karo.", "bad");
+      return false;
+    }
+    await ref.set(newData); // full replace (not merge) so removed fields really go away
+    DM.undo.push({ id: d.id, prev: d.data, after: dmStable(newData), label });
+    if (DM.undo.length > 30) DM.undo.shift();
+    DM.docs[docIdx] = dmMakeDoc(d.id, newData);
+    dmSetBusy("");
+    dmMsg("✅ Saved (" + label + ")." + (DM_LIVE.test(d.id) ? " Hotel app me turant update ho jaayega." : " Hotel app agli baar khulne pe lega."), "ok");
+    DM.cur >= 0 ? dmRenderDoc() : dmRenderList();
+    return true;
+  } catch (e) {
+    dmSetBusy("");
+    dmMsg("❌ Save nahi hua: " + dmErrText(e), "bad");
+    return false;
+  }
+}
+
+async function dmUndo() {
+  const u = DM.undo[DM.undo.length - 1]; if (!u || DM.busy) return;
+  if (!confirm("Last change wapas karein? (" + u.label + " — " + u.id + ")")) return;
+  dmSetBusy("Undo ho raha hai...");
+  try {
+    const ref = dmRef(u.id);
+    const fresh = await ref.get({ source: "server" });
+    const freshRaw = fresh.exists ? dmStable(fresh.data()) : null;
+    if (freshRaw !== u.after && !confirm("Aapke change ke baad hotel ne bhi is document ko badla hai. Undo karne se hotel ka naya change bhi hat jaayega. Phir bhi undo karein?")) { dmSetBusy(""); return; }
+    if (u.prev) await ref.set(u.prev); else await ref.delete();
+    DM.undo.pop();
+    dmSetBusy("");
+    dmMsg("↩️ Undo ho gaya (" + u.label + ").", "ok");
+    await dmRefresh();
+  } catch (e) { dmSetBusy(""); dmMsg("❌ Undo nahi hua: " + dmErrText(e), "bad"); }
+}
+
+// ── delete one document ─────────────────────────────────────────
+async function dmDeleteDoc(i) {
+  const d = DM.docs[i]; if (!d || DM.busy) return;
+  const critical = DM_CRITICAL.test(d.id);
+  const msg = "Document delete karein?\n\n" + d.id + " — " + dmLabel(d.id) + "\n" + (d.count !== null ? d.count + " records · " : "") + dmFmtBytes(d.bytes)
+    + "\n\nPehle iska JSON backup download hoga." + (DM_LIVE.test(d.id) || critical ? "\n⚠️ Agar hotel app chalu hai to uska device apni local copy agli save pe dobara upload kar sakta hai." : "");
+  if (critical) {
+    const t = prompt(msg + "\n\nYeh important data hai. Confirm karne ke liye DELETE type karo:");
+    if (t === null) return;
+    if (t.trim() !== "DELETE") { dmMsg("Delete cancel — 'DELETE' sahi type nahi hua.", "inf"); return; }
+  } else if (!confirm(msg)) return;
+  dmExportDoc(i, "json"); // backup first, always
+  dmSetBusy("Delete ho raha hai...");
+  try {
+    await dmRef(d.id).delete();
+    DM.undo.push({ id: d.id, prev: d.data, after: null, label: d.id + " delete" });
+    if (DM.undo.length > 30) DM.undo.shift();
+    dmSetBusy("");
+    dmMsg("🗑️ " + d.id + " delete ho gaya (backup download ho chuka hai, ↩️ Undo bhi kar sakte ho).", "ok");
+    DM.cur = -1; DM._curId = null;
+    await dmRefresh();
+  } catch (e) { dmSetBusy(""); dmMsg("❌ Delete nahi hua: " + dmErrText(e), "bad"); }
+}
+
+// ── exports ─────────────────────────────────────────────────────
+function dmBackupObject() {
+  const documents = {};
+  DM.docs.forEach(d => { documents[d.id] = d.data; });
+  return {
+    format: "atithibook-admin-backup", version: 1,
+    exportedAt: new Date().toISOString(), exportedBy: "BizzSathi admin panel",
+    hotelId: DM.key, hotelName: DM.hotel,
+    documents,
+    hotelRootDoc: DM.root,
+    publicBooking: DM.pub ? { token: DM.pub.token, page: DM.pub.data, requests: DM.pub.requests } : null
+  };
+}
+function dmExportFull() {
+  if (!DM.docs.length && !DM.pub) { dmMsg("Export karne ke liye koi data nahi hai.", "inf"); return; }
+  dmDownload("atithibook-" + dmSafeName(DM.key) + "-full-backup-" + dmToday() + ".json", JSON.stringify(dmBackupObject(), null, 2));
+  dmMsg("✅ Full backup download ho gaya (" + DM.docs.length + " documents). Isme guest data hai — surakshit jagah rakhna.", "ok");
+}
+function dmExportDoc(i, fmt) {
+  const d = DM.docs[i]; if (!d) return;
+  const base = "atithibook-" + dmSafeName(DM.key) + "-" + dmSafeName(d.id) + "-" + dmToday();
+  if (fmt === "csv" && Array.isArray(d.data.value)) dmDownload(base + ".csv", dmCsv(d.data.value), "text/csv;charset=utf-8");
+  else dmDownload(base + ".json", JSON.stringify({ format: "atithibook-admin-backup", version: 1, exportedAt: new Date().toISOString(), hotelId: DM.key, documents: { [d.id]: d.data } }, null, 2));
+}
+function dmExportRegister() {
+  // Live bookings + every monthly archive, as ONE register, oldest first.
+  const src = DM.docs.filter(d => (d.id === "bookings" || /^bookings_archive_/.test(d.id)) && Array.isArray(d.data.value));
+  const seen = new Set(), rows = [];
+  src.forEach(d => d.data.value.forEach(r => {
+    if (!r || typeof r !== "object") return;
+    const k = r.id !== undefined ? String(r.id) : JSON.stringify(r);
+    if (seen.has(k)) return; seen.add(k);
+    rows.push(Object.assign({ _source: d.id }, r));
+  }));
+  if (!rows.length) { dmMsg("Is hotel ki koi booking cloud me nahi mili.", "inf"); return; }
+  // Rows without any usable date go LAST, not first.
+  const t = r => { const v = r.checkIn || r.createdAt; if (!v) return Infinity; const n = typeof v === "number" ? v : Date.parse(v); return isNaN(n) ? Infinity : n; };
+  rows.sort((a, b) => t(a) - t(b));
+  dmDownload("atithibook-" + dmSafeName(DM.key) + "-guest-register-" + dmToday() + ".csv", dmCsv(rows), "text/csv;charset=utf-8");
+  dmMsg("✅ Guest register CSV download ho gaya — " + rows.length + " bookings (live + archives). Aadhaar masked hai.", "ok");
+}
+
+// ── delete ALL ──────────────────────────────────────────────────
+function dmOpenDeleteAll() {
+  if (DM.busy) return;
+  const n = DM.docs.length + (DM.root ? 1 : 0) + (DM.pub ? 1 + DM.pub.requests.length : 0);
+  if (!n) { dmMsg("Delete karne ke liye kuch nahi hai.", "inf"); return; }
+  const bk = DM.docs.filter(d => d.id === "bookings" || /^bookings_archive_/.test(d.id)).reduce((s, d) => s + (d.count || 0), 0);
+  document.getElementById("dmDaInfo").innerHTML = "<b>" + escHtml(DM.hotel || DM.key) + "</b> ke <b>" + DM.docs.length + "</b> documents"
+    + (bk ? " (<b>" + bk + "</b> guest bookings samet)" : "") + (DM.pub ? ", public booking page aur " + DM.pub.requests.length + " enquiries" : "")
+    + " cloud se hamesha ke liye delete honge."
+    + (DM.listMode === "probe" ? "<br>⚠️ Naye rules publish nahi hue — delete permission deny ho sakti hai." : "");
+  document.getElementById("dmDaKey").textContent = DM.key;
+  document.getElementById("dmDaConfirm").value = "";
+  document.getElementById("dmDaRevoke").checked = true;
+  document.getElementById("dmDaGo").disabled = true;
+  document.getElementById("dmDelAll").classList.add("open");
+  setTimeout(() => document.getElementById("dmDaConfirm").focus(), 50);
+}
+function dmCloseDeleteAll() { document.getElementById("dmDelAll").classList.remove("open"); }
+function dmDeleteAllCheck() {
+  document.getElementById("dmDaGo").disabled = document.getElementById("dmDaConfirm").value.trim().toUpperCase() !== DM.key;
+}
+async function dmDeleteAllRun() {
+  if (document.getElementById("dmDaConfirm").value.trim().toUpperCase() !== DM.key || DM.busy) return;
+  const revoke = document.getElementById("dmDaRevoke").checked;
+  dmCloseDeleteAll();
+  // 1) Re-read everything fresh, then 2) download the backup of THAT state,
+  // and only then 3) delete — so the backup always matches what is deleted.
+  await dmRefresh();
+  if (!DM.docs.length && !DM.pub && !DM.root) { dmMsg("Kuch delete karne ko nahi bacha.", "inf"); return; }
+  try {
+    dmDownload("atithibook-" + dmSafeName(DM.key) + "-BEFORE-DELETE-backup-" + dmToday() + ".json", JSON.stringify(dmBackupObject(), null, 2));
+  } catch (e) { dmMsg("❌ Backup nahi ban paaya, isliye delete ROKA gaya: " + dmErrText(e), "bad"); return; }
+  dmSetBusy("Delete ho raha hai...");
+  const db = window._db;
+  try {
+    // Revoke FIRST: once the license is inactive, a hotel device can't
+    // re-activate and re-upload while we're deleting.
+    if (revoke && licenses[DM.licIdx] && licenses[DM.licIdx].active !== false) {
+      licenses[DM.licIdx].active = false;
+      localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+      const res = await LicenseCloud.pushMany([licenses[DM.licIdx]], { fields: ["active"] });
+      if (!res || !res.ok) {
+        licenses[DM.licIdx].active = true;
+        localStorage.setItem("ab_admin_licenses", JSON.stringify(licenses));
+        throw new Error("License revoke nahi hua (" + ((res && res.error) || "cloud error") + ") — isliye data delete bhi ROKA gaya.");
+      }
+      if (typeof renderDashboard === "function") renderDashboard();
+    }
+    const refs = DM.docs.map(d => dmRef(d.id));
+    if (DM.root) refs.push(db.collection("hotels").doc(DM.key));
+    if (DM.pub) {
+      const pref = db.collection("public_booking").doc(DM.pub.token);
+      DM.pub.requests.forEach(r => { if (DM_ID_RE.test(r.id)) refs.push(pref.collection("requests").doc(r.id)); });
+      refs.push(pref);
+    }
+    for (let i = 0; i < refs.length; i += 400) {
+      const batch = db.batch();
+      refs.slice(i, i + 400).forEach(r => batch.delete(r));
+      await batch.commit();
+    }
+    DM.undo = []; // per-doc undo no longer meaningful — the backup file is the way back
+    dmSetBusy("");
+    dmMsg("🗑️ " + refs.length + " items delete ho gaye" + (revoke ? " aur license revoke ho gaya" : "") + ". Backup file (BEFORE-DELETE) se ♻️ Restore kar sakte ho.", "ok");
+    DM.cur = -1;
+    await dmRefresh();
+  } catch (e) {
+    dmSetBusy("");
+    dmMsg("❌ Delete beech me ruk gaya: " + dmErrText(e) + " — 🔄 Refresh karke dekho kya bacha hai. Backup already download ho chuka hai.", "bad");
+    await dmRefresh();
+  }
+}
+
+// ── restore from a backup file made by this manager ─────────────
+async function dmRestoreFromFile(input) {
+  const file = input.files && input.files[0];
+  input.value = "";
+  if (!file || DM.busy) return;
+  let b;
+  try { b = JSON.parse(await file.text()); } catch (e) { dmMsg("❌ Yeh file sahi JSON nahi hai.", "bad"); return; }
+  if (!b || b.format !== "atithibook-admin-backup" || !b.documents || typeof b.documents !== "object" || Array.isArray(b.documents)) {
+    dmMsg("❌ Yeh AtithiBook admin backup file nahi lagti (Data Manager se bani '.json' file chahiye).", "bad"); return;
+  }
+  const entries = Object.entries(b.documents).filter(([id, data]) => DM_ID_RE.test(id) && data && typeof data === "object" && !Array.isArray(data));
+  const bad = Object.keys(b.documents).length - entries.length;
+  if (!entries.length) { dmMsg("❌ Backup me restore karne layak koi document nahi mila.", "bad"); return; }
+  const tooBig = entries.find(([, data]) => dmBytes(data) > 1048000);
+  if (tooBig) { dmMsg("❌ '" + tooBig[0] + "' 1 MB se bada hai — Firestore me nahi jaa sakta.", "bad"); return; }
+  const existing = new Set(DM.docs.map(d => d.id));
+  const overwrite = entries.filter(([id]) => existing.has(id)).length;
+  const other = b.hotelId && String(b.hotelId).toUpperCase() !== DM.key;
+  const t = prompt("♻️ Restore: " + entries.length + " documents" + (b.exportedAt ? " (backup: " + String(b.exportedAt).slice(0, 16).replace("T", " ") + ")" : "")
+    + (overwrite ? "\n⚠️ " + overwrite + " existing document(s) backup wale version se REPLACE ho jaayenge." : "")
+    + (other ? "\n⚠️ Yeh backup DOOSRE hotel (" + b.hotelId + ") ka hai — is hotel me copy hoga!" : "")
+    + (bad ? "\n(" + bad + " ajeeb naam wale document skip honge.)" : "")
+    + "\n\nPehle abhi ke data ka backup download hoga.\nConfirm karne ke liye is hotel ki license key type karo:");
+  if (t === null) return;
+  if (t.trim().toUpperCase() !== DM.key) { dmMsg("Restore cancel — license key match nahi hui.", "inf"); return; }
+  if (DM.docs.length) dmDownload("atithibook-" + dmSafeName(DM.key) + "-BEFORE-RESTORE-backup-" + dmToday() + ".json", JSON.stringify(dmBackupObject(), null, 2));
+  let done = 0;
+  try {
+    // One document at a time (not a batch): a single batch is capped at
+    // 10 MiB total, and a big hotel's archives can exceed that.
+    for (const [id, data] of entries) {
+      dmSetBusy("Restore ho raha hai... " + (done + 1) + "/" + entries.length + " (" + id + ")");
+      await dmRef(id).set(data);
+      done++;
+    }
+    DM.undo = [];
+    dmSetBusy("");
+    dmMsg("♻️ " + done + " documents restore ho gaye. (License revoked hai to Edit/Features me Restore karna mat bhoolna.)", "ok");
+  } catch (e) {
+    dmSetBusy("");
+    dmMsg("❌ Restore " + done + "/" + entries.length + " pe ruk gaya: " + dmErrText(e), "bad");
+  }
+  DM.cur = -1;
+  await dmRefresh();
+}
+</script>
+
 </body>
 </html>
