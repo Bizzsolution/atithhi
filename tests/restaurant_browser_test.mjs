@@ -39,8 +39,8 @@ const server = http.createServer((req, res) => {
 await new Promise(r => server.listen(PORT, r));
 const browser = await chromium.launch(fs.existsSync(CHROMIUM) ? { executablePath: CHROMIUM } : {});
 
-async function newPage(features, storage) {
-  const ctx = await browser.newContext({ viewport: { width: 420, height: 860 }, serviceWorkers: "block" });
+async function newPage(features, storage, ctxOpts) {
+  const ctx = await browser.newContext({ viewport: { width: 420, height: 860 }, serviceWorkers: "block", ...(ctxOpts || {}) });
   await ctx.addInitScript(s => {
     if (sessionStorage.getItem("__seeded")) return;
     for (const [k, v] of Object.entries(s)) localStorage.setItem(k, v);
@@ -203,10 +203,18 @@ check("bill opens as a printable restaurant tax invoice", /TAX INVOICE — RESTA
 await page.click("text=← Back").catch(() => {});
 await page.waitForTimeout(300);
 
-console.log("\n=== Restaurant staff login ===");
+console.log("\n=== Restaurant staff login (now in ⚙️ Settings) ===");
+check("staff password box is NOT on the Restaurant tab any more", !(await page.evaluate(() => document.body.innerText)).includes("Restaurant staff login"));
+await page.click('button[aria-label="Settings"]');
+await page.waitForTimeout(500);
+const setText = await page.evaluate(() => document.body.innerText);
+check("Settings shows password change, KOT printer and staff login", /SETTINGS/.test(setText) && /KOT Printer/.test(setText) && /Restaurant staff login/.test(setText));
 await page.fill('input[aria-label="Restaurant staff password"]', "Rasoi@2026");
 await page.click('button:has-text("Set karo")');
 await page.waitForTimeout(800);
+check("success message shown in Settings", (await page.evaluate(() => document.body.innerText)).includes("Login taiyaar"));
+await page.click("text=Back");
+await page.waitForTimeout(400);
 const users = await page.evaluate(() => JSON.parse(localStorage.getItem("ab_users")));
 const ru = users.find(u => u.u === "restaurant");
 check("Owner created a 'restaurant' login (PBKDF2, role Restaurant)", ru && ru.role === "Restaurant" && ru.p.indexOf("pbkdf2-sha256$") === 0, ru);
@@ -222,6 +230,10 @@ await ctx.close();
   const body = await t.page.evaluate(() => document.body.innerText);
   check("Restaurant login lands on the counter, not the revenue dashboard", /Room bill me jodo/.test(body) && !/Today\s*Revenue/i.test(body));
   check("Restaurant login cannot edit the menu or create logins", !/📋 Menu/.test(body) && !/Restaurant staff login/.test(body));
+  await t.page.click('button[aria-label="Settings"]');
+  await t.page.waitForTimeout(400);
+  const st = await t.page.evaluate(() => document.body.innerText);
+  check("Restaurant login: Settings has KOT printer but no staff-login box", /KOT Printer/.test(st) && !/Restaurant staff login/.test(st));
   await t.ctx.close();
 }
 

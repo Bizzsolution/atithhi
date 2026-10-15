@@ -1957,18 +1957,162 @@ function nextKotNumber() {
   try { n = (parseInt(localStorage.getItem(k), 10) || 0) + 1; localStorage.setItem(k, String(n)); } catch (e) { n = Date.now() % 1000; }
   return "K" + String(n).padStart(3, "0");
 }
-// Kitchen Order Ticket — 80 mm slip. Opens the print dialog; on phones the
-// same slip can be shared to the kitchen's WhatsApp instead.
+// Kitchen Order Ticket — plain-text form (shareable).
 function kotText(order) {
   const head = "KOT " + order.kot + " · " + (order.where || "") + " · " + fmtTime(order.time);
   return head + "\n" + order.items.map(i => i.qty + " x " + i.name).join("\n") + (order.note ? "\nNote: " + order.note : "");
 }
-function printKOT(order) {
+// ── KOT PRINTER (per device) ─────────────────────────────────────────
+// Three ways to get a KOT onto paper, chosen per device in Settings:
+//   "browser"   – the system print dialog (any installed printer, incl.
+//                 USB/LAN thermal printers with a driver). 58 or 80 mm slip.
+//   "bluetooth" – direct ESC/POS to a Bluetooth-LE thermal printer through
+//                 Web Bluetooth (Chrome on Android / Windows / Mac). No app.
+//   "rawbt"     – hands ESC/POS bytes to the free Android "RawBT" app, which
+//                 drives classic-Bluetooth / USB thermal printers that Web
+//                 Bluetooth cannot reach (most ₹1,500–3,000 printers).
+// The choice lives in localStorage because a KOT printer belongs to one
+// counter device, not to the whole hotel.
+const KOT_PRINTER_KEY = "ab_kot_printer";
+const KotPrinter = {
+  get() {
+    let v = null;
+    try { v = JSON.parse(localStorage.getItem(KOT_PRINTER_KEY) || "null"); } catch (e) {}
+    const mode = v && ["browser", "bluetooth", "rawbt"].indexOf(v.mode) >= 0 ? v.mode : "browser";
+    const width = v && (v.width === 58 || v.width === 80) ? v.width : 80;
+    const copies = v && Number(v.copies) >= 1 && Number(v.copies) <= 3 ? Number(v.copies) : 1;
+    return { mode, width, copies, btName: (v && typeof v.btName === "string") ? v.btName.slice(0, 40) : "", btId: (v && typeof v.btId === "string") ? v.btId.slice(0, 80) : "" };
+  },
+  set(patch) {
+    const next = { ...KotPrinter.get(), ...patch };
+    try { localStorage.setItem(KOT_PRINTER_KEY, JSON.stringify(next)); } catch (e) {}
+    return next;
+  },
+  btSupported() { return !!(navigator.bluetooth && navigator.bluetooth.requestDevice); },
+  isAndroid() { return /Android/i.test(navigator.userAgent || ""); },
+  go(url) { window.location.href = url; }
+};
+
+// ESC/POS: printers only know ASCII in their default code page, so ₹ and
+// Devanagari are transliterated/dropped rather than printed as garbage.
+function escposAscii(s) {
+  return String(s == null ? "" : s).replace(/₹/g, "Rs").replace(/[×✕]/g, "x").replace(/[–—]/g, "-").replace(/[‘’]/g, "'").replace(/[“”]/g, '"')
+    .normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/[^\x20-\x7E\n]/g, "");
+}
+function escposWrap(text, width) {
+  const out = [];
+  String(text).split("\n").forEach(line => {
+    let l = line;
+    while (l.length > width) {
+      let cut = l.lastIndexOf(" ", width);
+      if (cut <= 0) cut = width;
+      out.push(l.slice(0, cut));
+      l = l.slice(cut).replace(/^ /, "");
+    }
+    out.push(l);
+  });
+  return out;
+}
+function kotEscPos(order, widthMm) {
+  const cols = widthMm === 58 ? 32 : 48;
+  const bytes = [];
+  const push = (...b) => b.forEach(x => bytes.push(x & 0xff));
+  const text = s => { const t = escposAscii(s); for (let i = 0; i < t.length; i++) bytes.push(t.charCodeAt(i)); };
+  const line = s => { text(s); push(0x0a); };
+  const pad = (a, b) => { const sp = Math.max(1, cols - a.length - b.length); return a + " ".repeat(sp) + b; };
+  push(0x1b, 0x40);                       // init
+  push(0x1b, 0x61, 0x01);                 // center
+  push(0x1d, 0x21, 0x11); line("KOT " + (order.kot || "")); // double width+height
+  push(0x1d, 0x21, 0x00);
+  push(0x1b, 0x45, 0x01); line("KITCHEN ORDER"); push(0x1b, 0x45, 0x00);
+  push(0x1b, 0x61, 0x00);                 // left
+  line("-".repeat(cols));
+  line(pad(escposAscii(order.where || "").slice(0, cols - 14), escposAscii(fmtTime(order.time) || "")));
+  line(pad(escposAscii(fmtDate(order.date) || ""), escposAscii(order.by || "").slice(0, 16)));
+  line("-".repeat(cols));
+  push(0x1d, 0x21, 0x01);                 // double height for items
+  push(0x1b, 0x45, 0x01);
+  (order.items || []).forEach(i => {
+    const q = String(i.qty) + " x ";
+    escposWrap(escposAscii(i.name), cols - q.length).forEach((p, k) => line((k ? " ".repeat(q.length) : q) + p));
+  });
+  push(0x1b, 0x45, 0x00); push(0x1d, 0x21, 0x00);
+  if (order.note) { line("-".repeat(cols)); escposWrap("Note: " + escposAscii(order.note), cols).forEach(line); }
+  line("-".repeat(cols));
+  push(0x1b, 0x61, 0x01); line("AtithiBook"); push(0x1b, 0x61, 0x00);
+  push(0x1b, 0x64, 0x04);                 // feed 4 lines
+  push(0x1d, 0x56, 0x42, 0x00);           // partial cut (ignored by cutter-less printers)
+  return new Uint8Array(bytes);
+}
+function bytesToBase64(u8) {
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// Web Bluetooth: common BLE thermal-printer services (generic 18F0, ISSC
+// transparent UART, "printer" FF00/FFE0, Xprinter E7810A71…).
+const BT_PRINTER_SERVICES = [
+  0x18f0, 0xff00, 0xffe0, 0xfee7, 0xae30, 0xae3a,
+  "000018f0-0000-1000-8000-00805f9b34fb",
+  "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2"
+];
+const BtPrinter = {
+  device: null, chr: null,
+  async pair() {
+    const dev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: BT_PRINTER_SERVICES });
+    BtPrinter.device = dev; BtPrinter.chr = null;
+    await BtPrinter.connect();
+    KotPrinter.set({ mode: "bluetooth", btName: dev.name || "Bluetooth printer", btId: dev.id || "" });
+    return dev.name || "Bluetooth printer";
+  },
+  // Re-find the paired printer after a reload without asking again, where
+  // the browser supports remembered devices (getDevices).
+  async restore() {
+    if (BtPrinter.device) return BtPrinter.device;
+    const saved = KotPrinter.get();
+    if (!navigator.bluetooth || !navigator.bluetooth.getDevices) return null;
+    try {
+      const list = await navigator.bluetooth.getDevices();
+      BtPrinter.device = list.find(d => d.id === saved.btId) || list.find(d => d.name && d.name === saved.btName) || null;
+    } catch (e) { BtPrinter.device = null; }
+    return BtPrinter.device;
+  },
+  async connect() {
+    const dev = BtPrinter.device;
+    if (!dev) throw new Error("Printer paired nahi hai");
+    const server = dev.gatt.connected ? dev.gatt : await dev.gatt.connect();
+    if (BtPrinter.chr) return BtPrinter.chr;
+    const services = await server.getPrimaryServices();
+    for (const s of services) {
+      let chars = [];
+      try { chars = await s.getCharacteristics(); } catch (e) { continue; }
+      const c = chars.find(x => x.properties.writeWithoutResponse) || chars.find(x => x.properties.write);
+      if (c) { BtPrinter.chr = c; return c; }
+    }
+    throw new Error("Is device me print karne wala channel nahi mila — kya ye thermal printer hai?");
+  },
+  async write(u8) {
+    if (!(await BtPrinter.restore())) throw new Error("Printer pair nahi hai — Settings me 'Printer jodo' dabao");
+    const c = await BtPrinter.connect();
+    const chunk = 180;
+    for (let i = 0; i < u8.length; i += chunk) {
+      const part = u8.slice(i, i + chunk);
+      if (c.properties.writeWithoutResponse && c.writeValueWithoutResponse) await c.writeValueWithoutResponse(part);
+      else await c.writeValue(part);
+      await new Promise(r => setTimeout(r, 25));
+    }
+  }
+};
+
+function printKOTBrowser(order, widthMm) {
+  const w58 = widthMm === 58;
   const rows = order.items.map(i => "<tr><td class=q>" + escHtml(i.qty) + "</td><td>" + escHtml(i.name) + "</td></tr>").join("");
   const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>KOT " + escHtml(order.kot) + "</title><style>" +
-    "@page{size:80mm auto;margin:3mm}body{font-family:Arial,sans-serif;width:72mm;margin:0 auto;font-size:13px;color:#000}" +
-    "h1{font-size:18px;text-align:center;margin:4px 0}.m{display:flex;justify-content:space-between;font-size:12px;border-bottom:1px dashed #000;padding:4px 0}" +
-    "table{width:100%;border-collapse:collapse;margin-top:6px}td{padding:4px 2px;font-size:15px;font-weight:700;border-bottom:1px dotted #999}td.q{width:34px;text-align:center}" +
+    "@page{size:" + (w58 ? "58mm" : "80mm") + " auto;margin:" + (w58 ? "2mm" : "3mm") + "}body{font-family:Arial,sans-serif;width:" + (w58 ? "52mm" : "72mm") + ";margin:0 auto;font-size:" + (w58 ? 12 : 13) + "px;color:#000}" +
+    "h1{font-size:" + (w58 ? 16 : 18) + "px;text-align:center;margin:4px 0}.m{display:flex;justify-content:space-between;gap:6px;font-size:" + (w58 ? 11 : 12) + "px;border-bottom:1px dashed #000;padding:4px 0}" +
+    "table{width:100%;border-collapse:collapse;margin-top:6px}td{padding:4px 2px;font-size:" + (w58 ? 14 : 15) + "px;font-weight:700;border-bottom:1px dotted #999;word-break:break-word}td.q{width:" + (w58 ? 26 : 34) + "px;text-align:center}" +
     ".n{margin-top:6px;font-size:12px}.f{text-align:center;font-size:10px;margin-top:8px}</style></head><body>" +
     "<h1>KITCHEN ORDER</h1><div class=m><b>" + escHtml(order.kot) + "</b><span>" + escHtml(fmtDate(order.date)) + " " + escHtml(fmtTime(order.time)) + "</span></div>" +
     "<div class=m><b>" + escHtml(order.where || "") + "</b><span>" + escHtml(order.by || "") + "</span></div>" +
@@ -1978,6 +2122,44 @@ function printKOT(order) {
   if (w) { w.document.write(html); w.document.close(); return true; }
   return false;
 }
+function printKOTRawBT(order, widthMm, copies) {
+  const one = kotEscPos(order, widthMm);
+  const all = new Uint8Array(one.length * copies);
+  for (let k = 0; k < copies; k++) all.set(one, k * one.length);
+  const b64 = bytesToBase64(all);
+  // Intent URL so Chrome on Android opens RawBT directly (or its Play Store
+  // page if it is not installed yet).
+  KotPrinter.go("intent:base64," + b64 + "#Intent;scheme=rawbt;package=ru.a402d.rawbtprinter;end;");
+  return true;
+}
+// Prints a KOT the way this device is set up. Never throws: if the direct
+// printer fails, the browser print dialog opens instead so the kitchen
+// still gets the order. Resolves to { ok, via, error? }.
+async function printKOT(order, opts) {
+  const cfg = { ...KotPrinter.get(), ...(opts || {}) };
+  if (cfg.mode === "bluetooth" && KotPrinter.btSupported()) {
+    try {
+      const one = kotEscPos(order, cfg.width);
+      for (let k = 0; k < cfg.copies; k++) await BtPrinter.write(one);
+      return { ok: true, via: "bluetooth" };
+    } catch (e) {
+      const ok = printKOTBrowser(order, cfg.width);
+      return { ok, via: "browser", error: "Bluetooth printer: " + (e && e.message || e) + " — normal print khola" };
+    }
+  }
+  if (cfg.mode === "rawbt" && KotPrinter.isAndroid()) {
+    try { return { ok: printKOTRawBT(order, cfg.width, cfg.copies), via: "rawbt" }; } catch (e) {}
+  }
+  return { ok: printKOTBrowser(order, cfg.width), via: "browser" };
+}
+function kotPrinterLabel() {
+  const c = KotPrinter.get();
+  return c.mode === "bluetooth" ? "Bluetooth" + (c.btName ? ": " + c.btName : "") : c.mode === "rawbt" ? "RawBT app" : "Print dialog, " + c.width + "mm";
+}
+function kotNotify(res) {
+  if (res && res.error) setTimeout(() => alert("⚠️ " + res.error), 50);
+}
+
 // GST for a walk-in restaurant bill: same "restaurant" rule the room bill
 // uses (5% at non-specified premises, 18% where any room tariff > ₹7,500),
 // inclusive/exclusive per the hotel's profile setting.
@@ -8134,7 +8316,7 @@ function MenuPicker({ menu, cart, setCart, cats, height }) {
     onClick, "aria-label": aria,
     style: { width: 34, height: 34, borderRadius: 9, border: dark ? "none" : "1.5px solid var(--border)", background: dark ? "var(--navy)" : "var(--cream)", color: dark ? "#fff" : "var(--navy)", fontWeight: 700, fontSize: 17, cursor: "pointer" }
   }, label);
-  return _h("div", { style: { display: "flex", flexDirection: "column", minHeight: 0, flex: 1 } },
+  return _h("div", { style: { display: "flex", flexDirection: "column", minHeight: 0, flex: "1 0 auto" } },
     _h("div", { style: { padding: "8px 14px 0" } },
       _h("input", { value: q, onChange: e => setQ(e.target.value), placeholder: "🔎 Item search karo…", "aria-label": "Search menu", style: { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 14 } })),
     !q.trim() && _h("div", { className: "hs", style: { display: "flex", gap: 6, padding: "10px 14px", overflowX: "auto", flexShrink: 0 } },
@@ -8142,7 +8324,7 @@ function MenuPicker({ menu, cart, setCart, cats, height }) {
         key: c, onClick: () => setCat(c),
         style: { padding: "7px 14px", borderRadius: 20, border: "1.5px solid", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer", fontFamily: "'Josefin Sans',sans-serif", background: cat === c ? "var(--navy)" : "transparent", color: cat === c ? "#fff" : "var(--navy)", borderColor: cat === c ? "var(--navy)" : "var(--border)" }
       }, c))),
-    _h("div", { className: "scrollable hs", style: { flex: 1, padding: "0 14px 10px", maxHeight: height || "none", overflowY: "auto" } },
+    _h("div", { className: "scrollable hs", style: { flex: 1, padding: "0 14px 10px", minHeight: 150, maxHeight: height || "none", overflowY: "auto" } },
       shown.length === 0 && _h("div", { style: { padding: 18, textAlign: "center", color: "var(--muted)", fontSize: 13 } }, list.length ? "Koi item nahi mila" : "Menu khaali hai — pehle '📋 Menu' me items jodo"),
       shown.map(m => _h("div", { key: m.id, style: { display: "flex", alignItems: "center", padding: "11px 0", borderBottom: "1px solid var(--border)" } },
         _h("div", { style: { flex: 1, minWidth: 0 } },
@@ -8227,14 +8409,14 @@ function ChargesModal({ booking, onAdd, onClose, canEditMenu, user }) {
     const charges = makeChargeItems(items, { src, table, user, kot: kotNo });
     try {
       await onAdd(charges);
-      if (kotNo) printKOT({ kot: kotNo, date: charges[0].date, time: charges[0].time, by: charges[0].by, where: "Room " + booking.roomId + (src === "restaurant" ? " · Restaurant" + (table ? " T-" + table : "") : " · Room Service"), items: items.filter(i => i.cat !== "🛎️ Services") });
+      if (kotNo) printKOT({ kot: kotNo, date: charges[0].date, time: charges[0].time, by: charges[0].by, where: "Room " + booking.roomId + (src === "restaurant" ? " · Restaurant" + (table ? " T-" + table : "") : " · Room Service"), items: items.filter(i => i.cat !== "🛎️ Services") }).then(kotNotify);
       onClose();
     } catch (e) { alert("Bill me nahi juda: " + e.message); setBusy(false); }
   };
   const seg = (val, label) => _h("button", { onClick: () => setSrc(val), "aria-pressed": src === val, style: { flex: 1, padding: "9px 6px", borderRadius: 9, border: "1.5px solid " + (src === val ? "var(--navy)" : "var(--border)"), background: src === val ? "var(--navy)" : "#fff", color: src === val ? "#fff" : "var(--navy)", fontSize: 12.5, fontWeight: 700, cursor: "pointer" } }, label);
   if (editMenu) return _h(MenuEditorModal, { onClose: () => setEditMenu(false), onSaved: m => setMenu(m) });
   return _h("div", { style: { position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 100, display: "flex", alignItems: "flex-end" } },
-    _h("div", { className: "card su", style: { width: "100%", borderRadius: "20px 20px 0 0", maxHeight: "90vh", display: "flex", flexDirection: "column", overflow: "hidden" } },
+    _h("div", { className: "card su", style: { width: "100%", borderRadius: "20px 20px 0 0", maxHeight: "90vh", display: "flex", flexDirection: "column", overflowY: "auto" } },
       _h("div", { style: { padding: "16px 16px 12px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } },
         _h("div", null, _h("div", { style: { fontWeight: 700, fontSize: 16 } }, "Add Food / Services"), _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, "Room ", booking.roomId, " · ", booking.name)),
         _h("div", { style: { display: "flex", gap: 6 } },
@@ -8247,8 +8429,83 @@ function ChargesModal({ booking, onAdd, onClose, canEditMenu, user }) {
         _h("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 8, fontSize: 14 } },
           _h("span", { style: { fontWeight: 600 } }, items.length, " item", items.length > 1 ? "s" : "", " · ", fmtMoney(total)),
           _h("span", { style: { color: "var(--muted)", fontSize: 12 } }, "+GST bill par (5–18% jaisa lage)")),
-        hasFood && hasFeature("restaurant") && _h("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 8 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: kot, onChange: e => setKot(e.target.checked) }), "🧾 Kitchen ke liye KOT print karo"),
+        hasFood && hasFeature("restaurant") && _h("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 8 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: kot, onChange: e => setKot(e.target.checked) }), "🧾 Kitchen ke liye KOT print karo", _h("span", { style: { color: "var(--muted)", fontSize: 11 } }, " (" + kotPrinterLabel() + ")")),
         _h("button", { className: "btn-p", disabled: busy, onClick: submit, style: { width: "100%" } }, busy ? "⏳ Jod rahe hain…" : "Add " + fmtMoney(total) + " to Room Bill"))));
+}
+
+/* ── SETTINGS: KOT printer (per device) ── */
+function KotPrinterCard() {
+  const _h = React.createElement;
+  const [cfg, setCfg] = useState(() => KotPrinter.get());
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const save = patch => setCfg(KotPrinter.set(patch));
+  const bt = KotPrinter.btSupported();
+  const android = KotPrinter.isAndroid();
+  const pair = async () => {
+    setBusy(true); setMsg("");
+    try { const name = await BtPrinter.pair(); setCfg(KotPrinter.get()); setMsg("✅ " + name + " jud gaya. Ab 'Test print' karo."); }
+    catch (e) { setMsg(e && e.name === "NotFoundError" ? "Koi printer select nahi kiya." : "❌ " + (e && e.message || e)); }
+    finally { setBusy(false); }
+  };
+  const test = async () => {
+    setBusy(true); setMsg("");
+    const now = new Date();
+    const res = await printKOT({ kot: "TEST", date: localDateStr(now), time: localTimeStr(now), by: "Settings", where: "Test print", items: [{ qty: 1, name: "Masala Chai" }, { qty: 2, name: "Paneer Butter Masala" }], note: "Printer test" });
+    setBusy(false);
+    setMsg(res.error ? "⚠️ " + res.error : res.via === "rawbt" ? "RawBT app khul raha hai — wahan se print hoga." : res.via === "bluetooth" ? "✅ Printer ko bhej diya." : "Print dialog khula — thermal printer chuno.");
+  };
+  const opt = (val, label, sub, disabled) => _h("label", { key: val, style: { display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 12px", borderRadius: 10, border: "1.5px solid " + (cfg.mode === val ? "var(--navy)" : "var(--border)"), background: cfg.mode === val ? "#eef2ff" : "#fff", marginBottom: 8, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.55 : 1 } },
+    _h("input", { type: "radio", name: "kotmode", value: val, checked: cfg.mode === val, disabled, onChange: () => { save({ mode: val }); setMsg(""); }, style: { width: 18, height: 18, flex: "0 0 auto", margin: "2px 0 0", accentColor: "var(--navy)" } }),
+    _h("span", null, _h("b", { style: { fontSize: 13.5 } }, label), _h("br"), _h("span", { style: { fontSize: 12, color: "var(--muted)" } }, sub)));
+  const field = { padding: "8px 10px", borderRadius: 8, border: "1.5px solid var(--border)", fontSize: 13, background: "#fff" };
+  return _h("div", { style: { background: "var(--card)", borderRadius: 16, padding: 18, border: "1px solid var(--border)", marginTop: 14 } },
+    _h("div", { style: { fontWeight: 700, fontSize: 16, color: "var(--navy)", marginBottom: 4 } }, "🖨️ KOT Printer (is device ke liye)"),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 12 } }, "Jis phone/computer se order lete ho, usi par set karo. Har device ki apni setting hoti hai."),
+    opt("browser", "Normal print (USB / WiFi printer)", "Print dialog khulega — computer se juda thermal printer chuno. Har printer chalta hai."),
+    opt("bluetooth", "Bluetooth thermal printer (direct)", bt ? "Bina app ke seedha print. BLE wale printer chahiye; purane printer ke liye RawBT use karo." : "Is browser me Bluetooth nahi hai — Android/Windows par Chrome use karo.", !bt),
+    opt("rawbt", "RawBT app se (Android, har Bluetooth printer)", android ? "Play Store se free 'RawBT' app install karo, usme printer jodo. Sabse zyada printers isi se chalte hain." : "Sirf Android phone par chalta hai.", !android),
+    cfg.mode === "bluetooth" && bt && _h("div", { style: { display: "flex", gap: 8, alignItems: "center", marginBottom: 10, flexWrap: "wrap" } },
+      _h("span", { style: { fontSize: 12.5, flex: 1, minWidth: 140 } }, cfg.btName ? _h(React.Fragment, null, "Printer: ", _h("b", null, cfg.btName)) : "Abhi koi printer nahi juda"),
+      _h("button", { className: "btn-o", disabled: busy, onClick: pair, style: { width: "auto", padding: "8px 12px" } }, cfg.btName ? "🔄 Dusra printer" : "🔗 Printer jodo")),
+    _h("div", { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 12 } },
+      _h("label", { style: { fontSize: 12.5, display: "flex", alignItems: "center", gap: 6 } }, "Paper",
+        _h("select", { value: cfg.width, onChange: e => save({ width: Number(e.target.value) }), "aria-label": "Paper width", style: field }, _h("option", { value: 80 }, "80 mm (3 inch)"), _h("option", { value: 58 }, "58 mm (2 inch)"))),
+      cfg.mode !== "browser" && _h("label", { style: { fontSize: 12.5, display: "flex", alignItems: "center", gap: 6 } }, "Copies",
+        _h("select", { value: cfg.copies, onChange: e => save({ copies: Number(e.target.value) }), "aria-label": "KOT copies", style: field }, [1, 2, 3].map(n => _h("option", { key: n, value: n }, n))))),
+    _h("button", { className: "btn-p", disabled: busy, onClick: test, style: { width: "100%" } }, busy ? "⏳ …" : "🧾 Test print"),
+    msg && _h("div", { role: "status", style: { fontSize: 12.5, marginTop: 8, color: /^❌|^⚠️/.test(msg) ? "#b91c1c" : "#166534" } }, msg));
+}
+
+/* ── SETTINGS: Restaurant staff login (Owner only) ── */
+function RestaurantStaffLoginCard() {
+  const _h = React.createElement;
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const exists = (() => { try { return JSON.parse(localStorage.getItem("ab_users") || "[]").some(x => x.u === "restaurant"); } catch (e) { return false; } })();
+  const save = async () => {
+    if (pw.length < 8) { setMsg("❌ Password kam se kam 8 characters ka rakho"); return; }
+    try {
+      const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
+      const hash = await SecUtils.hashPassword(pw);
+      const had = users.some(x => x.u === "restaurant");
+      const next = had
+        ? users.map(x => x.u === "restaurant" ? { ...x, p: hash, role: "Restaurant", mustChange: false } : x)
+        : users.concat([{ u: "restaurant", p: hash, name: "Restaurant Staff", role: "Restaurant", mustChange: false }]);
+      localStorage.setItem("ab_users", JSON.stringify(next));
+      CloudSync.users(next);
+      AuditLog.add(had ? "RESTAURANT_LOGIN_RESET" : "RESTAURANT_LOGIN_CREATED", "restaurant");
+      setPw("");
+      setMsg("✅ Login taiyaar — Username: restaurant · Password: jo abhi set kiya");
+    } catch (e) { setMsg("❌ Login nahi bana: " + e.message); }
+  };
+  return _h("div", { style: { background: "var(--card)", borderRadius: 16, padding: 18, border: "1px solid var(--border)", marginTop: 14 } },
+    _h("div", { style: { fontWeight: 700, fontSize: 16, color: "var(--navy)", marginBottom: 4 } }, "👤 Restaurant staff login"),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 10 } }, "Username ", _h("b", null, "restaurant"), " — ye sirf Restaurant section dekh sakta hai (room rates, revenue, guest ID nahi). ", exists ? "Login bana hua hai; naya password daal ke reset kar sakte ho." : "Abhi bana nahi hai."),
+    _h("div", { style: { display: "flex", gap: 8 } },
+      _h("input", { value: pw, onChange: e => setPw(e.target.value), type: "password", placeholder: "Naya password (min 8)", "aria-label": "Restaurant staff password", autoComplete: "new-password", style: { flex: 1, minWidth: 0, boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 13.5 } }),
+      _h("button", { className: "btn-o", onClick: save, style: { width: "auto", whiteSpace: "nowrap", padding: "8px 12px" } }, exists ? "Reset karo" : "Set karo")),
+    msg && _h("div", { role: "status", style: { fontSize: 12.5, marginTop: 8, color: msg.startsWith("❌") ? "#b91c1c" : "#166534" } }, msg));
 }
 
 /* ── RESTAURANT COUNTER (paid add-on: "restaurant") ── */
@@ -8270,7 +8527,6 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
   const [toast, setToast] = useState("");
   const [bills, setBills] = useState([]);
   const [editMenu, setEditMenu] = useState(false);
-  const [staffPw, setStaffPw] = useState("");
   useEffect(() => { MenuStore.refresh().then(setMenu).catch(() => {}); RestaurantBills.list().then(setBills).catch(() => {}); }, []);
   const active = (bookings || []).filter(b => b.status === "active").sort((a, b) => String(a.roomId).localeCompare(String(b.roomId), undefined, { numeric: true }));
   const sel = active.find(b => b.id === bookingId) || null;
@@ -8293,7 +8549,7 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
     try {
       await onAddCharge(sel.id, charges);
       AuditLog.add("ROOM_ORDER", "Room " + sel.roomId + " · " + fmtMoney(amt) + (kotNo ? " · " + kotNo : ""));
-      if (kotNo) printKOT({ kot: kotNo, date: charges[0].date, time: charges[0].time, by: charges[0].by, note, where: "Room " + sel.roomId + (src === "restaurant" ? " · Restaurant" + (table ? " T-" + table : "") : " · Room Service"), items: foodOnly });
+      if (kotNo) printKOT({ kot: kotNo, date: charges[0].date, time: charges[0].time, by: charges[0].by, note, where: "Room " + sel.roomId + (src === "restaurant" ? " · Restaurant" + (table ? " T-" + table : "") : " · Room Service"), items: foodOnly }).then(kotNotify);
       flash("✅ " + fmtMoney(amt) + " — Room " + sel.roomId + " ke bill me jud gaya");
       reset();
     } catch (e) { alert("Bill me nahi juda: " + e.message); } finally { setBusy(false); }
@@ -8317,33 +8573,16 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
       const all = await RestaurantBills.append(bill);
       setBills(all.filter(b => b.date === localDateStr()));
       AuditLog.add("RESTAURANT_BILL", id + " · " + fmtMoney(g.total) + " · " + payMode);
-      if (kotNo) printKOT({ kot: kotNo, date: bill.date, time: bill.time, by: bill.by, note, where: "Walk-in" + (bill.table ? " · Table " + bill.table : ""), items: bill.items });
+      if (kotNo) printKOT({ kot: kotNo, date: bill.date, time: bill.time, by: bill.by, note, where: "Walk-in" + (bill.table ? " · Table " + bill.table : ""), items: bill.items }).then(kotNotify);
       openHtmlBill(bill);
       reset();
     } catch (e) { alert("Bill nahi bana: " + e.message); } finally { setBusy(false); }
   };
-  const createStaffLogin = async () => {
-    if (staffPw.length < 8) { alert("Password kam se kam 8 characters ka rakho"); return; }
-    try {
-      const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
-      const hash = await SecUtils.hashPassword(staffPw);
-      const exists = users.some(x => x.u === "restaurant");
-      const next = exists
-        ? users.map(x => x.u === "restaurant" ? { ...x, p: hash, role: "Restaurant", mustChange: false } : x)
-        : users.concat([{ u: "restaurant", p: hash, name: "Restaurant Staff", role: "Restaurant", mustChange: false }]);
-      localStorage.setItem("ab_users", JSON.stringify(next));
-      CloudSync.users(next);
-      AuditLog.add(exists ? "RESTAURANT_LOGIN_RESET" : "RESTAURANT_LOGIN_CREATED", "restaurant");
-      setStaffPw("");
-      alert("✅ Restaurant staff login taiyaar:\nUsername: restaurant\nPassword: jo abhi set kiya");
-    } catch (e) { alert("Login nahi bana: " + e.message); }
-  };
-
   const seg = (val, cur, set, label) => _h("button", { onClick: () => set(val), "aria-pressed": cur === val, style: { flex: 1, padding: "10px 6px", borderRadius: 10, border: "1.5px solid " + (cur === val ? "var(--navy)" : "var(--border)"), background: cur === val ? "var(--navy)" : "#fff", color: cur === val ? "#fff" : "var(--navy)", fontSize: 13, fontWeight: 700, cursor: "pointer" } }, label);
   const field = { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 13.5 };
   if (editMenu) return _h(MenuEditorModal, { onClose: () => setEditMenu(false), onSaved: m => setMenu(m) });
 
-  return _h("div", { className: "scrollable hs", style: { height: "100%", display: "flex", flexDirection: "column" } },
+  return _h("div", { className: "scrollable hs", style: { height: "100%", overflowY: "auto", paddingBottom: 24 } },
     _h("div", { style: { padding: "14px 14px 8px", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 } },
       _h("div", null,
         _h("h2", { style: { fontSize: 20, fontFamily: "'Josefin Sans',sans-serif", color: "var(--navy)", margin: 0 } }, "🍽️ Restaurant"),
@@ -8372,7 +8611,7 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
         _h("div", { style: { display: "flex", justifyContent: "space-between" } }, _h("span", null, "GST @ ", (preview.rate * 100).toFixed(0), "% (CGST+SGST)"), _h("b", null, fmtMoney(preview.gst))),
         _h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 16, marginTop: 4 } }, _h("b", null, "Total"), _h("b", null, fmtMoney(preview.total))),
         _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 6, marginTop: 8 } }, ["Cash", "UPI", "Card"].map(m => _h("button", { key: m, onClick: () => setPayMode(m), "aria-pressed": payMode === m, style: { padding: 8, borderRadius: 8, fontSize: 12.5, fontWeight: 700, cursor: "pointer", border: "1.5px solid " + (payMode === m ? "var(--navy)" : "var(--border)"), background: payMode === m ? "var(--navy)" : "#fff", color: payMode === m ? "#fff" : "#333" } }, m)))),
-      foodOnly.length > 0 && _h("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 8 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: kot, onChange: e => setKot(e.target.checked) }), "🧾 Kitchen ke liye KOT print karo"),
+      foodOnly.length > 0 && _h("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 8 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: kot, onChange: e => setKot(e.target.checked) }), "🧾 Kitchen ke liye KOT print karo", _h("span", { style: { color: "var(--muted)", fontSize: 11 } }, " (" + kotPrinterLabel() + ")")),
       mode === "room"
         ? _h("button", { className: "btn-p", disabled: busy, onClick: addToRoom, style: { width: "100%" } }, busy ? "⏳ Jod rahe hain…" : "➕ " + fmtMoney(amt) + " Room " + sel.roomId + " ke bill me jodo")
         : _h("button", { className: "btn-p", disabled: busy, onClick: makeWalkinBill, style: { width: "100%" } }, busy ? "⏳ Bill ban raha hai…" : "🧾 Bill banao — " + fmtMoney(preview ? preview.total : amt) + " (" + payMode + ")")),
@@ -8380,13 +8619,7 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
       _h("div", { className: "st", style: { marginBottom: 6 } }, "AAJ KE WALK-IN BILLS"),
       bills.slice().reverse().map(b => _h("button", { key: b.id, onClick: () => openHtmlBill(b), style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", marginBottom: 6, borderRadius: 10, border: "1px solid var(--border)", background: "#fff", cursor: "pointer", fontSize: 13 } },
         _h("span", { style: { textAlign: "left" } }, _h("b", null, b.id), _h("br"), _h("span", { style: { color: "var(--muted)", fontSize: 11.5 } }, fmtTime(b.time), b.cust ? " · " + b.cust : "", " · ", b.payMode)),
-        _h("b", null, fmtMoney(b.total))))),
-    user && user.role === "Owner" && _h("div", { style: { margin: "4px 14px 20px", padding: 12, borderRadius: 12, border: "1px dashed var(--border)" } },
-      _h("div", { style: { fontWeight: 700, fontSize: 13, marginBottom: 4 } }, "👤 Restaurant staff login"),
-      _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 8 } }, "Username 'restaurant' — ye sirf Restaurant section dekh sakta hai (room rates, revenue, guest ID nahi)."),
-      _h("div", { style: { display: "flex", gap: 8 } },
-        _h("input", { value: staffPw, onChange: e => setStaffPw(e.target.value), type: "password", placeholder: "Naya password (min 8)", "aria-label": "Restaurant staff password", autoComplete: "new-password", style: field }),
-        _h("button", { className: "btn-o", onClick: createStaffLogin, style: { width: "auto", whiteSpace: "nowrap", padding: "8px 12px" } }, "Set karo"))));
+        _h("b", null, fmtMoney(b.total))))));
 }
 
 /* ── BOOKING MODAL ────────────────────────────────────────────── */
@@ -12268,7 +12501,8 @@ function App() {
   });
   if (showUpdatePwd) return /*#__PURE__*/React.createElement("div", {
     style: {
-      minHeight: "100vh",
+      height: "100svh",
+      overflowY: "auto",
       background: "var(--bg)"
     }
   }, /*#__PURE__*/React.createElement("div", {
@@ -12297,10 +12531,12 @@ function App() {
       fontWeight: 700,
       fontSize: 16
     }
-  }, "CHANGE PASSWORD")), /*#__PURE__*/React.createElement(UpdatePasswordScreen, {
+  }, "⚙️ SETTINGS")), /*#__PURE__*/React.createElement(UpdatePasswordScreen, {
     user: user,
     onDone: () => setUpdatePwd(false)
-  }));
+  }), hasFeature("restaurant") && /*#__PURE__*/React.createElement("div", {
+    style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
+  }, /*#__PURE__*/React.createElement(KotPrinterCard, null), user.role === "Owner" && /*#__PURE__*/React.createElement(RestaurantStaffLoginCard, null)));
   const liveB = bookings.find(b => b.id === modal?.b?.id) || modal?.b;
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -12391,6 +12627,8 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setUpdatePwd(true),
+    "aria-label": "Settings",
+    title: "Settings — password, KOT printer, staff login",
     style: {
       background: "rgba(255,255,255,.08)",
       border: "none",
@@ -12401,7 +12639,7 @@ function App() {
       fontSize: 11,
       fontFamily: "'Josefin Sans',sans-serif"
     }
-  }, "🔑"), /*#__PURE__*/React.createElement("button", {
+  }, "⚙️"), /*#__PURE__*/React.createElement("button", {
     onClick: handleLogout,
     style: {
       background: "rgba(255,255,255,.12)",
