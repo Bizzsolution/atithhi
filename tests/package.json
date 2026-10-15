@@ -2,13 +2,17 @@
   "name": "atithibook-security-tests",
   "private": true,
   "scripts": {
-    "test": "node functions_test.mjs && node admin_login_security_test.js && node license_expiry_client_test.js && node booking_notify_second_device_test.js && node flow_test.js && node billing_regression.js",
+    "test": "node functions_test.mjs && node security_audit_2_test.mjs && node menu_extract_test.mjs && node admin_login_security_test.js && node license_expiry_client_test.js && node booking_notify_second_device_test.js && node flow_test.js && node billing_regression.js",
+    "test:browser": "node data_manager_browser_test.mjs && node security_audit_2_browser_test.mjs && node restaurant_browser_test.mjs && node menu_import_browser_test.mjs",
     "test:rules": "firebase emulators:exec --only firestore --project atithibook-saas \"node firestore.rules.test.mjs\""
   },
   "devDependencies": {
     "jsdom": "^24.0.0",
+    "playwright": "^1.56.0",
     "firebase-tools": "^13.0.0",
     "@firebase/rules-unit-testing": "^3.0.0",
-    "firebase": "^10.12.2"
+    "firebase": "^10.12.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   }
 }

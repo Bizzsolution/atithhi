@@ -76,6 +76,18 @@
   <!-- Firebase SDK -->
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <!-- AD-1 remediation (see SECURITY_AUDIT.md): /api/verify-access now mints a
+       Firebase custom token bound to this hotel's license key, and this device
+       signs into it so requests carry a VERIFIED identity instead of relying
+       on knowledge of the (shared, never-rotated) license key alone. Loaded
+       here, alongside firestore-compat, so it's available before any
+       hotels/{key} read/write is attempted. Phase 1 (now): sign in
+       opportunistically, log adoption via the authVersion doc; firestore.rules
+       still also accept the legacy key-shape check so already-deployed devices
+       that haven't picked up this build yet are never locked out mid-shift.
+       Phase 2 (later, once authVersion shows full adoption): rules are
+       tightened to require request.auth.token.hotelId only. -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
   <!-- Bundled locally, not from a CDN: this app runs in hotels with patchy
        connectivity and as an installed PWA, where a CDN fetch can silently
        fail and leave QR scanning permanently dead with no visible error. -->
@@ -83,6 +95,7 @@
   <script>
     // Crash-proof Firebase init — app works even if SDK fails to load
     window._db=null;
+    window._auth=null;
     try{
       if(typeof firebase!=="undefined"&&firebase.initializeApp){
         firebase.initializeApp({
@@ -94,6 +107,18 @@
           appId:"1:851231850636:web:1168ddb738e1d7f41a7ba9"
         });
         window._db=firebase.firestore();
+        // AD-1: verified per-hotel identity (see comment above the SDK
+        // script tags). LOCAL persistence — unlike the admin panel's
+        // Auth.Persistence.NONE — because this session should legitimately
+        // survive app restarts/PWA relaunches on a hotel's own device.
+        try{
+          if(firebase.auth){
+            window._auth=firebase.auth();
+            window._auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(()=>{});
+          }
+        }catch(authErr){
+          console.warn("[AtithiBook] Firebase Auth init failed — falling back to legacy key-only access:",authErr.message);
+        }
         // Real-time listeners (onSnapshot) use a persistent WebChannel
         // "Listen" stream under the hood — DIFFERENT from the simple HTTP
         // requests used by one-time get()/set() calls. Some networks
@@ -132,8 +157,15 @@
   </script>
 
   <!-- Load order: React → Babel -->
-  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <!-- AUDIT-2 (F9): Subresource Integrity. These two files hold the whole
+       UI runtime; without integrity pinning, anything able to alter what
+       unpkg serves for these URLs runs with full access to guest data and
+       the license key. Hashes = sha384 of the npm tarball's files
+       (react@18.3.1 / react-dom@18.3.1), which unpkg serves byte-for-byte.
+       Changing the version REQUIRES recomputing these:
+         npm pack react@X && tar -xzOf react-X.tgz package/umd/react.production.min.js | openssl dgst -sha384 -binary | base64 -->
+  <script crossorigin="anonymous" referrerpolicy="no-referrer" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin="anonymous" referrerpolicy="no-referrer" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <!-- Claude Vision API handles Aadhaar scanning — user enters API key once in app -->
 
   <style>
@@ -255,8 +287,109 @@ const SecUtils = {
   },
   sanitize(str) {
     return String(str || "").replace(/[<>"']/g, "").slice(0, 500);
+  },
+  // ── STAFF PASSWORD HASHING (AUDIT-2 F5) ──────────────────────────
+  // hash() above is one SHA-256 round with a salt shared by every hotel,
+  // and the resulting hashes are synced to Firestore (hotels/<key>/data/
+  // users). Anyone who reads that document can test billions of guesses
+  // per second offline. New format: PBKDF2-HMAC-SHA256, 16-byte random
+  // salt PER PASSWORD, iteration count stored in the hash so it can be
+  // raised later without breaking existing logins:
+  //   "pbkdf2-sha256$<iterations>$<base64 salt>$<base64 32-byte key>"
+  // Legacy hashes still verify once and are re-hashed on that login.
+  PW_ITER: 310000,
+  PW_PREFIX: "pbkdf2-sha256$",
+  _b64(u8) {
+    let s = "";
+    for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+    return btoa(s);
+  },
+  _unb64(b64) {
+    const s = atob(b64);
+    const u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+    return u8;
+  },
+  _ctEq(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    let d = 0;
+    for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
+    return d === 0;
+  },
+  async _pbkdf2(pw, salt, iterations) {
+    const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(String(pw)), { name: "PBKDF2" }, false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, km, 256);
+    return new Uint8Array(bits);
+  },
+  async hashPassword(pw) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const dk = await this._pbkdf2(pw, salt, this.PW_ITER);
+    return this.PW_PREFIX + this.PW_ITER + "$" + this._b64(salt) + "$" + this._b64(dk);
+  },
+  // Returns { ok, upgrade }. upgrade=true means the stored value is in an
+  // older format/strength and the caller should replace it with
+  // hashPassword(pw) now that the plaintext is known to be correct.
+  async verifyPassword(pw, stored) {
+    const s = typeof stored === "string" ? stored : "";
+    if (s.indexOf(this.PW_PREFIX) === 0) {
+      const parts = s.split("$");
+      if (parts.length !== 4) return { ok: false, upgrade: false };
+      const iterations = parseInt(parts[1], 10);
+      // Bounds: a tampered users document must not be able to freeze the
+      // login screen with an absurd iteration count.
+      if (!(iterations >= 100000 && iterations <= 5000000)) return { ok: false, upgrade: false };
+      let salt, want;
+      try { salt = this._unb64(parts[2]); want = this._unb64(parts[3]); } catch (e) { return { ok: false, upgrade: false }; }
+      if (salt.length < 16 || want.length !== 32) return { ok: false, upgrade: false };
+      const got = await this._pbkdf2(pw, salt, iterations);
+      const ok = this._ctEq(got, want);
+      return { ok, upgrade: ok && iterations < this.PW_ITER };
+    }
+    if (/^[0-9a-f]{64}$/.test(s)) {
+      const enc = new TextEncoder();
+      const ok = this._ctEq(enc.encode(await this.hash(pw)), enc.encode(s));
+      return { ok, upgrade: ok };
+    }
+    // Very old installs stored the default demo password in plaintext.
+    // Accept ONLY an exact match against such a stored default (the old
+    // code accepted "admin123"/"front123" for ANY account) and force the
+    // upgrade.
+    if (s && STAFF.some(d => d.p === s)) {
+      const ok = String(pw) === s;
+      return { ok, upgrade: ok };
+    }
+    return { ok: false, upgrade: false };
+  },
+  // Burns the same work as a real verification so "unknown username" and
+  // "wrong password" take equally long.
+  async burnPasswordWork(pw) {
+    await this._pbkdf2(pw, new Uint8Array(16), this.PW_ITER);
+    return { ok: false, upgrade: false };
   }
 };
+
+// ── PHONE-SHAPE CHECK (AUDIT-2 F1) ───────────────────────────────
+// Mirrors isPhoneShaped() in netlify/functions/verify-access.mjs. Used to
+// purge any non-phone value an older build persisted as the "verified
+// phone" — in particular ADMIN_SECRET, which the admin-bypass flow used
+// to save into this device's localStorage.
+const PhoneShape = {
+  normalize(raw) {
+    let d = String(raw || "").replace(/\D/g, "");
+    if (d.length > 10 && d.indexOf("91") === 0) d = d.slice(2);
+    return d.slice(-10);
+  },
+  ok(raw) {
+    const s = String(raw || "").replace(/[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/g, "").trim();
+    return /^[0-9+\s\-()./]{7,28}$/.test(s) && this.normalize(s).length === 10;
+  }
+};
+(function purgeNonPhoneVerifiedPhone() {
+  try {
+    const v = localStorage.getItem("ab_verified_phone");
+    if (v !== null && !PhoneShape.ok(v)) localStorage.removeItem("ab_verified_phone");
+  } catch (e) {}
+})();
 
 // ── AADHAAR MASKING (Legal compliance — display only) ──────────
 const maskAadhaar = num => {
@@ -821,18 +954,14 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
     // the restaurant rate — the totals still added up, so the mistake was
     // invisible on the bill while over-stating GST in the returns. Match
     // the item name against the menu to recover the correct category.
-    let cat = c.cat;
-    if (cat !== "🍛 Food" && cat !== "☕ Beverages" && cat !== "🛎️ Services") {
-      const m = MENU.find(x => x.name === c.name);
-      if (m) cat = m.cat;
-    }
+    const cat = chargeCat(c);
     if (cat === "🍛 Food" || cat === "☕ Beverages") { foodAmtRaw += lineTotal; return; }
     // Within "🛎️ Services", split further so each gets its OWN SAC/rate
     // instead of everything being lumped into one "Other Services @ 18%"
     // line — laundry, cab, and extra-bed each have their own GST
     // treatment per the rule master, and a real GST audit expects them
     // reported separately.
-    const sub = ITEM_SUBCATEGORY[c.name];
+    const sub = chargeSub(c);
     if (sub === "laundry") laundryAmtRaw += lineTotal;
     else if (sub === "transport") transportAmtRaw += lineTotal;
     else if (sub === "extra_bed") extraBedAmtRaw += lineTotal;
@@ -953,15 +1082,11 @@ function buildTaxedLineItems(booking, roomObj, allRooms) {
   (booking.charges || []).forEach(c => {
     const lineTotal = (c.price || 0) * (c.qty || 0);
     if (lineTotal <= 0) return;
-    let cat = c.cat;
-    if (cat !== "🍛 Food" && cat !== "☕ Beverages" && cat !== "🛎️ Services") {
-      const m = MENU.find(x => x.name === c.name);
-      if (m) cat = m.cat;
-    }
+    const cat = chargeCat(c);
     let rate, sac;
     if (cat === "🍛 Food" || cat === "☕ Beverages") { rate = G.foodGSTRate; sac = G.foodSAC; }
     else {
-      const sub = ITEM_SUBCATEGORY[c.name];
+      const sub = chargeSub(c);
       if (sub === "laundry") { rate = G.laundryGSTRate; sac = G.laundrySAC; }
       else if (sub === "transport") { rate = G.transportGSTRate; sac = G.transportSAC; }
       else if (sub === "extra_bed") { rate = G.extraBedGSTRate; sac = G.extraBedSAC; }
@@ -969,8 +1094,11 @@ function buildTaxedLineItems(booking, roomObj, allRooms) {
     }
     const s = split(lineTotal, rate);
     const cs = splitCgstSgst(s.gst);
+    const tag = chargeLabel(c);
     lines.push({
-      date: booking.checkIn || "", desc: c.name + (c.qty > 1 ? " x" + c.qty : ""),
+      // Each order shows the day it was actually placed (older charges,
+      // saved before orders were time-stamped, keep the check-in date).
+      date: c.date || booking.checkIn || "", desc: c.name + (c.qty > 1 ? " x" + c.qty : "") + (tag ? " (" + tag + ")" : ""),
       sac, rate, taxable: s.base, cgst: cs.cgst, sgst: cs.sgst, total: s.base + s.gst
     });
   });
@@ -1712,6 +1840,224 @@ const ITEM_SUBCATEGORY = {
   "Extra Bed": "extra_bed"
   // "Newspaper" deliberately absent — falls through to other_services.
 };
+
+// ══════════════════════════════════════════════════════════════
+//  MENU + RESTAURANT / ROOM-SERVICE CORE
+// ══════════════════════════════════════════════════════════════
+// The menu used to be the hard-coded MENU constant above, so a hotel
+// could not change a single price. It is now each hotel's own list,
+// stored at hotels/<KEY>/data/menu (falls back to MENU until the owner
+// saves one). Every charge copies its own name/price/category/GST
+// sub-category at the moment it is added, so later menu edits never
+// change an existing bill.
+const MENU_CATS = ["☕ Beverages", "🍛 Food", "🛎️ Services"];
+const MENU_SUBS = ["", "laundry", "transport", "extra_bed"];
+const CHARGE_SRC_LABEL = { room: "Room Service", restaurant: "Restaurant" };
+let CURRENT_MENU = null; // null = not loaded yet → MenuStore.get() falls back
+function normalizeMenu(list) {
+  const out = [];
+  const seen = {};
+  (Array.isArray(list) ? list : []).forEach((m, i) => {
+    if (!m || typeof m !== "object") return;
+    const name = String(m.name || "").trim().slice(0, 60);
+    if (!name) return;
+    const cat = MENU_CATS.indexOf(m.cat) >= 0 ? m.cat : "🍛 Food";
+    const price = Math.round(Math.min(100000, Math.max(0, Number(m.price) || 0)) * 100) / 100;
+    let id = String(m.id || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || ("m" + Date.now().toString(36) + i);
+    while (seen[id]) id = id + "x";
+    seen[id] = true;
+    const sub = cat === "🛎️ Services" ? (MENU_SUBS.indexOf(m.sub) >= 0 ? m.sub : (ITEM_SUBCATEGORY[name] || "")) : "";
+    out.push({ id, cat, name, price, sub, active: m.active !== false, veg: m.veg === false ? false : true });
+  });
+  return out.slice(0, 400);
+}
+const MenuStore = {
+  get() {
+    if (CURRENT_MENU) return CURRENT_MENU;
+    try {
+      const v = JSON.parse(localStorage.getItem("ab_menu") || "null");
+      if (Array.isArray(v) && v.length) { CURRENT_MENU = normalizeMenu(v); return CURRENT_MENU; }
+    } catch (e) {}
+    return normalizeMenu(MENU);
+  },
+  async refresh() {
+    try {
+      const v = await WS.get("menu", true);
+      if (Array.isArray(v) && v.length) CURRENT_MENU = normalizeMenu(v);
+    } catch (e) {}
+    return MenuStore.get();
+  },
+  async save(list) {
+    const clean = normalizeMenu(list);
+    CURRENT_MENU = clean;
+    await WS.set("menu", clean);
+    return clean;
+  }
+};
+// Category / GST sub-category for a charge line. Prefers what the charge
+// itself recorded; older charges (no `cat`) are matched against the
+// hotel's menu, then the built-in defaults.
+function chargeCat(c) {
+  if (c && MENU_CATS.indexOf(c.cat) >= 0) return c.cat;
+  const name = c && c.name;
+  const m = MenuStore.get().find(x => x.name === name) || MENU.find(x => x.name === name);
+  return m ? m.cat : c && c.cat;
+}
+function chargeSub(c) {
+  if (c && c.sub && MENU_SUBS.indexOf(c.sub) > 0) return c.sub;
+  const name = c && c.name;
+  const m = MenuStore.get().find(x => x.name === name);
+  return (m && m.sub) || ITEM_SUBCATEGORY[name] || "";
+}
+// Local (device-timezone) date/time. todayStr() is UTC, so an order
+// placed between 00:00 and 05:30 IST would carry the previous day's date;
+// bills must show the date the guest actually ordered.
+function localDateStr(d) {
+  const x = d || new Date();
+  return x.getFullYear() + "-" + String(x.getMonth() + 1).padStart(2, "0") + "-" + String(x.getDate()).padStart(2, "0");
+}
+function localTimeStr(d) {
+  const x = d || new Date();
+  return String(x.getHours()).padStart(2, "0") + ":" + String(x.getMinutes()).padStart(2, "0");
+}
+// Turns cart lines into charge records with source, time and who added them.
+function makeChargeItems(items, opts) {
+  const o = opts || {};
+  const now = new Date();
+  const src = o.src === "restaurant" ? "restaurant" : "room";
+  const by = String((o.user && (o.user.name || o.user.u)) || "").slice(0, 40);
+  const table = String(o.table || "").trim().slice(0, 12);
+  const orderId = "O" + now.getTime().toString(36).toUpperCase();
+  return (items || []).filter(i => i && i.qty > 0).map((i, k) => ({
+    id: orderId + "-" + k,
+    orderId,
+    name: String(i.name).slice(0, 60),
+    price: Number(i.price) || 0,
+    qty: Math.max(1, Math.min(999, Math.round(Number(i.qty) || 1))),
+    cat: MENU_CATS.indexOf(i.cat) >= 0 ? i.cat : chargeCat(i),
+    sub: i.sub || "",
+    src,
+    date: localDateStr(now),
+    time: localTimeStr(now),
+    by,
+    table,
+    kot: o.kot || ""
+  }));
+}
+function chargeLabel(c) {
+  const parts = [];
+  if (c.src && CHARGE_SRC_LABEL[c.src]) parts.push(CHARGE_SRC_LABEL[c.src] + (c.table ? " T-" + c.table : ""));
+  if (c.time) parts.push(fmtTime(c.time));
+  return parts.join(", ");
+}
+// KOT numbers restart every day, per device (kitchen slips, not tax docs).
+function nextKotNumber() {
+  const k = "ab_kot_" + localDateStr();
+  let n = 0;
+  try { n = (parseInt(localStorage.getItem(k), 10) || 0) + 1; localStorage.setItem(k, String(n)); } catch (e) { n = Date.now() % 1000; }
+  return "K" + String(n).padStart(3, "0");
+}
+// Kitchen Order Ticket — 80 mm slip. Opens the print dialog; on phones the
+// same slip can be shared to the kitchen's WhatsApp instead.
+function kotText(order) {
+  const head = "KOT " + order.kot + " · " + (order.where || "") + " · " + fmtTime(order.time);
+  return head + "\n" + order.items.map(i => i.qty + " x " + i.name).join("\n") + (order.note ? "\nNote: " + order.note : "");
+}
+function printKOT(order) {
+  const rows = order.items.map(i => "<tr><td class=q>" + escHtml(i.qty) + "</td><td>" + escHtml(i.name) + "</td></tr>").join("");
+  const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>KOT " + escHtml(order.kot) + "</title><style>" +
+    "@page{size:80mm auto;margin:3mm}body{font-family:Arial,sans-serif;width:72mm;margin:0 auto;font-size:13px;color:#000}" +
+    "h1{font-size:18px;text-align:center;margin:4px 0}.m{display:flex;justify-content:space-between;font-size:12px;border-bottom:1px dashed #000;padding:4px 0}" +
+    "table{width:100%;border-collapse:collapse;margin-top:6px}td{padding:4px 2px;font-size:15px;font-weight:700;border-bottom:1px dotted #999}td.q{width:34px;text-align:center}" +
+    ".n{margin-top:6px;font-size:12px}.f{text-align:center;font-size:10px;margin-top:8px}</style></head><body>" +
+    "<h1>KITCHEN ORDER</h1><div class=m><b>" + escHtml(order.kot) + "</b><span>" + escHtml(fmtDate(order.date)) + " " + escHtml(fmtTime(order.time)) + "</span></div>" +
+    "<div class=m><b>" + escHtml(order.where || "") + "</b><span>" + escHtml(order.by || "") + "</span></div>" +
+    "<table>" + rows + "</table>" + (order.note ? "<div class=n>Note: " + escHtml(order.note) + "</div>" : "") +
+    "<div class=f>AtithiBook</div><script>window.onload=function(){setTimeout(function(){window.print()},200)}<\/script></body></html>";
+  const w = window.open("", "_blank", "width=360,height=600");
+  if (w) { w.document.write(html); w.document.close(); return true; }
+  return false;
+}
+// GST for a walk-in restaurant bill: same "restaurant" rule the room bill
+// uses (5% at non-specified premises, 18% where any room tariff > ₹7,500),
+// inclusive/exclusive per the hotel's profile setting.
+function calcRestaurantBill(items) {
+  const specified = isSpecifiedPremises(CURRENT_ROOMS);
+  const overrides = (CURRENT_PROFILE && CURRENT_PROFILE.gstOverrides) || null;
+  const rule = resolveGSTRule("restaurant", { nightlyRate: 0, specifiedPremises: specified }, localDateStr(), overrides);
+  const inclusive = (CURRENT_PROFILE && CURRENT_PROFILE.gstMode) === "inclusive";
+  const amtRaw = (items || []).reduce((s, i) => s + (Number(i.price) || 0) * (Number(i.qty) || 0), 0);
+  const base = inclusive ? Math.round(amtRaw / (1 + rule.rate)) : amtRaw;
+  const gst = inclusive ? Math.round(amtRaw - amtRaw / (1 + rule.rate)) : Math.round(amtRaw * rule.rate);
+  const cs = splitCgstSgst(gst);
+  return { rate: rule.rate, sac: rule.sac, ruleId: rule.id, inclusive, taxable: base, gst, cgst: cs.cgst, sgst: cs.sgst, total: base + gst };
+}
+// Walk-in bills live in one document per day (hotels/<KEY>/data/
+// rbills_YYYY_MM_DD) — a month of a busy restaurant would exceed
+// Firestore's 1 MiB document limit. Appends go through a transaction so
+// two counters billing at the same moment cannot overwrite each other.
+const RestaurantBills = {
+  key(dateStr) { return "rbills_" + String(dateStr || localDateStr()).replace(/-/g, "_"); },
+  async list(dateStr) {
+    const k = this.key(dateStr);
+    try { const v = await WS.get(k, true); if (Array.isArray(v)) return v; } catch (e) {}
+    try { const v = JSON.parse(localStorage.getItem("ab_" + k) || "[]"); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+  },
+  async append(bill) {
+    const k = this.key(bill.date);
+    if (window._db) {
+      try {
+        const ref = WS._ref(k);
+        const all = await window._db.runTransaction(async tx => {
+          const snap = await tx.get(ref);
+          const cur = (snap.exists && Array.isArray(snap.data().value)) ? snap.data().value : [];
+          const next = cur.concat([bill]);
+          tx.set(ref, { value: next, ts: Date.now() });
+          return next;
+        });
+        try { localStorage.setItem("ab_" + k, JSON.stringify(all)); } catch (e) {}
+        return all;
+      } catch (e) {
+        console.warn("Restaurant bill transaction failed, saving via normal sync:", e.message);
+      }
+    }
+    const cur = await this.list(bill.date);
+    const next = cur.concat([bill]);
+    await WS.set(k, next);
+    return next;
+  }
+};
+function buildRestaurantBillHTML(bill) {
+  const P = CURRENT_PROFILE || {};
+  const name = P.hotelName || HOTEL.name;
+  const rows = bill.items.map(i => "<tr><td>" + escHtml(i.name) + "</td><td class=num>" + escHtml(i.qty) + "</td><td class=num>₹" + escHtml(i.price) + "</td><td class=num>₹" + escHtml(Math.round(i.price * i.qty * 100) / 100) + "</td></tr>").join("");
+  const pct = (bill.rate * 100 / 2).toFixed(1);
+  const shareText = "🍽️ *" + name + "*\nRestaurant Bill: " + bill.id + "\nTotal: ₹" + bill.total + "\n_Dhanyavaad!_";
+  return "<!DOCTYPE html><html><head><meta charset=utf-8><title>Bill " + escHtml(bill.id) + "</title><style>" +
+    "*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:#e8e8e8;padding:16px}" +
+    ".sheet{max-width:520px;margin:0 auto;background:#fff;border:2px solid #000}.actbar{display:flex;gap:10px;padding:12px;background:#e8e8e8}" +
+    ".actbtn{flex:1;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer}.p{background:#1e3a5f;color:#fff}.s{background:#25d366;color:#fff}" +
+    ".hd{text-align:center;padding:12px;border-bottom:2px solid #000}.hn{font-size:22px;font-weight:700;color:#1e3a5f}.ad{font-size:11px;color:#444;margin-top:3px}" +
+    ".tt{display:flex;justify-content:space-between;padding:8px 12px;border-bottom:1px solid #000;font-size:12px}.tt b{font-size:15px;color:#1e3a5f}" +
+    ".mt{padding:8px 12px;font-size:12px;border-bottom:1px solid #000;line-height:1.6}" +
+    "table{width:100%;border-collapse:collapse}th{background:#f0f0f0;font-size:11px;text-transform:uppercase;padding:6px;border-bottom:1px solid #000;text-align:left}" +
+    "td{padding:6px;font-size:12px;border-bottom:1px solid #ddd}.num{text-align:right}" +
+    ".tot{padding:8px 12px;font-size:12px}.tot div{display:flex;justify-content:space-between;padding:2px 0}.g{font-size:16px;font-weight:700;border-top:1px solid #000;margin-top:4px;padding-top:4px;color:#1e3a5f}" +
+    ".ft{padding:8px 12px;font-size:10px;color:#555;border-top:1px solid #000;text-align:center}@media print{body{padding:0;background:#fff}.actbar{display:none}.sheet{border:none}}" +
+    "</style><script>if (window.self !== window.top) { document.write('<style>.actbar{display:none!important}<\\/style>'); }<\/script></head><body><div class=sheet>" +
+    "<div class=actbar><button class='actbtn p' onclick='window.print()'>🖨️ Print</button><button class='actbtn s' onclick='shareBill()'>📤 WhatsApp</button></div>" +
+    "<div class=hd><div class=hn>" + escHtml(name) + "</div><div class=ad>" + escHtml(String(P.hotelAddr || HOTEL.addr || "").replace(/\n/g, ", ")) + "</div>" +
+    "<div class=ad>" + (P.hotelGstin ? "GSTIN: " + escHtml(P.hotelGstin) + " · " : "") + "Ph: " + escHtml(P.hotelPhone || HOTEL.phone || "") + "</div></div>" +
+    "<div class=tt><b>TAX INVOICE — RESTAURANT</b><span>Bill No: <b style='font-size:12px'>" + escHtml(bill.id) + "</b></span></div>" +
+    "<div class=mt>Date: " + escHtml(fmtDate(bill.date)) + ", " + escHtml(fmtTime(bill.time)) + (bill.table ? " · Table " + escHtml(bill.table) : "") +
+    (bill.cust ? "<br>Customer: " + escHtml(bill.cust) : "") + (bill.phone ? " · " + escHtml(bill.phone) : "") + "</div>" +
+    "<table><tr><th>Item</th><th class=num>Qty</th><th class=num>Rate</th><th class=num>Amount</th></tr>" + rows + "</table>" +
+    "<div class=tot><div><span>Taxable value (SAC " + escHtml(bill.sac) + ")</span><b>₹" + escHtml(bill.taxable) + "</b></div>" +
+    "<div><span>CGST @ " + pct + "%</span><b>₹" + escHtml(bill.cgst) + "</b></div><div><span>SGST @ " + pct + "%</span><b>₹" + escHtml(bill.sgst) + "</b></div>" +
+    "<div class=g><span>Total</span><span>₹" + escHtml(bill.total) + "</span></div><div><span>Paid by</span><b>" + escHtml(bill.payMode) + "</b></div></div>" +
+    "<div class=ft>" + (bill.inclusive ? "Rates are inclusive of GST. " : "GST charged in addition to menu rates. ") + "Computer-generated invoice.<br>🙏 Dhanyavaad — phir padhariye!</div>" +
+    "</div><script>function shareBill(){var t=" + jsonForScript(shareText) + ";if(navigator.share){navigator.share({title:'Bill',text:t}).catch(function(){})}else{window.open('https://wa.me/?text='+encodeURIComponent(t),'_blank')}}<\/script></body></html>";
+}
 const TYPE_META = {
   "Standard": {
     emoji: "🛏️",
@@ -2024,6 +2370,50 @@ const WS = {
   }
 };
 
+// ── HOTEL AUTH (AD-1 remediation) ───────────────────────────────────────
+// /api/verify-access, on a successful check, now also mints a Firebase
+// custom token bound to THIS hotel's license key (uid: "hotel:<KEY>:<device>",
+// claim: hotelId). Signing into it gives every subsequent Firestore request
+// a server-verified identity instead of relying purely on whoever happens to
+// type the license key. This is additive/best-effort for now — firestore.rules
+// still also accept the legacy key-shape check (see SECURITY_AUDIT.md AD-1),
+// so a device that fails to sign in (SDK blocked, old cached build, etc.)
+// keeps working exactly as before. Nothing here can lock anyone out.
+const HotelAuth = {
+  // Stable per-device id — NOT a secret, just lets /api/verify-access mint a
+  // uid that's unique per physical device rather than shared across every
+  // device that ever typed the same license key (so a future per-device
+  // revocation — e.g. a lost phone — becomes possible without touching the
+  // whole hotel's access).
+  deviceId() {
+    try {
+      let id = localStorage.getItem("ab_device_id");
+      if (!id) {
+        id = (crypto.randomUUID ? crypto.randomUUID() : ("dev-" + Math.random().toString(36).slice(2) + Date.now().toString(36)))
+          .replace(/[^a-zA-Z0-9-]/g, "").slice(0, 64);
+        localStorage.setItem("ab_device_id", id);
+      }
+      return id;
+    } catch {
+      return "dev-fallback";
+    }
+  },
+  // Sign into the token returned by verify-access, then record (best-effort,
+  // non-blocking) that this device is on the new auth path — BizzSathi admin
+  // watches adoption via this before Phase 2 tightens firestore.rules.
+  async signIn(token) {
+    if (!token || !window._auth || !window.firebase) return false;
+    try {
+      await window._auth.signInWithCustomToken(token);
+      WS.set("authVersion", { v: 1, ts: Date.now(), deviceId: this.deviceId() }).catch(() => {});
+      return true;
+    } catch (e) {
+      console.warn("[AtithiBook] HotelAuth sign-in failed — continuing on legacy key-only access:", e.message);
+      return false;
+    }
+  }
+};
+
 // ── CLOUD SYNC — security data (staff logins, audit trail) backed up to
 // Firestore, while localStorage stays the fast/primary read path so existing
 // synchronous auth code is untouched. Photos/signatures deliberately EXCLUDED
@@ -2192,12 +2582,12 @@ function loadScriptOnce(src) {
 // jsQR) and pre-cached by the service worker, so this works offline
 // after the first successful load, same as the rest of the app; the
 // only network dependency is the very first fetch of these two files.
-async function buildInvoicePDFFromHTML(b, roomObj) {
+async function buildInvoicePDFFromHTML(b, roomObj, htmlOverride) {
   await Promise.all([
     loadScriptOnce("/html2canvas.min.js"),
     loadScriptOnce("/jspdf.umd.min.js")
   ]);
-  const html = buildInvoiceHTML(b, roomObj);
+  const html = htmlOverride || buildInvoiceHTML(b, roomObj);
   const doc = new DOMParser().parseFromString(html, "text/html");
   const sheet = doc.querySelector(".sheet");
   const actbar = sheet && sheet.querySelector(".actbar");
@@ -2757,7 +3147,7 @@ function LicenseSetup({
       const res = await fetch("/api/verify-access", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ licenseKey: k, phone: p })
+        body: JSON.stringify({ licenseKey: k, phone: p, deviceId: HotelAuth.deviceId() })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) {
@@ -2766,8 +3156,18 @@ function LicenseSetup({
         return;
       }
       localStorage.setItem("ab_license_key", k);
-      localStorage.setItem("ab_verified_phone", p);
+      // AUDIT-2 (F1): on an admin-override activation `p` is ADMIN_SECRET.
+      // Store the hotel's registered number the server returned instead,
+      // or nothing — never the typed value.
+      const phoneToKeep = data.adminOverride ? String(data.boundPhone || "") : p;
+      if (phoneToKeep && PhoneShape.ok(phoneToKeep)) localStorage.setItem("ab_verified_phone", phoneToKeep);
+      else localStorage.removeItem("ab_verified_phone");
+      setPhone("");
       if (groqKey.trim().startsWith("gsk_")) localStorage.setItem("ab_groq_key", groqKey.trim());
+      // AD-1 remediation: sign into the verified per-hotel identity if the
+      // server issued one. Fire-and-forget — a failure here never blocks
+      // login; the legacy key-shape rule still covers this device either way.
+      if (data.token) HotelAuth.signIn(data.token).catch(() => {});
       onDone(k);
     } catch (e) {
       setErr("Connection issue — internet check karके dobara try karo.");
@@ -2946,14 +3346,16 @@ function ChangePasswordScreen({
       setErr("Passwords do not match");
       return;
     }
-    const opHash = await SecUtils.hash(op);
     const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
     const usr = users.find(x => x.u === user.u);
-    if (usr && usr.p !== opHash && op !== "admin123" && op !== "front123") {
+    // AUDIT-2 (F4): the current password is always verified. The old check
+    // let "admin123" / "front123" through for ANY account.
+    const cur = usr ? await SecUtils.verifyPassword(op, usr.p) : { ok: false };
+    if (!cur.ok) {
       setErr("Current password is incorrect");
       return;
     }
-    const npHash = await SecUtils.hash(np);
+    const npHash = await SecUtils.hashPassword(np);
     const updated = users.map(x => x.u === user.u ? {
       ...x,
       p: npHash,
@@ -3028,7 +3430,7 @@ function ChangePasswordScreen({
     type: "password",
     value: op,
     onChange: e => setOp(e.target.value),
-    placeholder: "Current password (e.g. admin123)",
+    placeholder: "Current password (jo abhi login me daala)",
     style: {
       width: "100%",
       boxSizing: "border-box",
@@ -3093,32 +3495,68 @@ function ForgotPasswordScreen({
   const [step, setStep] = useState(1);
   const [u, su] = useState("");
   const [lk, slk] = useState("");
+  const [ph, sph] = useState("");
   const [np, snp] = useState("");
   const [cp, scp] = useState("");
   const [err, se] = useState("");
   const [ok, sok] = useState(false);
+  const [busy, setBusy] = useState(false);
+  // AUDIT-2 (F4): knowing the license key used to be enough to reset ANY
+  // account — including the Owner — and the key is typed in front of
+  // every staff member at setup. Reset now needs the key AND the hotel's
+  // registered phone, checked SERVER-SIDE by /api/verify-access (the same
+  // constant-time, rate-limited check that activates a device), so it
+  // cannot be bypassed from this device's storage or devtools.
   const verify = async () => {
-    if (!u.trim() || !lk.trim()) {
+    if (busy) return;
+    if (!u.trim() || !lk.trim() || !ph.trim()) {
       se("Fill all fields");
       return;
     }
     const storedKey = (localStorage.getItem("ab_license_key") || "").trim().toUpperCase();
-    if (lk.trim().toUpperCase() !== storedKey) {
+    const typedKey = lk.trim().toUpperCase();
+    if (!storedKey || typedKey !== storedKey) {
       se("License key incorrect. Contact BizzSathi support.");
       return;
     }
     const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
     const found = users.find(x => x.u === u.trim());
-    if (!found) {
-      se("Username not found");
-      return;
-    }
+    setBusy(true);
     se("");
-    setStep(2);
+    try {
+      const res = await fetch("/api/verify-access", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ licenseKey: typedKey, phone: ph.trim(), deviceId: HotelAuth.deviceId() })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data || data.ok !== true) {
+        se(res.status === 429 ? (data.error || "Too many attempts. Try later.") : "Verification failed — registered phone number check karo.");
+        return;
+      }
+      // A legacy license with no phone on record verifies ANY phone, so it
+      // cannot serve as a reset factor — route those to support instead.
+      if (data.noPhoneOnRecord) {
+        se("Is license par koi phone registered nahi hai — password reset ke liye BizzSathi support se contact karo.");
+        return;
+      }
+      // Username is checked only AFTER the server check, so this screen
+      // cannot be used to enumerate staff usernames without the phone.
+      if (!found) {
+        se("Username not found");
+        return;
+      }
+      setStep(2);
+    } catch (e) {
+      se("Connection issue — internet check karke dobara try karo.");
+    } finally {
+      setBusy(false);
+    }
   };
   const reset = async () => {
-    if (np.length < 6) {
-      se("Min 6 characters");
+    if (step !== 2) return;
+    if (np.length < 8) {
+      se("Min 8 characters");
       return;
     }
     if (np !== cp) {
@@ -3126,7 +3564,7 @@ function ForgotPasswordScreen({
       return;
     }
     const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
-    const hash = await SecUtils.hash(np);
+    const hash = await SecUtils.hashPassword(np);
     const updated = users.map(x => x.u === u.trim() ? {
       ...x,
       p: hash,
@@ -3237,13 +3675,28 @@ function ForgotPasswordScreen({
       color: "var(--muted)",
       marginTop: 4
     }
-  }, "Find this in your welcome message from BizzSathi")), /*#__PURE__*/React.createElement("button", {
+  }, "Find this in your welcome message from BizzSathi")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 11,
+      fontWeight: 600,
+      color: "var(--muted)",
+      display: "block",
+      marginBottom: 5
+    }
+  }, "REGISTERED PHONE NUMBER"), /*#__PURE__*/React.createElement("input", {
+    value: ph,
+    onChange: e => sph(e.target.value),
+    type: "tel",
+    autoComplete: "off",
+    placeholder: "Hotel setup ke waqt diya gaya number"
+  })), /*#__PURE__*/React.createElement("button", {
     className: "btn-p",
     onClick: verify,
+    disabled: busy,
     style: {
       marginTop: 4
     }
-  }, "Verify Identity →"))) : /*#__PURE__*/React.createElement(React.Fragment, null, err && /*#__PURE__*/React.createElement("div", {
+  }, busy ? "⏳ Verifying..." : "Verify Identity →"))) : /*#__PURE__*/React.createElement(React.Fragment, null, err && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "var(--rbg)",
       color: "var(--red)",
@@ -3337,13 +3790,13 @@ function UpdatePasswordScreen({
       return;
     }
     const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
-    const cpHash = await SecUtils.hash(cp);
     const found = users.find(x => x.u === user.u);
-    if (found && found.p !== cpHash) {
+    const cur = found ? await SecUtils.verifyPassword(cp, found.p) : { ok: false };
+    if (!cur.ok) {
       se("Current password is incorrect");
       return;
     }
-    const npHash = await SecUtils.hash(np);
+    const npHash = await SecUtils.hashPassword(np);
     const updated = users.map(x => x.u === user.u ? {
       ...x,
       p: npHash,
@@ -3501,7 +3954,7 @@ function LoginScreen({
       if (!users) {
         users = await Promise.all(STAFF.map(async x => ({
           ...x,
-          p: await SecUtils.hash(x.p),
+          p: await SecUtils.hashPassword(x.p),
           mustChange: true
         })));
         localStorage.setItem("ab_users", JSON.stringify(users));CloudSync.users(users);
@@ -3509,14 +3962,28 @@ function LoginScreen({
         // Migration: existing hotels (set up before Owner role existed) get
         // an Owner account added automatically so access control works.
         const ownerDef = STAFF.find(x => x.role === "Owner");
-        const ownerUser = { ...ownerDef, p: await SecUtils.hash(ownerDef.p), mustChange: true };
+        const ownerUser = { ...ownerDef, p: await SecUtils.hashPassword(ownerDef.p), mustChange: true };
         users = [ownerUser, ...users];
         localStorage.setItem("ab_users", JSON.stringify(users));
         CloudSync.users(users);
       }
-      const hash = await SecUtils.hash(p);
-      const found = users.find(x => x.u === u.trim() && x.p === hash);
+      const cand = users.find(x => x.u === u.trim());
+      const pv = cand ? await SecUtils.verifyPassword(p, cand.p) : await SecUtils.burnPasswordWork(p);
+      let found = pv.ok ? cand : null;
+      if (found && pv.upgrade) {
+        // AUDIT-2 (F5): transparent upgrade of a legacy hash on a
+        // successful login — the plaintext is only ever in memory here.
+        const upgraded = await SecUtils.hashPassword(p);
+        users = users.map(x => x.u === found.u ? { ...x, p: upgraded } : x);
+        localStorage.setItem("ab_users", JSON.stringify(users));
+        CloudSync.users(users);
+        found = users.find(x => x.u === found.u);
+      }
       if (found) {
+        // The session object (also synced to Firestore as "cu") never
+        // carries the password hash.
+        const { p: _pwHash, ...safeUser } = found;
+        found = safeUser;
         BruteForce.clear();
         Session.touch();
         AuditLog.add('LOGIN', found.u + ' — ' + found.role);
@@ -7647,203 +8114,279 @@ function RoomEditModal({
     }
   }, isNew ? "➕ Create Room" : "💾 Save Changes"))));
 }
-function ChargesModal({
-  booking,
-  onAdd,
-  onClose
-}) {
-  const cats = [...new Set(MENU.map(m => m.cat))];
-  const [cat, setCat] = useState(cats[0]);
-  const [cart, setCart] = useState({});
-  const setQ = (id, q) => setCart(p => q > 0 ? {
-    ...p,
-    [id]: q
-  } : (({
-    [id]: _,
-    ...r
-  }) => r)(p));
-  const items = MENU.filter(m => cart[m.id]).map(m => ({
-    ...m,
-    qty: cart[m.id]
-  }));
-  const total = items.reduce((s, i) => s + i.price * i.qty, 0);
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0,0,0,.5)",
-      zIndex: 100,
-      display: "flex",
-      alignItems: "flex-end"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "card su",
-    style: {
-      width: "100%",
-      borderRadius: "20px 20px 0 0",
-      maxHeight: "88vh",
-      display: "flex",
-      flexDirection: "column",
-      overflow: "hidden"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: "16px 16px 12px",
-      borderBottom: "1px solid var(--border)",
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontWeight: 700,
-      fontSize: 16
-    }
-  }, "Add Food / Services"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      color: "var(--muted)"
-    }
-  }, "Room ", booking.roomId, " · ", booking.name)), /*#__PURE__*/React.createElement("button", {
-    onClick: onClose,
-    style: {
-      background: "var(--cream)",
-      border: "none",
-      borderRadius: 8,
-      padding: "6px 10px",
-      fontSize: 18,
-      cursor: "pointer"
-    }
-  }, "✕")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6,
-      padding: "10px 14px",
-      overflowX: "auto"
-    },
-    className: "hs"
-  }, cats.map(c => /*#__PURE__*/React.createElement("button", {
-    key: c,
-    onClick: () => setCat(c),
-    style: {
-      padding: "7px 14px",
-      borderRadius: 20,
-      border: "1.5px solid",
-      fontSize: 12,
-      fontWeight: 600,
-      whiteSpace: "nowrap",
-      cursor: "pointer",
-      fontFamily: "'Josefin Sans',sans-serif",
-      background: cat === c ? "var(--navy)" : "transparent",
-      color: cat === c ? "#fff" : "var(--navy)",
-      borderColor: cat === c ? "var(--navy)" : "var(--border)"
-    }
-  }, c))), /*#__PURE__*/React.createElement("div", {
-    className: "scrollable hs",
-    style: {
-      flex: 1,
-      padding: "0 14px 10px"
-    }
-  }, MENU.filter(m => m.cat === cat).map(m => /*#__PURE__*/React.createElement("div", {
-    key: m.id,
-    style: {
-      display: "flex",
-      alignItems: "center",
-      padding: "12px 0",
-      borderBottom: "1px solid var(--border)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      flex: 1
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontWeight: 600,
-      fontSize: 14
-    }
-  }, m.name), /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: "var(--gold2)",
-      fontSize: 13,
-      fontWeight: 600
-    }
-  }, fmtMoney(m.price))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "center",
-      gap: 8
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setQ(m.id, Math.max(0, (cart[m.id] || 0) - 1)),
-    style: {
-      width: 30,
-      height: 30,
-      borderRadius: 8,
-      border: "1.5px solid var(--border)",
-      background: "var(--cream)",
-      cursor: "pointer",
-      fontWeight: 700,
-      fontSize: 16,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center"
-    }
-  }, "−"), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontWeight: 700,
-      fontSize: 15,
-      minWidth: 20,
-      textAlign: "center"
-    }
-  }, cart[m.id] || 0), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setQ(m.id, (cart[m.id] || 0) + 1),
-    style: {
-      width: 30,
-      height: 30,
-      borderRadius: 8,
-      border: "none",
-      background: "var(--navy)",
-      color: "#fff",
-      cursor: "pointer",
-      fontWeight: 700,
-      fontSize: 16,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center"
-    }
-  }, "+"))))), total > 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: "12px 14px",
-      borderTop: "1px solid var(--border)",
-      background: "var(--cream)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      marginBottom: 10,
-      fontSize: 14
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontWeight: 600
-    }
-  }, items.length, " item", items.length > 1 ? "s" : "", " · ", fmtMoney(total)), /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: "var(--muted)",
-      fontSize: 12
-    }
-  }, "+GST on bill (5-18% as applicable)")), /*#__PURE__*/React.createElement("button", {
-    className: "btn-p",
-    onClick: () => {
-      onAdd(items.map(i => ({
-        name: i.name,
-        price: i.price,
-        qty: i.qty
-      })));
+/* ── MENU PICKER (shared by Add-Food modal and the Restaurant counter) ── */
+function MenuPicker({ menu, cart, setCart, cats, height }) {
+  const _h = React.createElement;
+  const list = (menu || []).filter(m => m.active !== false && (!cats || cats.indexOf(m.cat) >= 0));
+  const catList = MENU_CATS.filter(c => list.some(m => m.cat === c));
+  const [cat, setCat] = useState(catList[0] || "");
+  const [q, setQ] = useState("");
+  useEffect(() => { if (catList.length && catList.indexOf(cat) < 0) setCat(catList[0]); }, [catList.join("|")]);
+  const setQty = (id, n) => setCart(p => {
+    const next = { ...p };
+    if (n > 0) next[id] = Math.min(999, n); else delete next[id];
+    return next;
+  });
+  const shown = q.trim()
+    ? list.filter(m => m.name.toLowerCase().indexOf(q.trim().toLowerCase()) >= 0)
+    : list.filter(m => m.cat === cat);
+  const stepBtn = (label, onClick, dark, aria) => _h("button", {
+    onClick, "aria-label": aria,
+    style: { width: 34, height: 34, borderRadius: 9, border: dark ? "none" : "1.5px solid var(--border)", background: dark ? "var(--navy)" : "var(--cream)", color: dark ? "#fff" : "var(--navy)", fontWeight: 700, fontSize: 17, cursor: "pointer" }
+  }, label);
+  return _h("div", { style: { display: "flex", flexDirection: "column", minHeight: 0, flex: 1 } },
+    _h("div", { style: { padding: "8px 14px 0" } },
+      _h("input", { value: q, onChange: e => setQ(e.target.value), placeholder: "🔎 Item search karo…", "aria-label": "Search menu", style: { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 14 } })),
+    !q.trim() && _h("div", { className: "hs", style: { display: "flex", gap: 6, padding: "10px 14px", overflowX: "auto", flexShrink: 0 } },
+      catList.map(c => _h("button", {
+        key: c, onClick: () => setCat(c),
+        style: { padding: "7px 14px", borderRadius: 20, border: "1.5px solid", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer", fontFamily: "'Josefin Sans',sans-serif", background: cat === c ? "var(--navy)" : "transparent", color: cat === c ? "#fff" : "var(--navy)", borderColor: cat === c ? "var(--navy)" : "var(--border)" }
+      }, c))),
+    _h("div", { className: "scrollable hs", style: { flex: 1, padding: "0 14px 10px", maxHeight: height || "none", overflowY: "auto" } },
+      shown.length === 0 && _h("div", { style: { padding: 18, textAlign: "center", color: "var(--muted)", fontSize: 13 } }, list.length ? "Koi item nahi mila" : "Menu khaali hai — pehle '📋 Menu' me items jodo"),
+      shown.map(m => _h("div", { key: m.id, style: { display: "flex", alignItems: "center", padding: "11px 0", borderBottom: "1px solid var(--border)" } },
+        _h("div", { style: { flex: 1, minWidth: 0 } },
+          _h("div", { style: { fontWeight: 600, fontSize: 14 } }, m.cat !== "🛎️ Services" && _h("span", { "aria-label": m.veg ? "Veg" : "Non-veg", style: { display: "inline-block", width: 9, height: 9, borderRadius: 2, marginRight: 6, border: "1.5px solid " + (m.veg ? "#16a34a" : "#b91c1c"), background: m.veg ? "#16a34a" : "#b91c1c", verticalAlign: "middle" } }), m.name),
+          _h("div", { style: { color: "var(--gold2)", fontSize: 13, fontWeight: 600 } }, fmtMoney(m.price))),
+        _h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+          stepBtn("−", () => setQty(m.id, (cart[m.id] || 0) - 1), false, "Kam karo " + m.name),
+          _h("span", { style: { fontWeight: 700, fontSize: 15, minWidth: 22, textAlign: "center" } }, cart[m.id] || 0),
+          stepBtn("+", () => setQty(m.id, (cart[m.id] || 0) + 1), true, "Aur jodo " + m.name)))))
+  );
+}
+function cartToItems(menu, cart) {
+  return (menu || []).filter(m => cart[m.id]).map(m => ({ name: m.name, price: m.price, qty: cart[m.id], cat: m.cat, sub: m.sub || "" }));
+}
+
+/* ── MENU EDITOR (Owner / Manager) ── */
+function MenuEditorModal({ onClose, onSaved }) {
+  const _h = React.createElement;
+  const [rows, setRows] = useState(() => MenuStore.get().map(m => ({ ...m })));
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  useEffect(() => { MenuStore.refresh().then(m => setRows(m.map(x => ({ ...x })))).catch(() => {}); }, []);
+  const upd = (i, k, v) => setRows(r => r.map((x, j) => j === i ? { ...x, [k]: v } : x));
+  const add = () => setRows(r => [{ id: "m" + Date.now().toString(36), cat: "🍛 Food", name: "", price: 0, sub: "", active: true, veg: true }].concat(r));
+  const del = i => { if (window.confirm("Ye item menu se hatana hai? (Purane bills par koi asar nahi padega)")) setRows(r => r.filter((_, j) => j !== i)); };
+  const save = async () => {
+    const bad = rows.find(r => !String(r.name || "").trim());
+    if (bad) { setMsg("Har item ka naam bharo (ya khaali row hatao)."); return; }
+    setBusy(true); setMsg("");
+    try {
+      const saved = await MenuStore.save(rows);
+      AuditLog.add("MENU_UPDATED", saved.length + " items");
+      onSaved && onSaved(saved);
       onClose();
-    }
-  }, "Add ", fmtMoney(total), " to Room Bill"))));
+    } catch (e) { setMsg("Save nahi hua: " + e.message); } finally { setBusy(false); }
+  };
+  const inp = { padding: "8px 10px", borderRadius: 8, border: "1.5px solid var(--border)", fontSize: 13, boxSizing: "border-box", width: "100%" };
+  return _h("div", { style: { position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 120, display: "flex", alignItems: "flex-end" } },
+    _h("div", { className: "card su", style: { width: "100%", borderRadius: "20px 20px 0 0", maxHeight: "92vh", display: "flex", flexDirection: "column", overflow: "hidden" } },
+      _h("div", { style: { padding: "14px 16px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } },
+        _h("div", null, _h("div", { style: { fontWeight: 700, fontSize: 16 } }, "📋 Menu / Rate List"), _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, rows.length + " items · rate badalne se purane bills nahi badalte")),
+        _h("button", { onClick: onClose, "aria-label": "Close", style: { background: "var(--cream)", border: "none", borderRadius: 8, padding: "6px 10px", fontSize: 18, cursor: "pointer" } }, "✕")),
+      _h("div", { style: { padding: "10px 16px" } }, _h("button", { className: "btn-o", onClick: add, style: { width: "100%" } }, "➕ Naya item jodo")),
+      _h("div", { className: "scrollable hs", style: { flex: 1, padding: "0 16px 10px" } },
+        rows.map((r, i) => _h("div", { key: r.id, style: { border: "1px solid var(--border)", borderRadius: 12, padding: 10, marginBottom: 8, background: r.active === false ? "#f8fafc" : "#fff", opacity: r.active === false ? 0.65 : 1 } },
+          _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 96px", gap: 8 } },
+            _h("input", { value: r.name, onChange: e => upd(i, "name", e.target.value), placeholder: "Item ka naam", "aria-label": "Item name", style: inp }),
+            _h("input", { value: r.price, type: "number", min: 0, inputMode: "decimal", onChange: e => upd(i, "price", e.target.value), "aria-label": "Price", style: inp })),
+          _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 } },
+            _h("select", { value: r.cat, onChange: e => upd(i, "cat", e.target.value), "aria-label": "Category", style: inp }, MENU_CATS.map(c => _h("option", { key: c, value: c }, c))),
+            r.cat === "🛎️ Services"
+              ? _h("select", { value: r.sub || "", onChange: e => upd(i, "sub", e.target.value), "aria-label": "GST type", style: inp },
+                  _h("option", { value: "" }, "Other service (18%)"), _h("option", { value: "laundry" }, "Laundry"), _h("option", { value: "transport" }, "Transport / Cab"), _h("option", { value: "extra_bed" }, "Extra bed"))
+              : _h("select", { value: r.veg === false ? "nv" : "v", onChange: e => upd(i, "veg", e.target.value === "v"), "aria-label": "Veg or non-veg", style: inp },
+                  _h("option", { value: "v" }, "🟢 Veg"), _h("option", { value: "nv" }, "🔴 Non-veg"))),
+          _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 } },
+            _h("label", { style: { fontSize: 12, display: "flex", alignItems: "center", gap: 6 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: r.active !== false, onChange: e => upd(i, "active", e.target.checked) }), "Menu me dikhao"),
+            _h("button", { onClick: () => del(i), style: { background: "none", border: "none", color: "#b91c1c", fontSize: 12, fontWeight: 700, cursor: "pointer", padding: "8px 4px" } }, "🗑️ Hatao"))))),
+      _h("div", { style: { padding: "12px 16px", borderTop: "1px solid var(--border)", background: "var(--cream)" } },
+        msg && _h("div", { style: { color: "#b91c1c", fontSize: 12, marginBottom: 8 } }, msg),
+        _h("button", { className: "btn-p", disabled: busy, onClick: save, style: { width: "100%" } }, busy ? "⏳ Save ho raha hai…" : "💾 Menu save karo"))));
+}
+
+/* ── ADD FOOD / SERVICES TO A ROOM BILL ── */
+function ChargesModal({ booking, onAdd, onClose, canEditMenu, user }) {
+  const _h = React.createElement;
+  const [menu, setMenu] = useState(() => MenuStore.get());
+  const [cart, setCart] = useState({});
+  const [src, setSrc] = useState("room");
+  const [table, setTable] = useState("");
+  const [kot, setKot] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [editMenu, setEditMenu] = useState(false);
+  useEffect(() => { MenuStore.refresh().then(setMenu).catch(() => {}); }, []);
+  const items = cartToItems(menu, cart);
+  const total = items.reduce((s, i) => s + i.price * i.qty, 0);
+  const hasFood = items.some(i => i.cat !== "🛎️ Services");
+  const submit = async () => {
+    if (!items.length || busy) return;
+    setBusy(true);
+    const kotNo = kot && hasFood ? nextKotNumber() : "";
+    const charges = makeChargeItems(items, { src, table, user, kot: kotNo });
+    try {
+      await onAdd(charges);
+      if (kotNo) printKOT({ kot: kotNo, date: charges[0].date, time: charges[0].time, by: charges[0].by, where: "Room " + booking.roomId + (src === "restaurant" ? " · Restaurant" + (table ? " T-" + table : "") : " · Room Service"), items: items.filter(i => i.cat !== "🛎️ Services") });
+      onClose();
+    } catch (e) { alert("Bill me nahi juda: " + e.message); setBusy(false); }
+  };
+  const seg = (val, label) => _h("button", { onClick: () => setSrc(val), "aria-pressed": src === val, style: { flex: 1, padding: "9px 6px", borderRadius: 9, border: "1.5px solid " + (src === val ? "var(--navy)" : "var(--border)"), background: src === val ? "var(--navy)" : "#fff", color: src === val ? "#fff" : "var(--navy)", fontSize: 12.5, fontWeight: 700, cursor: "pointer" } }, label);
+  if (editMenu) return _h(MenuEditorModal, { onClose: () => setEditMenu(false), onSaved: m => setMenu(m) });
+  return _h("div", { style: { position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 100, display: "flex", alignItems: "flex-end" } },
+    _h("div", { className: "card su", style: { width: "100%", borderRadius: "20px 20px 0 0", maxHeight: "90vh", display: "flex", flexDirection: "column", overflow: "hidden" } },
+      _h("div", { style: { padding: "16px 16px 12px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } },
+        _h("div", null, _h("div", { style: { fontWeight: 700, fontSize: 16 } }, "Add Food / Services"), _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, "Room ", booking.roomId, " · ", booking.name)),
+        _h("div", { style: { display: "flex", gap: 6 } },
+          canEditMenu && _h("button", { onClick: () => setEditMenu(true), style: { background: "var(--cream)", border: "none", borderRadius: 8, padding: "6px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" } }, "📋 Menu"),
+          _h("button", { onClick: onClose, "aria-label": "Close", style: { background: "var(--cream)", border: "none", borderRadius: 8, padding: "6px 10px", fontSize: 18, cursor: "pointer" } }, "✕"))),
+      _h("div", { style: { display: "flex", gap: 8, padding: "10px 14px 0" } }, seg("room", "🛎️ Room Service"), seg("restaurant", "🍽️ Restaurant")),
+      src === "restaurant" && _h("div", { style: { padding: "8px 14px 0" } }, _h("input", { value: table, onChange: e => setTable(e.target.value), placeholder: "Table no. (optional)", "aria-label": "Table number", style: { width: "100%", boxSizing: "border-box", padding: "8px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 13 } })),
+      _h(MenuPicker, { menu, cart, setCart }),
+      total > 0 && _h("div", { style: { padding: "12px 14px", borderTop: "1px solid var(--border)", background: "var(--cream)" } },
+        _h("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 8, fontSize: 14 } },
+          _h("span", { style: { fontWeight: 600 } }, items.length, " item", items.length > 1 ? "s" : "", " · ", fmtMoney(total)),
+          _h("span", { style: { color: "var(--muted)", fontSize: 12 } }, "+GST bill par (5–18% jaisa lage)")),
+        hasFood && hasFeature("restaurant") && _h("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 8 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: kot, onChange: e => setKot(e.target.checked) }), "🧾 Kitchen ke liye KOT print karo"),
+        _h("button", { className: "btn-p", disabled: busy, onClick: submit, style: { width: "100%" } }, busy ? "⏳ Jod rahe hain…" : "Add " + fmtMoney(total) + " to Room Bill"))));
+}
+
+/* ── RESTAURANT COUNTER (paid add-on: "restaurant") ── */
+function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
+  const _h = React.createElement;
+  const isBoss = user && (user.role === "Owner" || user.role === "Manager");
+  const [menu, setMenu] = useState(() => MenuStore.get());
+  const [mode, setMode] = useState("room");
+  const [bookingId, setBookingId] = useState("");
+  const [src, setSrc] = useState("restaurant");
+  const [table, setTable] = useState("");
+  const [note, setNote] = useState("");
+  const [cart, setCart] = useState({});
+  const [kot, setKot] = useState(true);
+  const [cust, setCust] = useState("");
+  const [phone, setPhone] = useState("");
+  const [payMode, setPayMode] = useState("Cash");
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState("");
+  const [bills, setBills] = useState([]);
+  const [editMenu, setEditMenu] = useState(false);
+  const [staffPw, setStaffPw] = useState("");
+  useEffect(() => { MenuStore.refresh().then(setMenu).catch(() => {}); RestaurantBills.list().then(setBills).catch(() => {}); }, []);
+  const active = (bookings || []).filter(b => b.status === "active").sort((a, b) => String(a.roomId).localeCompare(String(b.roomId), undefined, { numeric: true }));
+  const sel = active.find(b => b.id === bookingId) || null;
+  const cats = mode === "walkin" ? ["☕ Beverages", "🍛 Food"] : null;
+  const items = cartToItems(menu, cart).filter(i => !cats || cats.indexOf(i.cat) >= 0);
+  const amt = items.reduce((s, i) => s + i.price * i.qty, 0);
+  const preview = mode === "walkin" && items.length ? calcRestaurantBill(items) : null;
+  const today = localDateStr();
+  const roomSaleToday = active.concat((bookings || []).filter(b => b.status !== "active")).reduce((s, b) => s + (b.charges || []).filter(c => c.date === today && c.cat !== "🛎️ Services").reduce((t, c) => t + c.price * c.qty, 0), 0);
+  const walkinToday = bills.reduce((s, b) => s + (Number(b.total) || 0), 0);
+  const flash = t => { setToast(t); setTimeout(() => setToast(""), 2600); };
+  const reset = () => { setCart({}); setNote(""); setTable(""); setCust(""); setPhone(""); };
+  const foodOnly = items.filter(i => i.cat !== "🛎️ Services");
+
+  const addToRoom = async () => {
+    if (!sel || !items.length || busy) return;
+    setBusy(true);
+    const kotNo = kot && foodOnly.length ? nextKotNumber() : "";
+    const charges = makeChargeItems(items, { src, table, user, kot: kotNo });
+    try {
+      await onAddCharge(sel.id, charges);
+      AuditLog.add("ROOM_ORDER", "Room " + sel.roomId + " · " + fmtMoney(amt) + (kotNo ? " · " + kotNo : ""));
+      if (kotNo) printKOT({ kot: kotNo, date: charges[0].date, time: charges[0].time, by: charges[0].by, note, where: "Room " + sel.roomId + (src === "restaurant" ? " · Restaurant" + (table ? " T-" + table : "") : " · Room Service"), items: foodOnly });
+      flash("✅ " + fmtMoney(amt) + " — Room " + sel.roomId + " ke bill me jud gaya");
+      reset();
+    } catch (e) { alert("Bill me nahi juda: " + e.message); } finally { setBusy(false); }
+  };
+  const makeWalkinBill = async () => {
+    if (!items.length || busy) return;
+    const ph = phone.trim();
+    if (ph && ph.replace(/\D/g, "").length < 10) { alert("Phone number 10 digit ka daalo (ya khaali chhodo)"); return; }
+    setBusy(true);
+    try {
+      const g = calcRestaurantBill(items);
+      const now = new Date();
+      const id = await generateDocumentNumber("RB");
+      const kotNo = kot ? nextKotNumber() : "";
+      const bill = {
+        id, date: localDateStr(now), time: localTimeStr(now), cust: cust.trim().slice(0, 60), phone: ph.slice(0, 20), table: table.trim().slice(0, 12),
+        items: items.map(i => ({ name: i.name, price: i.price, qty: i.qty, cat: i.cat })), payMode,
+        rate: g.rate, sac: g.sac, ruleId: g.ruleId, inclusive: g.inclusive, taxable: g.taxable, cgst: g.cgst, sgst: g.sgst, total: g.total,
+        by: String(user && (user.name || user.u) || "").slice(0, 40), kot: kotNo, createdAt: now.toISOString()
+      };
+      const all = await RestaurantBills.append(bill);
+      setBills(all.filter(b => b.date === localDateStr()));
+      AuditLog.add("RESTAURANT_BILL", id + " · " + fmtMoney(g.total) + " · " + payMode);
+      if (kotNo) printKOT({ kot: kotNo, date: bill.date, time: bill.time, by: bill.by, note, where: "Walk-in" + (bill.table ? " · Table " + bill.table : ""), items: bill.items });
+      openHtmlBill(bill);
+      reset();
+    } catch (e) { alert("Bill nahi bana: " + e.message); } finally { setBusy(false); }
+  };
+  const createStaffLogin = async () => {
+    if (staffPw.length < 8) { alert("Password kam se kam 8 characters ka rakho"); return; }
+    try {
+      const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
+      const hash = await SecUtils.hashPassword(staffPw);
+      const exists = users.some(x => x.u === "restaurant");
+      const next = exists
+        ? users.map(x => x.u === "restaurant" ? { ...x, p: hash, role: "Restaurant", mustChange: false } : x)
+        : users.concat([{ u: "restaurant", p: hash, name: "Restaurant Staff", role: "Restaurant", mustChange: false }]);
+      localStorage.setItem("ab_users", JSON.stringify(next));
+      CloudSync.users(next);
+      AuditLog.add(exists ? "RESTAURANT_LOGIN_RESET" : "RESTAURANT_LOGIN_CREATED", "restaurant");
+      setStaffPw("");
+      alert("✅ Restaurant staff login taiyaar:\nUsername: restaurant\nPassword: jo abhi set kiya");
+    } catch (e) { alert("Login nahi bana: " + e.message); }
+  };
+
+  const seg = (val, cur, set, label) => _h("button", { onClick: () => set(val), "aria-pressed": cur === val, style: { flex: 1, padding: "10px 6px", borderRadius: 10, border: "1.5px solid " + (cur === val ? "var(--navy)" : "var(--border)"), background: cur === val ? "var(--navy)" : "#fff", color: cur === val ? "#fff" : "var(--navy)", fontSize: 13, fontWeight: 700, cursor: "pointer" } }, label);
+  const field = { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 13.5 };
+  if (editMenu) return _h(MenuEditorModal, { onClose: () => setEditMenu(false), onSaved: m => setMenu(m) });
+
+  return _h("div", { className: "scrollable hs", style: { height: "100%", display: "flex", flexDirection: "column" } },
+    _h("div", { style: { padding: "14px 14px 8px", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 } },
+      _h("div", null,
+        _h("h2", { style: { fontSize: 20, fontFamily: "'Josefin Sans',sans-serif", color: "var(--navy)", margin: 0 } }, "🍽️ Restaurant"),
+        _h("div", { style: { fontSize: 12, color: "var(--muted)", marginTop: 2 } }, "Aaj: rooms me ", fmtMoney(roomSaleToday), " · walk-in ", fmtMoney(walkinToday), " (", bills.length, " bills)")),
+      isBoss && _h("button", { onClick: () => setEditMenu(true), className: "btn-o", style: { padding: "8px 12px", fontSize: 12.5, width: "auto" } }, "📋 Menu")),
+    _h("div", { style: { display: "flex", gap: 8, padding: "0 14px 10px" } }, seg("room", mode, setMode, "🛏️ Room bill me jodo"), seg("walkin", mode, setMode, "🚶 Walk-in bill")),
+    toast && _h("div", { role: "status", style: { margin: "0 14px 10px", padding: "10px 12px", borderRadius: 10, background: "#dcfce7", color: "#166534", fontSize: 13, fontWeight: 600 } }, toast),
+    mode === "room" && _h("div", { style: { padding: "0 14px" } },
+      active.length === 0
+        ? _h("div", { style: { padding: 14, borderRadius: 12, background: "var(--cream)", fontSize: 13, color: "var(--muted)" } }, "Abhi koi guest checked-in nahi hai. Bahar ke customer ke liye 'Walk-in bill' use karo.")
+        : _h("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } }, active.map(b => _h("button", {
+            key: b.id, onClick: () => setBookingId(b.id), "aria-pressed": bookingId === b.id,
+            style: { padding: "8px 10px", borderRadius: 10, border: "1.5px solid " + (bookingId === b.id ? "var(--gold)" : "var(--border)"), background: bookingId === b.id ? "#fff7e6" : "#fff", cursor: "pointer", textAlign: "left", minWidth: 96 }
+          }, _h("div", { style: { fontWeight: 800, fontSize: 15, color: "var(--navy)" } }, "Room ", b.roomId), _h("div", { style: { fontSize: 11, color: "var(--muted)", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, b.name)))),
+      sel && _h("div", { style: { display: "flex", gap: 8, marginTop: 10 } }, seg("restaurant", src, setSrc, "🍽️ Restaurant me khaya"), seg("room", src, setSrc, "🛎️ Room service"))),
+    mode === "walkin" && _h("div", { style: { padding: "0 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 } },
+      _h("input", { value: cust, onChange: e => setCust(e.target.value), placeholder: "Customer naam (optional)", "aria-label": "Customer name", style: field }),
+      _h("input", { value: phone, onChange: e => setPhone(e.target.value), placeholder: "Mobile (optional)", type: "tel", "aria-label": "Customer mobile", style: field })),
+    (mode === "walkin" || (sel && src === "restaurant")) && _h("div", { style: { padding: "8px 14px 0" } }, _h("input", { value: table, onChange: e => setTable(e.target.value), placeholder: "Table no. (optional)", "aria-label": "Table number", style: field })),
+    (mode === "walkin" || sel) && _h(MenuPicker, { menu, cart, setCart, cats, height: "46vh" }),
+    items.length > 0 && (mode === "walkin" || sel) && _h("div", { style: { margin: "6px 14px 14px", padding: 12, borderRadius: 14, background: "var(--cream)", border: "1px solid var(--border)" } },
+      _h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginBottom: 6 } }, items.map(i => i.qty + "× " + i.name).join(", ")),
+      _h("input", { value: note, onChange: e => setNote(e.target.value), placeholder: "Kitchen note (jaise: kam teekha)", "aria-label": "Kitchen note", style: { ...field, marginBottom: 8 } }),
+      mode === "walkin" && preview && _h("div", { style: { fontSize: 13, marginBottom: 8 } },
+        _h("div", { style: { display: "flex", justifyContent: "space-between" } }, _h("span", null, "Taxable"), _h("b", null, fmtMoney(preview.taxable))),
+        _h("div", { style: { display: "flex", justifyContent: "space-between" } }, _h("span", null, "GST @ ", (preview.rate * 100).toFixed(0), "% (CGST+SGST)"), _h("b", null, fmtMoney(preview.gst))),
+        _h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 16, marginTop: 4 } }, _h("b", null, "Total"), _h("b", null, fmtMoney(preview.total))),
+        _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 6, marginTop: 8 } }, ["Cash", "UPI", "Card"].map(m => _h("button", { key: m, onClick: () => setPayMode(m), "aria-pressed": payMode === m, style: { padding: 8, borderRadius: 8, fontSize: 12.5, fontWeight: 700, cursor: "pointer", border: "1.5px solid " + (payMode === m ? "var(--navy)" : "var(--border)"), background: payMode === m ? "var(--navy)" : "#fff", color: payMode === m ? "#fff" : "#333" } }, m)))),
+      foodOnly.length > 0 && _h("label", { style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 8 } }, _h("input", { type: "checkbox", style: { width: 18, height: 18, flex: "0 0 auto", margin: 0, accentColor: "var(--navy)" }, checked: kot, onChange: e => setKot(e.target.checked) }), "🧾 Kitchen ke liye KOT print karo"),
+      mode === "room"
+        ? _h("button", { className: "btn-p", disabled: busy, onClick: addToRoom, style: { width: "100%" } }, busy ? "⏳ Jod rahe hain…" : "➕ " + fmtMoney(amt) + " Room " + sel.roomId + " ke bill me jodo")
+        : _h("button", { className: "btn-p", disabled: busy, onClick: makeWalkinBill, style: { width: "100%" } }, busy ? "⏳ Bill ban raha hai…" : "🧾 Bill banao — " + fmtMoney(preview ? preview.total : amt) + " (" + payMode + ")")),
+    mode === "walkin" && bills.length > 0 && _h("div", { style: { padding: "0 14px 14px" } },
+      _h("div", { className: "st", style: { marginBottom: 6 } }, "AAJ KE WALK-IN BILLS"),
+      bills.slice().reverse().map(b => _h("button", { key: b.id, onClick: () => openHtmlBill(b), style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", marginBottom: 6, borderRadius: 10, border: "1px solid var(--border)", background: "#fff", cursor: "pointer", fontSize: 13 } },
+        _h("span", { style: { textAlign: "left" } }, _h("b", null, b.id), _h("br"), _h("span", { style: { color: "var(--muted)", fontSize: 11.5 } }, fmtTime(b.time), b.cust ? " · " + b.cust : "", " · ", b.payMode)),
+        _h("b", null, fmtMoney(b.total))))),
+    user && user.role === "Owner" && _h("div", { style: { margin: "4px 14px 20px", padding: 12, borderRadius: 12, border: "1px dashed var(--border)" } },
+      _h("div", { style: { fontWeight: 700, fontSize: 13, marginBottom: 4 } }, "👤 Restaurant staff login"),
+      _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 8 } }, "Username 'restaurant' — ye sirf Restaurant section dekh sakta hai (room rates, revenue, guest ID nahi)."),
+      _h("div", { style: { display: "flex", gap: 8 } },
+        _h("input", { value: staffPw, onChange: e => setStaffPw(e.target.value), type: "password", placeholder: "Naya password (min 8)", "aria-label": "Restaurant staff password", autoComplete: "new-password", style: field }),
+        _h("button", { className: "btn-o", onClick: createStaffLogin, style: { width: "auto", whiteSpace: "nowrap", padding: "8px 12px" } }, "Set karo"))));
 }
 
 /* ── BOOKING MODAL ────────────────────────────────────────────── */
@@ -7851,6 +8394,10 @@ function BookingModal({
   b,
   room,
   onAddCharge,
+  onVoidCharge,
+  canVoid,
+  canEditMenu,
+  user,
   onCheckOut,
   onExtendStay,
   onClose
@@ -7991,15 +8538,26 @@ function BookingModal({
       fontWeight: 600
     }
   }, fmtMoney(b.roomTotal))), charges.map((c, i) => /*#__PURE__*/React.createElement("div", {
-    key: i,
+    key: c.id || i,
     style: {
       display: "flex",
       justifyContent: "space-between",
+      alignItems: "center",
+      gap: 8,
       fontSize: 13,
       marginBottom: 5,
       color: "var(--muted)"
     }
-  }, /*#__PURE__*/React.createElement("span", null, c.name, " × ", c.qty), /*#__PURE__*/React.createElement("span", null, fmtMoney(c.price * c.qty)))), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", { style: { flex: 1, minWidth: 0 } }, c.name, " × ", c.qty, chargeLabel(c) ? /*#__PURE__*/React.createElement("span", { style: { display: "block", fontSize: 11, color: "#94a3b8" } }, (c.src === "restaurant" ? "🍽️ " : c.src === "room" ? "🛎️ " : ""), chargeLabel(c), c.date ? " · " + fmtDate(c.date) : "", c.by ? " · " + c.by : "") : null), /*#__PURE__*/React.createElement("span", null, fmtMoney(c.price * c.qty)), canVoid && b.status === "active" && onVoidCharge && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      const reason = window.prompt("'" + c.name + " × " + c.qty + "' bill se hatana hai?\nWajah likho (zaroori):", "");
+      if (reason === null) return;
+      if (!reason.trim()) { alert("Wajah likhna zaroori hai — audit record ke liye."); return; }
+      onVoidCharge(b.id, i, reason.trim());
+    },
+    "aria-label": "Remove " + c.name + " from bill",
+    style: { background: "#fee2e2", border: "none", borderRadius: 6, color: "#b91c1c", fontSize: 12, fontWeight: 700, padding: "4px 8px", cursor: "pointer" }
+  }, "✕"))), /*#__PURE__*/React.createElement("div", {
     style: {
       height: 1,
       background: "var(--border)",
@@ -8119,6 +8677,8 @@ function BookingModal({
     style: { flex: 1.5, padding: "10px", borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "✅ Confirm Check Out"))))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
     booking: b,
+    user: user,
+    canEditMenu: canEditMenu,
     onAdd: items => onAddCharge(b.id, items),
     onClose: () => setSC(false)
   }));
@@ -8976,7 +9536,7 @@ function generatePublicBookingToken() {
 // up as a permission-denied error and has nothing to do with the
 // network. Reporting that as an "internet issue" sends whoever is
 // setting this up chasing entirely the wrong problem.
-async function publishPublicBookingSnapshot(token, profile, rooms) {
+async function publishPublicBookingSnapshot(token, profile, rooms, opts) {
   if (!window._db) return { ok: false, reason: "no-db", detail: "Firebase connected nahi hai" };
   if (!token) return { ok: false, reason: "no-token", detail: "Token missing" };
   const byType = {};
@@ -8985,15 +9545,30 @@ async function publishPublicBookingSnapshot(token, profile, rooms) {
     if (!byType[r.type]) byType[r.type] = { type: r.type, rate: r.rate || 0 };
     else if ((r.rate || 0) < byType[r.type].rate) byType[r.type].rate = r.rate;
   });
+  // Lengths mirror the caps in firestore.rules (validSnapshotFields), so
+  // an unusually long address can never make every publish fail.
   const snapshot = {
-    hotelName: profile?.hotelName || "",
-    hotelAddr: profile?.hotelAddr || "",
-    hotelPhone: profile?.hotelPhone || "",
-    roomTypes: Object.values(byType),
+    hotelName: String(profile?.hotelName || "").slice(0, 200),
+    hotelAddr: String(profile?.hotelAddr || "").slice(0, 1000),
+    hotelPhone: String(profile?.hotelPhone || "").slice(0, 60),
+    roomTypes: Object.values(byType).slice(0, 50).map(t => ({ type: String(t.type).slice(0, 60), rate: Number(t.rate) || 0 })),
     updatedAt: Date.now()
   };
   try {
-    await window._db.collection("public_booking").doc(token).set(snapshot, { merge: true });
+    const pageRef = window._db.collection("public_booking").doc(token);
+    if (opts && opts.claim) {
+      // AUDIT-2 (F2): a NEW link is published in one batch together with
+      // its private owner binding (public_booking_owner/{token}), which
+      // the rules require before anyone may update the page or read its
+      // enquiries. The binding can only be created while the page does not
+      // exist yet, so nobody can claim an existing hotel's link.
+      const batch = window._db.batch();
+      batch.set(window._db.collection("public_booking_owner").doc(token), { hotelId: WS._hid(), createdAt: Date.now() });
+      batch.set(pageRef, snapshot);
+      await batch.commit();
+    } else {
+      await pageRef.set(snapshot, { merge: true });
+    }
     return { ok: true };
   } catch (e) {
     const msg = (e && e.message) || String(e);
@@ -9026,7 +9601,7 @@ function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
     setPublishState(null);
     try {
       const newToken = generatePublicBookingToken();
-      const res = await publishPublicBookingSnapshot(newToken, profile, rooms);
+      const res = await publishPublicBookingSnapshot(newToken, profile, rooms, { claim: true });
       if (!res.ok) { setPublishState(res); return; }
       await onSaveToken(newToken);
       setPublishState({ ok: true });
@@ -9053,7 +9628,7 @@ function DirectBookingLinkCard({ profile, rooms, onSaveToken }) {
     if (st.reason === "permission-denied") {
       return /*#__PURE__*/React.createElement("div", {
         style: { color: "#dc2626", fontSize: 11.5, marginTop: 8, lineHeight: 1.5 }
-      }, "Firebase ne permission deny kiya — iska matlab is feature ke liye Firestore Security Rules abhi publish nahi hui hain. Bizzsathi support ko batao: 'public_booking rules deploy karni hain'. (Yeh internet ki problem nahi hai.)");
+      }, "Firebase ne permission deny kiya. Do wajah ho sakti hain: (1) is device ka secure hotel login abhi complete nahi hua — app band karke dobara kholo (internet on rakho), phir try karo; (2) Firestore Security Rules abhi publish nahi hui — Bizzsathi support ko batao. (Yeh internet ki problem nahi hai.)");
     }
     if (st.reason === "no-db") {
       return /*#__PURE__*/React.createElement("div", {
@@ -10105,7 +10680,7 @@ function AccessControlView({
   const [saved, setSaved] = useState(false);
   const toggle = (role, featureId) => {
     setLocal(p => {
-      const current = p[role] || [];
+      const current = permsFor(p, role);
       const has = current.includes(featureId);
       const updated = has ? current.filter(f => f !== featureId) : [...current, featureId];
       return {
@@ -10145,7 +10720,7 @@ function AccessControlView({
     style: {
       padding: "0 14px"
     }
-  }, ["Manager", "Receptionist"].map(role => /*#__PURE__*/React.createElement("div", {
+  }, ["Manager", "Receptionist"].concat(hasFeature("restaurant") ? ["Restaurant"] : []).map(role => /*#__PURE__*/React.createElement("div", {
     key: role,
     style: {
       background: "var(--card)",
@@ -10164,14 +10739,14 @@ function AccessControlView({
       alignItems: "center",
       gap: 8
     }
-  }, role === "Manager" ? "👔" : "🛎️", " ", role), /*#__PURE__*/React.createElement("div", {
+  }, role === "Manager" ? "👔" : role === "Restaurant" ? "🍽️" : "🛎️", " ", role), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
       gap: 8
     }
-  }, ALL_FEATURES.map(f => {
-    const checked = (local[role] || []).includes(f.id);
+  }, ALL_FEATURES.filter(f => !FEATURE_GATED_VIEWS[f.id] || hasFeature(FEATURE_GATED_VIEWS[f.id])).map(f => {
+    const checked = permsFor(local, role).includes(f.id);
     return /*#__PURE__*/React.createElement("label", {
       key: f.id,
       style: {
@@ -10263,14 +10838,18 @@ function BottomNav({
     id: "storage",
     icon: "💾",
     label: "Storage"
+  }, {
+    id: "restaurant",
+    icon: "🍽️",
+    label: "Restaurant"
   }];
   // Owner sees everything + Access Control. Manager/Receptionist see only
   // what Owner has allowed them via the permissions settings. Plan features
   // apply on top — a hotel without "history" or "storage" enabled on their
   // plan won't see those tabs even if their role would otherwise allow it.
   const isOwner = role === "Owner";
-  const allowed = isOwner ? baseItems.map(i => i.id) : (permissions?.[role] || []);
-  const planGated = { history: hasFeature("history"), storage: hasFeature("storage") };
+  const allowed = isOwner ? baseItems.map(i => i.id) : permsFor(permissions, role);
+  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant") };
   let items = baseItems.filter(i => allowed.includes(i.id) && (planGated[i.id] === undefined || planGated[i.id]));
   if (isOwner && hasFeature("roles")) {
     items = [...items, { id: "access", icon: "🔐", label: "Access" }];
@@ -10333,9 +10912,20 @@ function BottomNav({
 // Default access — Owner always has everything; these control what
 // Manager/Receptionist can see. Owner can change this from Access Control.
 const DEFAULT_PERMISSIONS = {
-  Manager: ["dash", "rooms", "checkin", "billing", "history", "docs", "storage"],
-  Receptionist: ["dash", "rooms", "checkin", "billing"]
+  Manager: ["dash", "rooms", "checkin", "billing", "history", "docs", "storage", "restaurant"],
+  Receptionist: ["dash", "rooms", "checkin", "billing", "restaurant"],
+  // Restaurant staff (paid "restaurant" add-on): only the order counter —
+  // no room rates, revenue dashboard, guest IDs or registers.
+  Restaurant: ["restaurant"]
 };
+// A role's allowed views. Hotels that saved permissions before a role
+// existed (e.g. Restaurant) fall back to that role's defaults.
+function permsFor(permissions, role) {
+  const p = permissions && permissions[role];
+  return Array.isArray(p) ? p : (DEFAULT_PERMISSIONS[role] || []);
+}
+// Views that also need a plan feature / paid add-on.
+const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant" };
 const ALL_FEATURES = [
   { id: "dash", label: "Dashboard", icon: "📊" },
   { id: "rooms", label: "Rooms", icon: "🏨" },
@@ -10343,7 +10933,8 @@ const ALL_FEATURES = [
   { id: "billing", label: "Billing", icon: "💰" },
   { id: "history", label: "History", icon: "🗒️" },
   { id: "docs", label: "Vault", icon: "🗂️" },
-  { id: "storage", label: "Storage", icon: "💾" }
+  { id: "storage", label: "Storage", icon: "💾" },
+  { id: "restaurant", label: "Restaurant", icon: "🍽️" }
 ];
 
 // ── PUBLIC BOOKING REQUEST PAGE ──────────────────────────────────
@@ -10594,8 +11185,9 @@ function App() {
     if (!invoiceView || sharePdfBusy) return;
     setSharePdfBusy(true);
     try {
-      const blob = await buildInvoicePDFFromHTML(invoiceView.b, invoiceView.room);
-      const fileLabel = invoiceView.b.invoiceNo || invoiceView.b.id;
+      const isRB = invoiceView.kind === "rbill";
+      const blob = await buildInvoicePDFFromHTML(invoiceView.b, invoiceView.room, isRB ? invoiceView.html : null);
+      const fileLabel = isRB ? invoiceView.label : (invoiceView.b.invoiceNo || invoiceView.b.id);
       const file = new File([blob], `invoice-${fileLabel.replace(/\//g, "-")}.pdf`, { type: "application/pdf" });
       // Share the actual PDF where supported (WhatsApp appears in the sheet
       // and sends the file). Older browsers just get a download.
@@ -10619,6 +11211,7 @@ function App() {
       // offline), fall back to the older hand-drawn PDF rather than
       // leaving the user with no way to share at all.
       try {
+        if (invoiceView.kind === "rbill") throw e;
         const blob = buildInvoicePDFBlob(invoiceView.b, invoiceView.room);
         const fileLabel = invoiceView.b.invoiceNo || invoiceView.b.id;
         const file = new File([blob], `invoice-${fileLabel.replace(/\//g, "-")}.pdf`, { type: "application/pdf" });
@@ -10661,10 +11254,11 @@ function App() {
     const key = localStorage.getItem("ab_license_key");
     const phone = localStorage.getItem("ab_verified_phone");
     if (!key || !phone) return; // nothing to re-check (e.g. pre-dates this feature)
+    if (!PhoneShape.ok(phone)) { localStorage.removeItem("ab_verified_phone"); return; } // AUDIT-2 F1
     fetch("/api/verify-access", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ licenseKey: key, phone })
+      body: JSON.stringify({ licenseKey: key, phone, deviceId: HotelAuth.deviceId() })
     }).then(res => res.json().then(data => ({ status: res.status, data })))
       .then(({ status, data }) => {
         // Only actively-rejected (403) means "this phone is no longer on
@@ -10675,11 +11269,25 @@ function App() {
           localStorage.removeItem("ab_license_key");
           localStorage.removeItem("ab_verified_phone");
           setLicenseSet(false);
+          return;
+        }
+        // AD-1 remediation: this silent re-check already runs on every boot,
+        // so it's also the natural place to (re)establish the verified
+        // per-hotel Firebase Auth session — refreshes it if it expired, and
+        // opportunistically signs in devices that were verified before this
+        // build shipped (their localStorage already has key+phone, they just
+        // never got a token). Fire-and-forget; failure here changes nothing
+        // (legacy key-shape rule still covers this device).
+        if (status === 200 && data && data.ok && data.token) {
+          HotelAuth.signIn(data.token).catch(() => {});
         }
       })
       .catch(() => {}); // network failure — fail open, stay logged in
   }, [licenseSet]);
   const [view, setView] = useState("dash");
+  // Hotel's own menu (Restaurant / Add Food) — refreshed from the cloud on
+  // boot so every device bills with the same rates.
+  useEffect(() => { if (licenseSet) MenuStore.refresh().catch(() => {}); }, [licenseSet]);
   // Defense-in-depth: bounce anyone (including Owner) away from a view
   // their PLAN doesn't include (e.g. "roles" or "history" disabled by
   // BizzSathi admin for this hotel) — this is separate from the
@@ -10688,10 +11296,11 @@ function App() {
   // plan somehow excludes even dash, the header Exit button remains
   // reachable so no one is ever fully trapped.
   useEffect(() => {
-    const featureGatedViews = { access: "roles", history: "history", storage: "storage" };
-    const requiredFeature = featureGatedViews[view];
+    const requiredFeature = FEATURE_GATED_VIEWS[view];
     if (requiredFeature && !hasFeature(requiredFeature)) {
-      setView("dash");
+      // Non-owners go to their first allowed view (the effect below picks
+      // it); an Owner falls back to the dashboard.
+      setView(user && user.role !== "Owner" ? "none" : "dash");
     }
   }, [view, enabledFeatures]);
   // Defense-in-depth: if a Manager/Receptionist ends up on a view they're
@@ -10704,12 +11313,16 @@ function App() {
   // fully trapped.
   useEffect(() => {
     if (!user || user.role === "Owner") return;
-    const allowed = permissions?.[user.role] || [];
-    if (view === "access") { setView(allowed[0] || "dash"); return; }
-    if (!allowed.includes(view)) {
-      setView(allowed[0] || "dash");
-    }
-  }, [view, user, permissions]);
+    // Only views this role may see AND the hotel's plan includes. If
+    // nothing is left (e.g. a Restaurant login after the add-on was
+    // switched off) show a neutral screen — never fall back to the
+    // revenue dashboard.
+    const allowed = permsFor(permissions, user.role).filter(v => !FEATURE_GATED_VIEWS[v] || hasFeature(FEATURE_GATED_VIEWS[v]));
+    const fallback = allowed[0] || "none";
+    if (view === "access") { setView(fallback); return; }
+    if (view !== "none" && !allowed.includes(view)) { setView(fallback); return; }
+    if (view === "none" && allowed.length) setView(fallback);
+  }, [view, user, permissions, enabledFeatures]);
   const [rooms, setRooms] = useState(() => {
     // Synchronous lazy initializer — runs ONCE, before ANY effect (including
     // the onSnapshot listener setup) gets a chance to run. This is critical:
@@ -11071,6 +11684,17 @@ function App() {
   // (re)subscribe the moment the token becomes known on ANY device,
   // including one where it arrives seconds after login rather than at
   // mount. Also runs again correctly if the token itself is ever rotated.
+  // AUDIT-2 (F2): enquiries are readable only by the signed-in owning
+  // hotel, and HotelAuth.signIn() completes asynchronously — often AFTER
+  // this listener first registers. A listener rejected with
+  // permission-denied is dead for good, so it is re-created whenever the
+  // Firebase Auth identity changes (independent review finding S1).
+  const [authUid, setAuthUid] = useState("");
+  useEffect(() => {
+    if (!window._auth || typeof window._auth.onAuthStateChanged !== "function") return;
+    const off = window._auth.onAuthStateChanged(u => setAuthUid(u && u.uid ? u.uid : ""));
+    return () => { try { off && off(); } catch (e) {} };
+  }, []);
   useEffect(() => {
     const tok = (profile?.publicBookingToken || "").trim();
     if (!tok || !window._db) { setBookingRequests([]); return; }
@@ -11088,7 +11712,7 @@ function App() {
         }, err => console.warn("Booking requests listener:", err.message));
     } catch (e) { console.warn("Booking requests listener setup:", e.message); }
     return () => unsub();
-  }, [profile?.publicBookingToken]);
+  }, [profile?.publicBookingToken, authUid]);
 
   // Strips everything that must NEVER leave this device before syncing to
   // Firestore: raw Aadhaar/ID numbers (masked instead) and all photos
@@ -11408,18 +12032,57 @@ function App() {
     setCIR(null);
   };
   const handleAddCharge = async (bid, items) => {
-    const nb = bookings.map(b => b.id === bid ? {
-      ...b,
-      charges: [...(b.charges || []), ...items]
-    } : b);
+    // Restaurant counter and reception may add orders to the same room
+    // from different devices within seconds. Before writing, pull the
+    // server's copy of THIS booking's charges and keep any (time-stamped,
+    // id-bearing) order this device has not seen yet, so one device's save
+    // can never silently drop another device's order. Only the charges
+    // list is merged — everything else (photos, unmasked ID kept locally)
+    // stays as this device has it.
+    let serverCharges = [];
+    try {
+      const fresh = await WS.get("bookings", true);
+      const fb = Array.isArray(fresh) ? fresh.find(x => x.id === bid) : null;
+      if (fb && Array.isArray(fb.charges)) serverCharges = fb.charges;
+    } catch (e) {}
+    let merged = null;
+    const nb = bookings.map(b => {
+      if (b.id !== bid) return b;
+      const local = b.charges || [];
+      const seen = {};
+      local.forEach(c => { if (c && c.id) seen[c.id] = true; });
+      const voided = {};
+      (b.voidedCharges || []).forEach(c => { if (c && c.id) voided[c.id] = true; });
+      const missing = serverCharges.filter(c => c && c.id && !seen[c.id] && !voided[c.id]);
+      merged = [...local, ...missing, ...items];
+      return { ...b, charges: merged };
+    });
     await saveBk(nb);
-    if (modal?.b?.id === bid) setModal(p => ({
+    if (modal?.b?.id === bid && merged) setModal(p => ({
       ...p,
       b: {
         ...p.b,
-        charges: [...(p.b.charges || []), ...items]
+        charges: merged
       }
     }));
+  };
+  // Removing a wrongly-entered item: never a silent delete. The line moves
+  // to voidedCharges with who/when/why, and the audit log records it.
+  const handleVoidCharge = async (bid, index, reason) => {
+    const b = bookings.find(x => x.id === bid);
+    if (!b || b.status !== "active") { alert("Checked-out bill me badlav nahi ho sakta — credit note use karo."); return; }
+    if (!user || (user.role !== "Owner" && user.role !== "Manager")) { alert("Sirf Owner/Manager item hata sakte hain."); return; }
+    const c = (b.charges || [])[index];
+    if (!c) return;
+    const voidRec = { ...c, voidBy: user.name || user.u, voidAt: new Date().toISOString(), voidReason: String(reason).slice(0, 120) };
+    const nb = bookings.map(x => x.id === bid ? {
+      ...x,
+      charges: (x.charges || []).filter((_, j) => j !== index),
+      voidedCharges: [...(x.voidedCharges || []), voidRec]
+    } : x);
+    await saveBk(nb);
+    AuditLog.add("CHARGE_VOIDED", "Room " + b.roomId + " · " + c.name + " x" + c.qty + " · " + reason);
+    if (modal?.b?.id === bid) setModal(p => ({ ...p, b: nb.find(x => x.id === bid) }));
   };
   const handleExtendStay = async (bid, newCheckOut) => {
     const b = bookings.find(x => x.id === bid);
@@ -11527,8 +12190,9 @@ function App() {
     setModal(null);
   };
   const handleLogin = async s => {
-    setUser(s);
-    await WS.set("cu", s);
+    const { p: _pwHash, ...safe } = s || {};
+    setUser(safe);
+    await WS.set("cu", safe);
   };
   const handleLogout = async () => {
     AuditLog.add("LOGOUT", user?.u || "");
@@ -11583,6 +12247,12 @@ function App() {
   if (!user) return /*#__PURE__*/React.createElement(LoginScreen, {
     onLogin: u => {
       setUser(u);
+      // Land non-owners directly on a view they may see, so a restricted
+      // login (e.g. Restaurant) never renders the dashboard even briefly.
+      if (u && u.role !== "Owner") {
+        const ok = permsFor(permissions, u.role).filter(v => !FEATURE_GATED_VIEWS[v] || hasFeature(FEATURE_GATED_VIEWS[v]));
+        setView(ok[0] || "none");
+      }
       if (u.mustChange) setChangePwd(true);
     }
   });
@@ -11786,7 +12456,15 @@ function App() {
   }), view === "docs" && /*#__PURE__*/React.createElement(DocumentsView, {
     bookings: bookings,
     rooms: rooms
-  }), invoiceView && /*#__PURE__*/React.createElement("div", {
+  }), view === "restaurant" && hasFeature("restaurant") && /*#__PURE__*/React.createElement(RestaurantView, {
+    rooms: rooms,
+    bookings: bookings,
+    user: user,
+    onAddCharge: handleAddCharge,
+    openHtmlBill: bill => setInvoiceView({ kind: "rbill", bill, label: bill.id, html: buildRestaurantBillHTML(bill) })
+  }), view === "none" && /*#__PURE__*/React.createElement("div", {
+    style: { padding: 28, textAlign: "center", color: "var(--muted)", fontSize: 14 }
+  }, "Aapke login ke liye abhi koi section chalu nahi hai. Owner se baat karein."), invoiceView && /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed", inset: 0, zIndex: 4000, background: "#fff",
       display: "flex", flexDirection: "column"
@@ -11845,6 +12523,10 @@ function App() {
   })), modal?.type === "booking" && liveB && /*#__PURE__*/React.createElement(BookingModal, {
     b: liveB,
     room: modal.room,
+    user: user,
+    canVoid: !!user && (user.role === "Owner" || user.role === "Manager"),
+    canEditMenu: !!user && (user.role === "Owner" || user.role === "Manager"),
+    onVoidCharge: handleVoidCharge,
     onAddCharge: handleAddCharge,
     onCheckOut: handleCheckOut,
     onExtendStay: handleExtendStay,

@@ -7,12 +7,24 @@ rules_version = '2';
 //
 //  ⚠️  READ THIS FIRST — WHAT THESE RULES CAN AND CANNOT DO
 //
-//  UPDATE (2026-09 audit): the ADMIN PANEL now signs in with a
-//  server-minted custom token (see isAdmin() below and
-//  netlify/functions/admin-auth.mjs). The HOTEL APP (index.html) still
-//  uses no Firebase Authentication, so every hotel-app request is
-//  ANONYMOUS and `request.auth` is null for it. The rest of this note
-//  describes that hotel-side situation.
+//  UPDATE (2026-09 audit): the ADMIN PANEL signs in with a server-minted
+//  custom token (see isAdmin() below and netlify/functions/admin-auth.mjs).
+//
+//  UPDATE (AD-1 remediation, Phase 1 — see SECURITY_AUDIT.md): the HOTEL
+//  APP (index.html) now ALSO gets a server-minted custom token —
+//  {hotelId: <KEY>} — from /api/verify-access on every successful
+//  license+phone check, and signs into it (HotelAuth module in
+//  index.html). See `verifiedHotel()` below. THIS IS NOT YET ENFORCED:
+//  the rules below accept EITHER that verified identity OR the bare
+//  key-shape check, so every description in this note of what the
+//  key-only model can and cannot do is STILL ACCURATE today — a device
+//  that hasn't signed in (old cached build, Auth SDK blocked, etc.) is
+//  still let in on key-shape alone. Phase 1 only gets verified identities
+//  flowing so adoption can be observed (the `authVersion` doc each
+//  hotel's data subtree gets once a device signs in) before Phase 2 (see
+//  the TODO at the bottom of this file) removes the key-shape half of the
+//  OR and makes `verifiedHotel()` the only way in. Until that flip
+//  happens, every point below still applies in full.
 //
 //  The practical consequence, stated plainly: these rules CANNOT tell
 //  "Hotel A's staff" apart from "a stranger on the internet who has
@@ -47,20 +59,19 @@ rules_version = '2';
 //    • A dishonest staff member who has seen the key retains access
 //      after leaving, until the key is changed for that hotel.
 //
-//  THE REAL FIX, when there is time to do it properly, is to add
-//  authentication so that rules can check identity instead of trusting
-//  a shared secret. The path that fits this app's existing design:
-//    (a) Add the firebase-auth SDK to index.html.
-//    (b) Have the existing /api/verify-access Netlify function — which
-//        already verifies license key + registered phone server-side —
-//        mint a Firebase Custom Token carrying the hotel id as a claim
-//        (needs the Firebase Admin SDK and a service-account key stored
-//        in Netlify env vars, never in client code).
-//    (c) Client calls signInWithCustomToken() with that token.
-//    (d) Replace the `hotelId` checks below with
-//        `request.auth.token.hotelId == hotelId`, which ties every read
-//        and write to a verified device rather than to knowledge of a
-//        string. At that point a leaked key alone stops being enough.
+//  PHASE 2 — THE REAL FIX — TODO once adoption is confirmed:
+//    (a)–(c) already shipped: firebase-auth SDK in index.html,
+//        /api/verify-access mints the custom token, HotelAuth.signIn()
+//        calls signInWithCustomToken().
+//    (d) REMAINING: once telemetry (the `authVersion` doc, or simply
+//        enough elapsed time/support-ticket-free operation) shows every
+//        live device has picked up a build with HotelAuth, remove the
+//        `validHotelId(hotelId) ||` part from every hotels/ rule below,
+//        leaving `verifiedHotel(hotelId) || isAdmin()` (keep isAdmin() —
+//        the admin Data Manager depends on it). At that point a leaked key alone
+//        stops being enough, and revoking a hotel's access for real means
+//        revoking that uid's refresh tokens via the Admin API (in
+//        addition to `active:false`).
 //
 // ═══════════════════════════════════════════════════════════════════
 
@@ -88,6 +99,27 @@ service cloud.firestore {
         && id.size() >= 8
         && id.size() <= 40
         && id.matches('^ATITHI-[A-Za-z0-9]+$');
+    }
+
+    // AD-1 REMEDIATION, PHASE 1 (see SECURITY_AUDIT.md). /api/verify-access
+    // now mints a Firebase custom token — uid "hotel:<KEY>:<deviceId>",
+    // claim {hotelId: <KEY>} — on every successful license+phone check, and
+    // index.html's HotelAuth module signs into it. This helper recognizes
+    // that VERIFIED identity, in addition to (not yet instead of) the
+    // key-shape check below.
+    //
+    // Per the rule-semantics note further down: Firestore rules are OR'd, so
+    // right now `validHotelId(hotelId) || verifiedHotel(hotelId)` behaves
+    // identically to `validHotelId(hotelId)` alone — this does NOT tighten
+    // anything yet, by design. It exists so devices can start signing in and
+    // BizzSathi admin can watch adoption (the `authVersion` doc each hotel's
+    // data subtree gets once a device signs in) before Phase 2 removes
+    // `validHotelId(hotelId)` from these OR's and leaves only
+    // `verifiedHotel(hotelId)` — the point at which a leaked license key
+    // alone stops being sufficient to read or write that hotel's data.
+    function verifiedHotel(id) {
+      return request.auth != null
+        && request.auth.token.hotelId == id;
     }
 
     // The admin panel's billing vault ID — a random per-admin-device
@@ -122,18 +154,30 @@ service cloud.firestore {
 
     // ---- per-hotel operational data ------------------------------
     // Path: hotels/{hotelId}/data/{docId}
-    // docId is one of: rooms, bookings, profile, users, audit,
-    // permissions, creditNotes, bookings_archive_YYYY_MM, invoiceCounter_*.
+    // docId is one of: rooms, bookings, profile, users, audit, cu,
+    // permissions, creditNotes, authVersion, bookings_archive_YYYY_MM,
+    // invCounter_YY-YY, cnCounter_YY-YY, menu (hotel's own menu),
+    // rbills_YYYY_MM_DD (walk-in restaurant bills, one doc per day) and
+    // rbCounter_YY-YY (restaurant bill number series).
     // (Public booking requests are NOT here — they live under the
     // separate, token-scoped public_booking/ tree; see below.)
     match /hotels/{hotelId}/data/{docId} {
 
       // `get` (one specific document) is allowed; `list` is NOT granted
-      // anywhere in this file. That distinction is deliberate and is
-      // what prevents someone from enumerating hotels. The staff app
-      // only ever does direct .doc(id).get() calls — verified against
-      // the codebase — so denying list costs the app nothing.
-      allow get: if validHotelId(hotelId);
+      // to the hotel app or anyone anonymous. That distinction is
+      // deliberate and is what prevents someone from enumerating hotels.
+      // The staff app only ever does direct .doc(id).get() calls —
+      // verified against the codebase — so denying list costs it nothing.
+      //
+      // ADMIN DATA MANAGER (admin.html → license card → "🗂️ Data"): the
+      // authenticated BizzSathi admin (isAdmin(), server-minted claim) may
+      // additionally LIST one hotel's data subcollection — so the manager
+      // finds every document (including dated bookings_archive_* months)
+      // without guessing ids — and may edit/delete. `isAdmin()` is OR'd in
+      // explicitly (not relied on via validHotelId) so admin access keeps
+      // working after AD-1 Phase 2 drops the key-shape check.
+      allow get: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+      allow list: if isAdmin() && validHotelId(hotelId);
 
       // NOTE ON RULE SEMANTICS (worth remembering before adding any
       // narrower rule under this same path): Firestore Security Rules
@@ -145,23 +189,30 @@ service cloud.firestore {
       // under here ever needs stricter treatment, it must be excluded
       // from this block's conditions explicitly (or live outside this
       // subtree entirely, the way public_booking/ does).
-      allow create, update: if validHotelId(hotelId);
+      allow create, update: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
 
       // Guest registers are a legal retention requirement under the
       // Indian hospitality/police-reporting rules, and the app itself
       // never deletes these documents in normal operation — it only
       // overwrites them (archiving MOVES records between documents via
-      // writes, never a delete). Denying delete outright means a
-      // compromised or buggy client cannot destroy a hotel's records.
-      allow delete: if false;
+      // writes, never a delete). So the hotel app (anonymous or
+      // verifiedHotel) still can NOT delete: a compromised or buggy hotel
+      // device cannot destroy a hotel's records.
+      //
+      // Only the authenticated BizzSathi admin can delete, via the admin
+      // Data Manager — which forces a full JSON backup download and a
+      // typed-key confirmation before any delete (see dmDelete* in
+      // admin.html). Used for closed/churned clients and DPDP erasure
+      // requests.
+      allow delete: if isAdmin();
     }
 
     // The app writes a few keys directly under the hotel document
     // itself rather than the data subcollection. Same treatment.
     match /hotels/{hotelId} {
-      allow get: if validHotelId(hotelId);
-      allow create, update: if validHotelId(hotelId);
-      allow delete: if false;
+      allow get: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+      allow create, update: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+      allow delete: if isAdmin();
     }
 
     // ---- licenses (new, per-document storage) --------------------
@@ -213,55 +264,134 @@ service cloud.firestore {
 
     // ---- public booking (token-scoped, safe to share) ------------
     // The public booking link is "…/?book=<PUBLIC-TOKEN>", where the
-    // token is a random value UNRELATED to the hotel's license key.
-    // That distinction is the whole security design of this feature:
-    // with no Firebase Auth in this app, the license key is effectively
-    // the only credential these rules can check, so a URL meant to be
-    // posted on Facebook must not contain or reveal it. An earlier
-    // version of this feature put the license key straight in the link,
-    // which meant publishing the link published read/write access to the
-    // hotel's entire guest register. It now cannot: nothing under
-    // `hotels/{licenseKey}/**` is reachable from the public page, and the
-    // license key is not derivable from the token.
+    // token is a random value UNRELATED to the hotel's license key, so
+    // publishing the link never publishes the key.
     //
-    // This document holds ONLY the outward-facing snapshot the hotel's
-    // staff app publishes — name, address, phone, room types and a
-    // "starting from" rate. No room numbers, no occupancy, no guest
-    // data. World-readable by design (it is the same information a
-    // hotel prints on its own website), but not enumerable: `list` is
-    // denied, and tokens are 16 random chars from a 32-char alphabet
-    // (32^16 ≈ 1.2 × 10^24), so they cannot be guessed or walked.
+    // AUDIT-2 (F2) — WRITE OWNERSHIP. The token is deliberately public: it
+    // is posted on Facebook/WhatsApp. The previous rules nonetheless let
+    // anyone holding it UPDATE the page (`size() <= 12` was the only
+    // check), so any stranger who saw the link could replace the hotel's
+    // phone number with their own and take bookings/advance payments meant
+    // for the hotel, and could LIST every pending enquiry (guest names and
+    // phone numbers) and flip their status.
+    //
+    // Ownership is recorded ONCE, server-side-verifiable, in a private
+    // binding document public_booking_owner/{token} = { hotelId, createdAt }:
+    //   • no client can read it (rules' own get() is not subject to rules);
+    //   • a hotel can create it only for a token whose public page does
+    //     not exist yet, i.e. at the moment it mints a new link — so an
+    //     existing page can never be claimed by someone else;
+    //   • it can never be changed afterwards except by the admin (who also
+    //     backfills bindings for pages created before this rule existed —
+    //     see backfillBookingOwners() in admin.html).
+    // The binding deliberately does NOT live in the hotel's own profile:
+    // every hotel can write its own profile, so "my profile names this
+    // token" proves nothing (independent review finding B1).
+    function verifiedHotelId() {
+      return request.auth != null
+        && request.auth.token.hotelId is string
+        && validHotelId(request.auth.token.hotelId);
+    }
+    function ownsBookingToken(token) {
+      return verifiedHotelId()
+        && exists(/databases/$(database)/documents/public_booking_owner/$(token))
+        && get(/databases/$(database)/documents/public_booking_owner/$(token)).data.hotelId == request.auth.token.hotelId;
+    }
+    // Same check against the state AFTER the current batch, for the batch
+    // that creates the binding and the page together.
+    function ownsBookingTokenAfter(token) {
+      return verifiedHotelId()
+        && existsAfter(/databases/$(database)/documents/public_booking_owner/$(token))
+        && getAfter(/databases/$(database)/documents/public_booking_owner/$(token)).data.hotelId == request.auth.token.hotelId;
+    }
+    // Shape of tokens minted by generatePublicBookingToken() in index.html.
+    // Enforced on CREATE only, so pages published under any older token
+    // format keep working for reads, updates and guest submissions.
+    function validBookingToken(token) {
+      return token is string && token.matches('^PB[A-Z2-9]{16}$');
+    }
+    function boundedString(v, maxLen) {
+      return v is string && v.size() <= maxLen;
+    }
+    function validSnapshotFields(d) {
+      return (!('hotelName' in d) || boundedString(d.hotelName, 200))
+        && (!('hotelAddr' in d) || boundedString(d.hotelAddr, 1000))
+        && (!('hotelPhone' in d) || boundedString(d.hotelPhone, 60))
+        && (!('roomTypes' in d) || (d.roomTypes is list && d.roomTypes.size() <= 50))
+        && (!('updatedAt' in d) || d.updatedAt is number);
+    }
+
+    // The hotel's outward-facing snapshot — name, address, phone, room
+    // types and a "starting from" rate. World-readable by design (it is
+    // what a hotel prints on its own website), not enumerable.
     match /public_booking/{token} {
       allow get: if true;
       allow list: if false;
-      // Only the hotel's own staff app writes this snapshot. It cannot
-      // be restricted further without auth, but the blast radius of a
-      // malicious write is limited to defacing that one hotel's public
-      // booking page — it reaches no private data.
-      allow create, update: if request.resource.data.size() <= 12;
-      allow delete: if false;
+      // CREATE: first publish of a brand-new random token, in the same
+      // batch that creates its owner binding (see ownsBookingTokenAfter).
+      allow create: if validBookingToken(token)
+        && request.resource.data.keys().hasOnly(['hotelName', 'hotelAddr', 'hotelPhone', 'roomTypes', 'updatedAt'])
+        && validSnapshotFields(request.resource.data)
+        && (ownsBookingTokenAfter(token) || isAdmin());
+      // UPDATE: only the owning hotel (or the admin). Only the published
+      // snapshot fields may change; legacy extra fields may remain.
+      allow update: if (ownsBookingToken(token) || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hotelName', 'hotelAddr', 'hotelPhone', 'roomTypes', 'updatedAt'])
+        && validSnapshotFields(request.resource.data);
+      // Admin Data Manager only (removing a closed hotel's public page).
+      allow delete: if isAdmin();
     }
 
-    // Each booking request is its OWN document here, created by the
-    // public page. Per-document creates (rather than appending to a
-    // shared array) mean a guest needs no read access to submit, and
-    // cannot overwrite or expose another guest's submission.
+    // Private owner binding for a public booking token (see the AUDIT-2 F2
+    // note above). Never readable by clients; written once.
+    match /public_booking_owner/{token} {
+      allow get: if isAdmin();
+      allow list: if false;
+      allow create: if request.resource.data.keys().hasOnly(['hotelId', 'createdAt'])
+        && request.resource.data.createdAt is number
+        && (
+          (verifiedHotelId()
+            && validBookingToken(token)
+            && request.resource.data.hotelId == request.auth.token.hotelId
+            && !exists(/databases/$(database)/documents/public_booking/$(token)))
+          || (isAdmin() && validHotelId(request.resource.data.hotelId))
+        );
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['hotelId', 'createdAt'])
+        && validHotelId(request.resource.data.hotelId);
+      allow delete: if isAdmin();
+    }
+
+    // Each booking request is its OWN document, created by the public page.
     match /public_booking/{token}/requests/{reqId} {
-      // ⚠️ RESIDUAL, ACCEPTED EXPOSURE: staff need to read this queue to
-      // action requests, and with no auth the rules cannot tell a staff
-      // device from a guest. So anyone holding the token can read the
-      // pending requests — i.e. the names/phones of people who have
-      // enquired at that hotel. That is a genuine but deliberately
-      // bounded trade-off: it is limited to a handful of open enquiries
-      // for one hotel, versus the entire historical guest register that
-      // the previous license-key-in-the-link design exposed. Closing it
-      // completely requires Firebase Auth (see the file header).
-      allow get, list: if true;
-      // Guests create; staff update (to mark confirmed/declined). Capped
-      // small — a request is a few short text fields, so anything larger
-      // is abuse rather than use.
-      allow create, update: if request.resource.data.size() <= 20;
-      allow delete: if false;
+      // Guests submit without any identity — that is the feature. The
+      // document must have exactly the public form's shape, start as
+      // "pending", and its id field must equal its document id.
+      allow create: if exists(/databases/$(database)/documents/public_booking/$(token))
+        && reqId.matches('^REQ[A-Z0-9]{4,24}$')
+        && request.resource.data.keys().hasOnly(['id', 'name', 'phone', 'email', 'checkIn', 'checkOut', 'roomType', 'notes', 'status', 'createdAt'])
+        && request.resource.data.id == reqId
+        && request.resource.data.status == 'pending'
+        && boundedString(request.resource.data.name, 100)
+        && boundedString(request.resource.data.phone, 20)
+        && (!('email' in request.resource.data) || boundedString(request.resource.data.email, 100))
+        && (!('notes' in request.resource.data) || boundedString(request.resource.data.notes, 300))
+        && (!('roomType' in request.resource.data) || boundedString(request.resource.data.roomType, 60))
+        && (!('checkIn' in request.resource.data) || boundedString(request.resource.data.checkIn, 10))
+        && (!('checkOut' in request.resource.data) || boundedString(request.resource.data.checkOut, 10))
+        && (!('createdAt' in request.resource.data) || boundedString(request.resource.data.createdAt, 40));
+      // AUDIT-2 (F2): enquiries contain guests' names and phone numbers —
+      // readable only by the owning hotel and the admin, no longer by
+      // anyone who has seen the public link.
+      allow get, list: if ownsBookingToken(token) || isAdmin();
+      // Staff accept/decline: only the decision fields may change.
+      allow update: if (ownsBookingToken(token) || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'decidedAt', 'decisionReason'])
+        && request.resource.data.status in ['pending', 'confirmed', 'declined']
+        && (!('decisionReason' in request.resource.data) || boundedString(request.resource.data.decisionReason, 300))
+        && (!('decidedAt' in request.resource.data) || boundedString(request.resource.data.decidedAt, 40));
+      // Admin Data Manager only (clearing a closed hotel's enquiries).
+      allow delete: if isAdmin();
     }
 
     // ---- BizzSathi admin billing (internal — NOT customer-facing) --

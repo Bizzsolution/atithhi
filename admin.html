@@ -11,6 +11,12 @@
 <!-- Auth SDK: the panel signs in with a server-minted custom token
      (/api/admin-auth) so Firestore rules can verify it is the admin. -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<!-- AUDIT-2 (F10): payment QR codes are generated locally (qrcode-generator
+     1.4.4, MIT, Kazuhiko Arase — vendored as /qrcode.js). They used to be
+     rendered by the third-party api.qrserver.com, which received every
+     UPI ID, amount and invoice number and fully controlled the QR image a
+     customer scans to pay BizzSathi. -->
+<script src="/qrcode.js"></script>
 <script>
   window._db = null;
   try {
@@ -920,13 +926,121 @@ async function hydrateLicensesFromCloud() {
 // One entry point for login, the Sync button and vault switches.
 async function syncLicensesNow(showSuccess) {
   const r = await hydrateLicensesFromCloud();
-  if (r.state === true) backfillLicenseFields();
+  if (r.state === true) { backfillLicenseFields(); backfillBookingOwners().catch(() => {}); }
   renderDashboard();
   if (typeof renderVaultCard === "function") renderVaultCard();
   updateSyncIndicator(r.state);
   if (r.state !== true) showMsg(r.message, "error");
   else if (showSuccess) showMsg(r.message, "success");
   return r;
+}
+
+// ── AUDIT-2 (F2): public booking link owner bindings ───────────────
+// firestore.rules only let a hotel update its public booking page and read
+// its enquiries when public_booking_owner/{token} names that hotel. Links
+// created by the patched app write that binding themselves; links created
+// BEFORE the patch have none, so the admin binds them here.
+//
+// A hotel's own profile is NOT proof of ownership — every hotel can write
+// its own profile, so anyone can copy a competitor's public token into it.
+// A binding is therefore made automatically ONLY when all of these hold:
+//   1. the public page public_booking/{token} actually exists;
+//   2. exactly one hotel profile (across the FULL license index, not just
+//      the loaded page of the list) names the token;
+//   3. the hotel name shown on that page equals the hotel name the ADMIN
+//      recorded on that license (admin-written, so not forgeable by a
+//      hotel).
+// Anything else is shown to the admin for an explicit yes/no decision;
+// a "no" is remembered on this device so it is not asked again.
+let bookingOwnerBackfillDone = false;
+const BO_SKIP_KEY = "ab_booking_owner_skipped";
+function boNormName(v) { return String(v || "").toLowerCase().replace(/[^a-z0-9\u0900-\u097f]+/g, ""); }
+async function backfillBookingOwners(opts) {
+  const o = opts || {};
+  if (!o.force && bookingOwnerBackfillDone) return { bound: 0, review: [], conflicts: [] };
+  if (!window._db) return { bound: 0, review: [], conflicts: [] };
+  bookingOwnerBackfillDone = true;
+  const db = window._db;
+  // Full key list from the admin vault index; fall back to what is loaded.
+  let keys = [];
+  try {
+    const idx = await LicenseIndex.load();
+    if (idx && idx.ok) keys = idx.keys;
+  } catch (e) {}
+  (Array.isArray(licenses) ? licenses : []).forEach(l => { if (l && l.key) keys.push(String(l.key).toUpperCase()); });
+  keys = [...new Set(keys)].filter(k => /^ATITHI-[A-Z0-9]{1,33}$/.test(k));
+  if (!keys.length) return { bound: 0, review: [], conflicts: [] };
+
+  const nameByKey = {};
+  (Array.isArray(licenses) ? licenses : []).forEach(l => { if (l && l.key) nameByKey[String(l.key).toUpperCase()] = l.hotel || ""; });
+  const byToken = {};
+  for (const key of keys) {
+    try {
+      const snap = await db.collection("hotels").doc(key).collection("data").doc("profile").get();
+      const tok = snap.exists ? String(((snap.data() || {}).value || {}).publicBookingToken || "").trim() : "";
+      if (tok && /^[A-Za-z0-9]{4,64}$/.test(tok)) (byToken[tok] = byToken[tok] || []).push(key);
+    } catch (e) { /* unreadable profile: skipped, retried next session */ }
+  }
+  let skipped = {};
+  try { skipped = JSON.parse(localStorage.getItem(BO_SKIP_KEY) || "{}") || {}; } catch (e) { skipped = {}; }
+  let bound = 0;
+  const review = [];
+  const conflicts = [];
+  for (const tok of Object.keys(byToken)) {
+    try {
+      const ownerRef = db.collection("public_booking_owner").doc(tok);
+      const cur = await ownerRef.get();
+      if (cur.exists) {
+        const have = String((cur.data() || {}).hotelId || "");
+        if (byToken[tok].some(k => k !== have)) conflicts.push({ token: tok, boundTo: have, claimedBy: byToken[tok] });
+        continue;
+      }
+      const page = await db.collection("public_booking").doc(tok).get();
+      if (!page.exists) continue; // nothing public to protect; the app binds new links itself
+      const claimants = byToken[tok];
+      const pageName = String((page.data() || {}).hotelName || "");
+      if (claimants.length === 1) {
+        const key = claimants[0];
+        const recorded = nameByKey[key] || "";
+        if (recorded && boNormName(recorded) === boNormName(pageName)) {
+          await ownerRef.set({ hotelId: key, createdAt: Date.now() });
+          bound++;
+          continue;
+        }
+      }
+      review.push({ token: tok, claimants, pageName });
+    } catch (e) { console.warn("Booking owner backfill:", tok, e && e.message); }
+  }
+  // Explicit admin decision for everything that could not be proven.
+  for (const item of review) {
+    for (const key of item.claimants) {
+      const mark = item.token + "|" + key;
+      if (skipped[mark] && !o.force) continue;
+      const ok = confirm(
+        "🔗 Booking link owner set karna hai?\n\n" +
+        "Link token: " + item.token + "\n" +
+        "Public page par hotel naam: " + (item.pageName || "—") + "\n" +
+        "Claim karne wala hotel: " + (nameByKey[key] || "—") + " (" + key + ")\n" +
+        (item.claimants.length > 1 ? "⚠️ Yeh token " + item.claimants.length + " hotels ke profile me hai — sirf ASLI hotel ko chuno.\n" : "") +
+        "\nOK = isi hotel ko owner banao   |   Cancel = skip"
+      );
+      if (ok) {
+        try {
+          await db.collection("public_booking_owner").doc(item.token).set({ hotelId: key, createdAt: Date.now() });
+          bound++;
+        } catch (e) { console.warn("Booking owner bind:", e && e.message); }
+        break;
+      }
+      skipped[mark] = Date.now();
+    }
+  }
+  try { localStorage.setItem(BO_SKIP_KEY, JSON.stringify(skipped)); } catch (e) {}
+  if (conflicts.length) {
+    console.error("SECURITY: public booking token named by a hotel other than its bound owner:", JSON.stringify(conflicts));
+    showMsg("⚠️ " + conflicts.length + " booking link(s) kisi doosre hotel ke profile me bhi mile (owner pehle se set hai, kuch badla nahi). Details: Console (F12).", "error");
+  }
+  if (bound) showMsg("🔗 " + bound + " booking link(s) ke owner set ho gaye.", "success");
+  return { bound, review, conflicts };
 }
 
 function renderVaultCard() {
@@ -1204,6 +1318,7 @@ function renderDashboard() {
           <button class="btn" style="background:#1e293b;color:#93c5fd" onclick="openEditHotelModal(${i})">✏️ Edit</button>
           <button class="btn" style="background:#3730a3;color:#c7d2fe" onclick="openFeatureControl(${i})">🎛️ Features</button>
           <button class="btn" style="background:#134e4a;color:#5eead4" onclick="openDataManager(${i})">🗂️ Data</button>
+          <button class="btn" style="background:#3b1d0b;color:#fdba74" onclick="openMenuImport(${i})">🍽️ Menu</button>
           ${l.plan !== "TRIAL" ? `<button class="btn" style="background:#78350f;color:#fcd34d" onclick="generateInvoiceForLicense(${i})">🧾 Invoice</button>` : ''}
           ${l.active
             ? `<button class="btn btn-danger" onclick="revokeKey(${i})">Revoke</button>`
@@ -1237,7 +1352,8 @@ const FEATURE_CATALOG = [
 // itself — only this explicit per-hotel toggle does that.
 const ADDON_CATALOG = [
   { id: "ota_import", label: "OTA Booking Import", desc: "Quick-entry bookings from Agoda/MakeMyTrip/Goibibo etc, blocks the room like a normal check-in" },
-  { id: "direct_booking", label: "Direct Booking Link", desc: "Public shareable link (for Facebook/Instagram/WhatsApp) where guests request a room; hotel confirms from the app" }
+  { id: "direct_booking", label: "Direct Booking Link", desc: "Public shareable link (for Facebook/Instagram/WhatsApp) where guests request a room; hotel confirms from the app" },
+  { id: "restaurant", label: "Restaurant & Room Service", desc: "Restaurant counter (orders straight to the room bill), walk-in GST bills, KOT kitchen slips, separate Restaurant staff login" }
 ];
 const PLAN_DEFAULT_FEATURES = {
   TRIAL: [],
@@ -1393,8 +1509,24 @@ const PLAN_AMOUNTS = { TRIAL: 0, BASIC: 499, PRO: 999, PREM: 1499 };
 function buildUpiString(amount, note) {
   return `upi://pay?pa=${encodeURIComponent(UPI_ID)}&pn=${encodeURIComponent(UPI_PAYEE_NAME)}${amount > 0 ? `&am=${amount}` : ""}&cu=INR&tn=${encodeURIComponent(note)}`;
 }
+// Returns a data: URL (GIF) for the QR, or "" if the encoder is missing or
+// the payload cannot be encoded — callers then show no QR rather than a
+// QR from anywhere else (fail closed: a missing QR is an inconvenience, a
+// wrong QR sends money to the wrong account).
+function qrDataUrl(text, cellSize) {
+  try {
+    if (typeof qrcode !== "function") return "";
+    const q = qrcode(0, "M");
+    q.addData(String(text));
+    q.make();
+    return q.createDataURL(cellSize || 5, 2);
+  } catch (e) {
+    console.warn("QR generation failed:", e && e.message);
+    return "";
+  }
+}
 function qrImageUrl(upiString) {
-  return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(upiString)}`;
+  return qrDataUrl(upiString, 5);
 }
 
 // Cryptographically secure random key — uses crypto.getRandomValues()
@@ -1464,7 +1596,10 @@ function generateKey() {
   const qrSection = document.getElementById("paymentQrSection");
   if (amount > 0) {
     const upiStr = buildUpiString(amount, hotel + " - AtithiBook " + plan);
-    document.getElementById("paymentQrImg").src = qrImageUrl(upiStr);
+    const qrSrc = qrImageUrl(upiStr);
+    const qrImg = document.getElementById("paymentQrImg");
+    qrImg.src = qrSrc;
+    qrImg.style.display = qrSrc ? "" : "none";
     document.getElementById("paymentQrAmount").textContent = "₹" + amount + "/month";
     document.getElementById("paymentQrLink").href = upiStr;
     qrSection.style.display = "block";
@@ -2062,7 +2197,8 @@ function blInvoiceHTML(inv, opts) {
     let qr = "";
     if (s.upiId && !opts.noQr && t.total > 0) {
       const upi = `upi://pay?pa=${encodeURIComponent(s.upiId)}&pn=${encodeURIComponent(s.businessName || "")}&am=${(t.total / 100).toFixed(2)}&cu=INR&tn=${encodeURIComponent(inv.number)}`;
-      qr = `<img crossorigin="anonymous" src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=${encodeURIComponent(upi)}" style="width:92px;height:92px;flex-shrink:0" alt="UPI QR"/>`;
+      const qrSrc = qrDataUrl(upi, 3);
+      qr = qrSrc ? `<img src="${qrSrc}" style="width:92px;height:92px;flex-shrink:0;image-rendering:pixelated" alt="UPI QR"/>` : "";
     }
     if (bank || qr) payBlock = `<div class="bx"><div class="bh">Payment Details</div><div style="display:flex;gap:12px;align-items:flex-start"><div style="flex:1">${bank}</div>${qr}</div></div>`;
   }
@@ -3479,6 +3615,12 @@ async function dmDeleteAllRun() {
     const refs = DM.docs.map(d => dmRef(d.id));
     if (DM.root) refs.push(db.collection("hotels").doc(DM.key));
     if (DM.pub) {
+      // AUDIT-2 (F2): keep (or create) the owner binding as a tombstone, so
+      // the still-circulating public link can never be re-created by
+      // anyone except this hotel once its page is deleted.
+      const ownerRef = db.collection("public_booking_owner").doc(DM.pub.token);
+      const ownerSnap = await ownerRef.get();
+      if (!ownerSnap.exists) await ownerRef.set({ hotelId: DM.key, createdAt: Date.now() });
       const pref = db.collection("public_booking").doc(DM.pub.token);
       DM.pub.requests.forEach(r => { if (DM_ID_RE.test(r.id)) refs.push(pref.collection("requests").doc(r.id)); });
       refs.push(pref);
@@ -3545,6 +3687,391 @@ async function dmRestoreFromFile(input) {
   DM.cur = -1;
   await dmRefresh();
 }
+</script>
+
+
+<!-- ═══ Menu Import (admin) — upload a hotel's menu from a photo, PDF, Excel or CSV ═══ -->
+<style>
+.mi-drop{border:2px dashed #2d4470;border-radius:14px;padding:22px 14px;text-align:center;color:#94a3b8;font-size:13px;cursor:pointer;background:#0b1220}
+.mi-drop:hover,.mi-drop.over{border-color:#60a5fa;color:#e2e8f0}
+.mi-drop b{color:#f8fafc;font-size:15px;display:block;margin-bottom:4px}
+.mi-tbl{width:100%;border-collapse:separate;border-spacing:0 6px}
+.mi-tbl th{font-size:11px;color:#64748b;text-transform:uppercase;text-align:left;padding:0 6px;font-weight:800;letter-spacing:.4px}
+.mi-tbl td{padding:0 4px;vertical-align:middle}
+.mi-tbl input[type=text],.mi-tbl input[type=number],.mi-tbl select{width:100%;box-sizing:border-box;padding:7px 8px;border-radius:8px;border:1.5px solid #263248;background:#060b16;color:#e2e8f0;font-size:13px;margin:0}
+.mi-tbl input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:#2563eb}
+.mi-tbl tr.off td{opacity:.45}
+.mi-tag{display:inline-block;font-size:10px;font-weight:800;padding:2px 7px;border-radius:999px;background:#1e293b;color:#93c5fd;margin-left:6px}
+.mi-tag.upd{background:#422006;color:#fbbf24}.mi-tag.new{background:#052e16;color:#4ade80}
+.mi-opt{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:#cbd5e1;margin:10px 0}
+.mi-opt label{display:flex;align-items:center;gap:6px;cursor:pointer}
+.mi-opt input{width:16px;height:16px;margin:0}
+</style>
+<div class="dm-ov" id="miModal" role="dialog" aria-modal="true" aria-labelledby="miTitle" style="z-index:270">
+  <div class="dm-box">
+    <div class="dm-head">
+      <div>
+        <div class="dm-title" id="miTitle">🍽️ Menu Upload</div>
+        <div class="dm-sub" id="miSub"></div>
+      </div>
+      <button class="dm-x" onclick="miClose()" aria-label="Close">×</button>
+    </div>
+    <div class="dm-note" style="margin-top:12px">Hotel ke menu ki <b>photo / PDF</b> (AI padhega) ya <b>Excel / CSV</b> (columns: Item, Price, Category, Veg) upload karo. Pehle saare items yahan dikhenge — check/edit karke hi save hoga. Rate badalne se purane bills nahi badalte.</div>
+    <input type="file" id="miFile" accept="image/jpeg,image/png,image/webp,application/pdf,.pdf,.csv,.txt,.xlsx" style="display:none">
+    <div class="mi-drop" id="miDrop" tabindex="0" role="button" aria-label="Menu file chuno">
+      <b>📤 File chuno ya yahan drop karo</b>
+      JPG · PNG · WEBP · PDF (max 4 MB) &nbsp;|&nbsp; XLSX · CSV
+    </div>
+    <div class="dm-busy" id="miBusy"></div>
+    <div class="dm-msg" id="miMsg"></div>
+    <div id="miReview" style="display:none">
+      <div class="dm-sec" id="miCount"></div>
+      <div class="mi-opt">
+        <label><input type="radio" name="miMode" value="merge" checked> Merge — naye items jodo, same naam wale ka rate update karo</label>
+        <label><input type="radio" name="miMode" value="replace"> Replace — poora purana menu hatao</label>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="mi-tbl" aria-label="Extracted menu items">
+          <thead><tr><th style="width:34px">✔</th><th>Item</th><th style="width:96px">Rate ₹</th><th style="width:140px">Category</th><th style="width:128px">Veg</th></tr></thead>
+          <tbody id="miRows"></tbody>
+        </table>
+      </div>
+      <div class="dm-bar" style="margin-top:12px">
+        <button class="dm-b" onclick="miAddRow()">➕ Row jodo</button>
+        <button class="dm-b" onclick="miToggleAll()">☑️ Sab select / unselect</button>
+        <button class="dm-b grn" style="margin-left:auto" id="miSaveBtn" onclick="miSave()">💾 Hotel ke menu me save karo</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+// ── MENU IMPORT ─────────────────────────────────────────────────────
+// Writes hotels/<KEY>/data/menu in exactly the shape the hotel app's
+// MenuStore reads: [{id, cat, name, price, sub, active, veg}] wrapped in
+// {value, ts}. Everything parsed from a file or returned by the AI is
+// treated as untrusted text: rendered only via DOM text/value properties
+// (never innerHTML) and re-validated before saving.
+const MI = { idx: -1, key: "", hotel: "", rows: [], current: [], busy: false };
+const MI_CATS = [["🍛 Food", "Food"], ["☕ Beverages", "Beverages"], ["🛎️ Services", "Services"]];
+const MI_MAX_ROWS = 400;
+function miCatFrom(v) {
+  const s = String(v || "").toLowerCase();
+  if (/bev|drink|tea|chai|coffee|juice|shake|lassi|water|soda|cold/.test(s)) return "☕ Beverages";
+  if (/serv|laundry|iron|cab|taxi|bed|transport/.test(s)) return "🛎️ Services";
+  return "🍛 Food";
+}
+function miSubFor(cat, name) {
+  if (cat !== "🛎️ Services") return "";
+  const n = String(name).toLowerCase();
+  if (/laundry|iron|press|wash/.test(n)) return "laundry";
+  if (/cab|taxi|pickup|drop|transport/.test(n)) return "transport";
+  if (/extra\s*bed|mattress/.test(n)) return "extra_bed";
+  return "";
+}
+function miVegFrom(v) {
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  if (s === "") return true;
+  if (/^(n|no|non|nv|non-?veg|egg|false|0|🔴)/.test(s)) return false;
+  return true;
+}
+function miClean(r) {
+  const name = String(r.name || "").replace(/\s+/g, " ").trim().slice(0, 60);
+  const price = Math.round(Math.min(100000, Math.max(0, Number(String(r.price == null ? "" : r.price).replace(/[^0-9.]/g, "")) || 0)) * 100) / 100;
+  const cat = MI_CATS.some(c => c[0] === r.cat) ? r.cat : miCatFrom(r.cat);
+  return { name, price, cat, veg: r.veg !== false, on: r.on !== false };
+}
+function miMsg(t, kind) { const el = document.getElementById("miMsg"); el.textContent = t || ""; el.className = "dm-msg" + (t ? " " + (kind || "inf") : ""); }
+function miBusy(t) { const el = document.getElementById("miBusy"); el.textContent = t || ""; el.classList.toggle("on", !!t); MI.busy = !!t; }
+
+async function openMenuImport(i) {
+  const l = licenses[i];
+  if (!l) return;
+  MI.idx = i; MI.key = String(l.key || "").toUpperCase().replace(/[^A-Z0-9-]/g, ""); MI.hotel = l.hotel || ""; MI.rows = []; MI.current = [];
+  document.getElementById("miSub").textContent = (MI.hotel || "—") + " · " + MI.key;
+  document.getElementById("miReview").style.display = "none";
+  miMsg("");
+  document.getElementById("miModal").classList.add("open");
+  if (!window._db) { miMsg("Firebase connected nahi hai — pehle admin login karo.", "bad"); return; }
+  try {
+    const snap = await window._db.collection("hotels").doc(MI.key).collection("data").doc("menu").get();
+    const v = snap.exists ? (snap.data() || {}).value : null;
+    MI.current = Array.isArray(v) ? v : [];
+    miMsg(MI.current.length ? "Abhi is hotel ke menu me " + MI.current.length + " items hain." : "Is hotel ka apna menu abhi nahi bana (app default menu chal raha hai).", "inf");
+  } catch (e) {
+    miMsg("Current menu padh nahi paaye: " + e.message, "bad");
+  }
+}
+function miClose() { if (MI.busy) return; document.getElementById("miModal").classList.remove("open"); }
+
+// ── CSV ──
+function miParseCSV(text) {
+  const rows = []; let row = [], cell = "", q = false;
+  const s = String(text).replace(/^﻿/, "");
+  const delim = (s.split("\n")[0].split("\t").length > s.split("\n")[0].split(",").length) ? "\t" : ",";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      if (ch === '"') { if (s[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === delim) { row.push(cell); cell = ""; }
+    else if (ch === "\n" || ch === "\r") { if (ch === "\r" && s[i + 1] === "\n") i++; row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += ch;
+  }
+  if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(c => String(c).trim() !== ""));
+}
+// ── XLSX (first sheet) — a .xlsx is a ZIP of XML files; read it with the
+// browser's own DecompressionStream, no library needed. ──
+async function miInflateRaw(bytes) {
+  const ds = new DecompressionStream("deflate-raw");
+  const out = new Response(new Blob([bytes]).stream().pipeThrough(ds));
+  return new Uint8Array(await out.arrayBuffer());
+}
+async function miUnzip(buf) {
+  const u8 = new Uint8Array(buf), dv = new DataView(buf);
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 66000); i--) { if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; } }
+  if (eocd < 0) throw new Error("ZIP structure nahi mila");
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const files = {};
+  const dec = new TextDecoder();
+  for (let n = 0; n < count && n < 5000; n++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
+    const lho = dv.getUint32(p + 42, true);
+    const name = dec.decode(u8.subarray(p + 46, p + 46 + nlen));
+    const dataStart = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+    const raw = u8.subarray(dataStart, dataStart + csize);
+    if (/^xl\/(sharedStrings|workbook)\.xml$|^xl\/worksheets\/sheet\d+\.xml$|^xl\/_rels\/workbook\.xml\.rels$/.test(name)) {
+      files[name] = method === 0 ? raw : method === 8 ? await miInflateRaw(raw) : null;
+    }
+    p += 46 + nlen + xlen + clen;
+  }
+  return files;
+}
+async function miParseXLSX(buf) {
+  const files = await miUnzip(buf);
+  const dec = new TextDecoder();
+  const xml = name => files[name] ? new DOMParser().parseFromString(dec.decode(files[name]), "application/xml") : null;
+  const shared = [];
+  const ss = xml("xl/sharedStrings.xml");
+  if (ss) [...ss.getElementsByTagName("si")].forEach(si => shared.push([...si.getElementsByTagName("t")].map(t => t.textContent).join("")));
+  // First sheet in workbook order.
+  let sheetPath = "xl/worksheets/sheet1.xml";
+  const wb = xml("xl/workbook.xml"), rels = xml("xl/_rels/workbook.xml.rels");
+  if (wb && rels) {
+    const first = wb.getElementsByTagName("sheet")[0];
+    const rid = first && (first.getAttribute("r:id") || first.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "id"));
+    const rel = rid && [...rels.getElementsByTagName("Relationship")].find(r => r.getAttribute("Id") === rid);
+    if (rel) { const t = rel.getAttribute("Target").replace(/^\/?(xl\/)?/, ""); sheetPath = "xl/" + t; }
+  }
+  const sh = xml(sheetPath) || xml("xl/worksheets/sheet1.xml");
+  if (!sh) throw new Error("Excel sheet nahi mili");
+  const grid = [];
+  const colIdx = ref => { const m = /^([A-Z]+)/.exec(ref || ""); let n = 0; if (m) for (const ch of m[1]) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; };
+  [...sh.getElementsByTagName("row")].forEach(r => {
+    const row = [];
+    [...r.getElementsByTagName("c")].forEach(c => {
+      const t = c.getAttribute("t"), v = c.getElementsByTagName("v")[0], is = c.getElementsByTagName("is")[0];
+      let val = "";
+      if (t === "s" && v) val = shared[parseInt(v.textContent, 10)] || "";
+      else if (t === "inlineStr" && is) val = [...is.getElementsByTagName("t")].map(x => x.textContent).join("");
+      else if (v) val = v.textContent;
+      const ci = colIdx(c.getAttribute("r"));
+      row[ci >= 0 ? ci : row.length] = val;
+    });
+    for (let k = 0; k < row.length; k++) if (row[k] === undefined) row[k] = "";
+    if (row.some(x => String(x).trim() !== "")) grid.push(row);
+  });
+  return grid;
+}
+// Grid (from CSV/XLSX) → rows. Finds the header row by column names;
+// without one, assumes "name, price[, category][, veg]".
+function miGridToRows(grid) {
+  let h = -1, ci = { name: 0, price: 1, cat: -1, veg: -1 };
+  for (let r = 0; r < Math.min(grid.length, 10); r++) {
+    const cells = grid[r].map(x => String(x).toLowerCase().trim());
+    const name = cells.findIndex(c => /^(item|items|item name|name|dish|particulars|product)/.test(c));
+    const price = cells.findIndex(c => /(price|rate|amount|mrp|rs|₹)/.test(c));
+    if (name >= 0 && price >= 0) {
+      h = r;
+      ci = { name, price, cat: cells.findIndex(c => /(category|cat|type|section|group)/.test(c)), veg: cells.findIndex(c => /(veg)/.test(c)) };
+      break;
+    }
+  }
+  const out = [];
+  for (let r = h + 1; r < grid.length && out.length < MI_MAX_ROWS; r++) {
+    const g = grid[r];
+    const name = String(g[ci.name] || "").trim();
+    const price = Number(String(g[ci.price] == null ? "" : g[ci.price]).replace(/[^0-9.]/g, ""));
+    if (!name || !isFinite(price) || price <= 0) continue;
+    const catRaw = ci.cat >= 0 ? g[ci.cat] : name;
+    out.push(miClean({ name, price, cat: miCatFrom(catRaw), veg: ci.veg >= 0 ? miVegFrom(g[ci.veg]) : true }));
+  }
+  return out;
+}
+function miReadAs(file, how) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = () => rej(new Error("File padh nahi paaye"));
+    if (how === "text") fr.readAsText(file); else if (how === "buffer") fr.readAsArrayBuffer(file); else fr.readAsDataURL(file);
+  });
+}
+// Photos are downscaled to ≤ 2000 px JPEG — keeps menus legible, uploads small.
+async function miImageToBase64(file) {
+  const url = await miReadAs(file, "dataurl");
+  const img = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error("Photo khul nahi rahi")); im.src = url; });
+  const sc = Math.min(1, 2000 / Math.max(img.width, img.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.85).split(",")[1];
+}
+async function miExtractAI(mime, data) {
+  const u = window.firebase && firebase.auth && firebase.auth().currentUser;
+  if (!u) throw new Error("Admin session nahi mila — dobara login karo.");
+  const idToken = await u.getIdToken();
+  const r = await fetch("/api/menu-extract", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + idToken },
+    body: JSON.stringify({ mime, data })
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("Server error " + r.status));
+  return (Array.isArray(d.items) ? d.items : []).slice(0, MI_MAX_ROWS).map(it => miClean({
+    name: it.name, price: it.price,
+    cat: it.category === "beverage" ? "☕ Beverages" : it.category === "service" ? "🛎️ Services" : "🍛 Food",
+    veg: it.veg !== false
+  }));
+}
+async function miHandleFile(file) {
+  if (!file || MI.busy) return;
+  miMsg("");
+  const name = (file.name || "").toLowerCase();
+  try {
+    let rows;
+    if (/\.(csv|txt)$/.test(name) || file.type === "text/csv") {
+      miBusy("⏳ CSV padh rahe hain…");
+      rows = miGridToRows(miParseCSV(await miReadAs(file, "text")));
+    } else if (/\.xlsx$/.test(name)) {
+      miBusy("⏳ Excel padh rahe hain…");
+      rows = miGridToRows(await miParseXLSX(await miReadAs(file, "buffer")));
+    } else if (/\.xls$/.test(name)) {
+      throw new Error("Purana .xls format nahi chalega — Excel me 'Save As → .xlsx' ya CSV karke upload karo.");
+    } else if (file.type === "application/pdf" || /\.pdf$/.test(name)) {
+      if (file.size > 4 * 1024 * 1024) throw new Error("PDF 4 MB se chhoti honi chahiye (sirf menu wale pages rakho).");
+      miBusy("🤖 AI menu padh raha hai (PDF)… 20-40 sec");
+      rows = await miExtractAI("application/pdf", (await miReadAs(file, "dataurl")).split(",")[1]);
+    } else if (/^image\//.test(file.type)) {
+      miBusy("🤖 AI menu padh raha hai (photo)… 15-30 sec");
+      rows = await miExtractAI("image/jpeg", await miImageToBase64(file));
+    } else {
+      throw new Error("Ye file type support nahi hai. Photo, PDF, XLSX ya CSV use karo.");
+    }
+    miBusy("");
+    // Drop exact duplicates (same name + price) from multi-page menus.
+    const seen = {};
+    MI.rows = rows.filter(r => { const k = r.name.toLowerCase() + "|" + r.price; if (seen[k]) return false; seen[k] = true; return true; });
+    if (!MI.rows.length) { miMsg("Is file me koi item + rate nahi mila. Saaf photo ya 'Item, Price' columns wali sheet try karo.", "bad"); document.getElementById("miReview").style.display = "none"; return; }
+    // Every new file starts in the safe Merge mode — Replace must be chosen again.
+    const mergeRadio = document.querySelector('input[name="miMode"][value="merge"]'); if (mergeRadio) mergeRadio.checked = true;
+    miRender();
+    miMsg("✅ " + MI.rows.length + " items mile — neeche check/edit karo, phir save karo.", "ok");
+  } catch (e) {
+    miBusy("");
+    miMsg("❌ " + e.message, "bad");
+  } finally {
+    document.getElementById("miFile").value = "";
+  }
+}
+function miRender() {
+  const tb = document.getElementById("miRows");
+  tb.textContent = "";
+  const cur = {};
+  MI.current.forEach(m => { if (m && m.name) cur[String(m.name).toLowerCase()] = m; });
+  MI.rows.forEach((r, i) => {
+    const tr = document.createElement("tr");
+    if (!r.on) tr.className = "off";
+    const td = () => document.createElement("td");
+    const c0 = td(); const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = r.on; cb.setAttribute("aria-label", "Include " + r.name);
+    cb.onchange = () => { MI.rows[i].on = cb.checked; tr.className = cb.checked ? "" : "off"; miCount(); }; c0.appendChild(cb);
+    const c1 = td(); const nm = document.createElement("input"); nm.type = "text"; nm.value = r.name; nm.maxLength = 60; nm.setAttribute("aria-label", "Item name");
+    nm.oninput = () => { MI.rows[i].name = nm.value; }; c1.appendChild(nm);
+    const ex = cur[r.name.toLowerCase()];
+    const tag = document.createElement("span");
+    if (ex) { tag.className = "mi-tag upd"; tag.textContent = Number(ex.price) === r.price ? "same" : "₹" + ex.price + " → ₹" + r.price; }
+    else { tag.className = "mi-tag new"; tag.textContent = "new"; }
+    c1.appendChild(tag);
+    const c2 = td(); const pr = document.createElement("input"); pr.type = "number"; pr.min = "0"; pr.step = "0.5"; pr.value = r.price; pr.setAttribute("aria-label", "Rate");
+    pr.oninput = () => { MI.rows[i].price = pr.value; }; c2.appendChild(pr);
+    const c3 = td(); const ct = document.createElement("select"); ct.setAttribute("aria-label", "Category");
+    MI_CATS.forEach(([v, l]) => { const o = document.createElement("option"); o.value = v; o.textContent = v.split(" ")[0] + " " + l; if (v === r.cat) o.selected = true; ct.appendChild(o); });
+    ct.onchange = () => { MI.rows[i].cat = ct.value; }; c3.appendChild(ct);
+    const c4 = td(); const vg = document.createElement("select"); vg.setAttribute("aria-label", "Veg");
+    [["v", "🟢 Veg"], ["nv", "🔴 Non-veg"]].forEach(([v, l]) => { const o = document.createElement("option"); o.value = v; o.textContent = l; if ((v === "v") === (r.veg !== false)) o.selected = true; vg.appendChild(o); });
+    vg.onchange = () => { MI.rows[i].veg = vg.value === "v"; }; c4.appendChild(vg);
+    [c0, c1, c2, c3, c4].forEach(c => tr.appendChild(c));
+    tb.appendChild(tr);
+  });
+  document.getElementById("miReview").style.display = "block";
+  miCount();
+}
+function miCount() {
+  const on = MI.rows.filter(r => r.on).length;
+  document.getElementById("miCount").textContent = on + " / " + MI.rows.length + " items select kiye";
+}
+function miAddRow() { MI.rows.unshift({ name: "", price: 0, cat: "🍛 Food", veg: true, on: true }); miRender(); }
+function miToggleAll() { const all = MI.rows.every(r => r.on); MI.rows.forEach(r => { r.on = !all; }); miRender(); }
+function miNewId(i) { return "m" + Date.now().toString(36) + i.toString(36); }
+async function miSave() {
+  if (MI.busy) return;
+  const picked = MI.rows.filter(r => r.on).map(miClean).filter(r => r.name && r.price > 0);
+  const bad = MI.rows.filter(r => r.on).length - picked.length;
+  if (!picked.length) { miMsg("Koi valid item select nahi hai (naam + rate dono chahiye).", "bad"); return; }
+  if (bad > 0 && !confirm(bad + " row(s) me naam ya rate khaali hai — unhe chhod ke save karein?")) return;
+  const mode = (document.querySelector('input[name="miMode"]:checked') || {}).value || "merge";
+  let next;
+  if (mode === "replace") {
+    if (!confirm("Poora purana menu (" + MI.current.length + " items) hata kar sirf ye " + picked.length + " items rakhne hain?\nPurane menu ka backup file download ho jayega.")) return;
+    if (MI.current.length) dmDownload("menu-backup-" + MI.key + "-" + new Date().toISOString().slice(0, 10) + ".json", JSON.stringify(MI.current, null, 2), "application/json");
+    next = picked.map((r, i) => ({ id: miNewId(i), cat: r.cat, name: r.name, price: r.price, sub: miSubFor(r.cat, r.name), active: true, veg: r.veg }));
+  } else {
+    next = MI.current.map(m => ({ ...m }));
+    const byName = {};
+    next.forEach((m, i) => { if (m && m.name) byName[String(m.name).toLowerCase()] = i; });
+    picked.forEach((r, i) => {
+      const at = byName[r.name.toLowerCase()];
+      if (at !== undefined) next[at] = { ...next[at], price: r.price, cat: r.cat, veg: r.veg, active: true, sub: next[at].sub || miSubFor(r.cat, r.name) };
+      else { next.push({ id: miNewId(i), cat: r.cat, name: r.name, price: r.price, sub: miSubFor(r.cat, r.name), active: true, veg: r.veg }); byName[r.name.toLowerCase()] = next.length - 1; }
+    });
+  }
+  if (next.length > MI_MAX_ROWS) { miMsg("Menu me " + MI_MAX_ROWS + " se zyada items nahi ho sakte (abhi " + next.length + ").", "bad"); return; }
+  miBusy("⏳ Save ho raha hai…");
+  try {
+    await window._db.collection("hotels").doc(MI.key).collection("data").doc("menu").set({ value: next, ts: Date.now() });
+    MI.current = next;
+    miBusy("");
+    miMsg("✅ " + MI.hotel + " ka menu save ho gaya — " + next.length + " items. Hotel ke app me agli baar kholte hi dikhega.", "ok");
+    document.getElementById("miReview").style.display = "none";
+    MI.rows = [];
+  } catch (e) {
+    miBusy("");
+    miMsg("❌ Save nahi hua: " + e.message, "bad");
+  }
+}
+(function miWire() {
+  const drop = document.getElementById("miDrop"), file = document.getElementById("miFile");
+  drop.addEventListener("click", () => file.click());
+  drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); file.click(); } });
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); miHandleFile(e.dataTransfer.files[0]); });
+  file.addEventListener("change", () => miHandleFile(file.files[0]));
+})();
 </script>
 
 </body>
