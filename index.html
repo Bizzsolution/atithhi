@@ -1227,12 +1227,195 @@ function hasFeature(id) {
   return CURRENT_FEATURES.includes(id);
 }
 
+// ── STORAGE GUARD (2026-10 login fix) ───────────────────────────────
+// localStorage is only ~5–10 MB per site. Every check-in used to put the
+// guest's ID photos there 3–4 times (inside the booking, as ab_img_img_*,
+// as ab_img_front_*, and as a ph_* capture copy that was never read), so a
+// busy hotel's phone filled up after a few dozen check-ins — and then ANY
+// write failed, including the login screen's attempt counter ("Setting the
+// value of 'ab_bf' exceeded the quota").
+//   • ImgDB moves photo/signature images to IndexedDB (hundreds of MB).
+//   • StorageGuard.migrate() moves existing images there on every start
+//     (verify-then-delete: nothing is removed before the IndexedDB copy is
+//     confirmed) and drops the never-read duplicates.
+//   • StorageGuard.install() makes every localStorage.setItem self-healing:
+//     on a quota error it frees space (never-read copies first, then local
+//     copies of cloud documents) and retries once.
+const ImgDB = {
+  _p: null,
+  open() {
+    if (this._p) return this._p;
+    this._p = new Promise((res, rej) => {
+      try {
+        if (!window.indexedDB) return rej(new Error("IndexedDB not available"));
+        const r = indexedDB.open("atithibook_media", 1);
+        r.onupgradeneeded = () => { try { r.result.createObjectStore("img"); } catch (e) {} };
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error || new Error("IndexedDB open failed"));
+        r.onblocked = () => rej(new Error("IndexedDB blocked"));
+      } catch (e) { rej(e); }
+    });
+    this._p.catch(() => { this._p = null; });
+    return this._p;
+  },
+  async get(k) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      try {
+        const q = db.transaction("img", "readonly").objectStore("img").get(k);
+        q.onsuccess = () => res(q.result == null ? null : q.result);
+        q.onerror = () => rej(q.error);
+      } catch (e) { rej(e); }
+    });
+  },
+  async put(k, v) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      try {
+        const tx = db.transaction("img", "readwrite");
+        tx.objectStore("img").put(v, k);
+        tx.oncomplete = () => res(true);
+        tx.onerror = () => rej(tx.error || new Error("IndexedDB write failed"));
+        tx.onabort = () => rej(tx.error || new Error("IndexedDB write aborted"));
+      } catch (e) { rej(e); }
+    });
+  },
+  async del(k) {
+    const db = await this.open();
+    return new Promise(res => {
+      try { const tx = db.transaction("img", "readwrite"); tx.objectStore("img").delete(k); tx.oncomplete = () => res(true); tx.onerror = () => res(false); } catch (e) { res(false); }
+    });
+  }
+};
+const StorageGuard = {
+  isQuota(e) {
+    return !!e && (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED" || e.code === 22 || e.code === 1014 || /quota/i.test(String(e.message || "")));
+  },
+  keys() {
+    const out = [];
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k != null) out.push(k); } } catch (e) {}
+    return out;
+  },
+  hasSpace() {
+    try { localStorage.setItem("__ab_probe", "x".repeat(20000)); localStorage.removeItem("__ab_probe"); return true; } catch (e) { try { localStorage.removeItem("__ab_probe"); } catch (x) {} return false; }
+  },
+  usedBytes() {
+    let n = 0;
+    this.keys().forEach(k => { try { n += (k.length + (localStorage.getItem(k) || "").length) * 2; } catch (e) {} });
+    return n;
+  },
+  // Synchronous emergency clean-up (setItem is synchronous). Removes only
+  // data that is never read back, or that is a local copy of a cloud
+  // document the app re-downloads when needed. Returns true if it freed
+  // anything. `keep` is the key being written — never removed.
+  freeSync(keep) {
+    let freed = 0;
+    const rm = k => {
+      if (k === keep) return;
+      try { const v = localStorage.getItem(k); localStorage.removeItem(k); freed += k.length + (v ? v.length : 0); } catch (e) {}
+    };
+    const ks = this.keys();
+    // 1. capture-time photo copies (ph_f_* / ph_b_*) — written, never read.
+    ks.filter(k => /^ph_[fb]_/.test(k)).forEach(rm);
+    // 2. ab_img_front_/back_* — a second copy of ab_img_img_front_/back_*
+    //    that nothing reads. Removed only when that other copy is present.
+    ks.forEach(k => {
+      const m = /^ab_img_(front|back)_(.+)$/.exec(k);
+      if (m && localStorage.getItem("ab_img_img_" + m[1] + "_" + m[2]) != null) rm(k);
+    });
+    if (freed > 0) return true;
+    // 3. local copies of cloud documents: archived months and earlier days'
+    //    restaurant bills (both re-fetched from the cloud when opened).
+    const todayBills = "ab_rbills_" + localDateStr().replace(/-/g, "_");
+    ks.filter(k => /^ab_bookings_archive_/.test(k) || (/^ab_rbills_/.test(k) && k !== todayBills)).forEach(rm);
+    if (freed > 0) return true;
+    // 4. last resort — same rule the app already applies when saving
+    //    bookings: photos of guests who checked out more than 3 days ago
+    //    are dropped from the local booking list (the vault copy lives in
+    //    IndexedDB; the cloud never had photos).
+    try {
+      if (keep !== "ab_bookings") {
+        const raw = localStorage.getItem("ab_bookings");
+        if (raw && raw.length > 50000) {
+          const cutoff = Date.now() - 3 * 86400000;
+          const list = JSON.parse(raw);
+          if (Array.isArray(list)) {
+            const slim = list.map(b => {
+              if (!(b && b.status === "checkedout" && b.checkOutActual && new Date(b.checkOutActual).getTime() < cutoff)) return b;
+              const { photoFront, photoBack, signature, ...rest } = b;
+              return { ...rest, family: Array.isArray(b.family) ? b.family.map(m => { const { photoFront: a, photoBack: c, ...r } = m || {}; return r; }) : b.family };
+            });
+            const s = JSON.stringify(slim);
+            if (s.length < raw.length) { StorageGuard._origSet.call(localStorage, "ab_bookings", s); freed += raw.length - s.length; }
+          }
+        }
+      }
+    } catch (e) {}
+    return freed > 0;
+  },
+  _origSet: null,
+  install() {
+    if (this._origSet) return;
+    try {
+      const proto = Object.getPrototypeOf(window.localStorage);
+      const orig = proto.setItem;
+      this._origSet = orig;
+      const guard = this;
+      proto.setItem = function (k, v) {
+        try { return orig.call(this, k, v); } catch (e) {
+          if (this !== window.localStorage || !guard.isQuota(e) || guard._busy) throw e;
+          guard._busy = true;
+          let ok = false;
+          try { ok = guard.freeSync(String(k)); } finally { guard._busy = false; }
+          guard.migrate().catch(() => {});
+          if (ok) return orig.call(this, k, v);
+          throw e;
+        }
+      };
+    } catch (e) { console.warn("[AtithiBook] StorageGuard install:", e.message); }
+  },
+  // Moves every image out of localStorage into IndexedDB. Each image is
+  // deleted from localStorage only after IndexedDB confirms the write.
+  _mig: null,
+  migrate() {
+    if (this._mig) return this._mig;
+    this._mig = (async () => {
+      let moved = 0;
+      try { await ImgDB.open(); } catch (e) { return 0; }
+      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) {}
+      for (const k of this.keys()) {
+        if (/^ph_[fb]_/.test(k)) { try { localStorage.removeItem(k); } catch (e) {} continue; }
+        let m, target = null;
+        if ((m = /^ab_img_(img_front_|img_back_|sig_)(.+)$/.exec(k))) target = m[1] + m[2];
+        else if ((m = /^ab_img_(front|back)_(.+)$/.exec(k))) target = "img_" + m[1] + "_" + m[2];
+        if (!target) continue;
+        try {
+          const v = localStorage.getItem(k);
+          if (v) {
+            const have = await ImgDB.get(target);
+            if (!have) await ImgDB.put(target, v);
+            if (!(await ImgDB.get(target))) continue; // not confirmed — keep it
+          }
+          localStorage.removeItem(k);
+          moved++;
+        } catch (e) { /* keep in localStorage, try again next start */ }
+      }
+      if (moved) console.info("[AtithiBook] moved " + moved + " image(s) to IndexedDB");
+      return moved;
+    })().finally(() => { setTimeout(() => { StorageGuard._mig = null; }, 0); });
+    return this._mig;
+  }
+};
+StorageGuard.install();
+setTimeout(() => { StorageGuard.migrate().catch(() => {}); }, 0);
+
 // ── BRUTE FORCE PROTECTION ───────────────────────
 const BruteForce = {
   MAX: 5,
   LOCK_MS: 15 * 60 * 1000,
   check() {
-    const d = JSON.parse(localStorage.getItem("ab_bf") || "{}");
+    let d = {};
+    try { d = JSON.parse(localStorage.getItem("ab_bf") || "{}") || {}; } catch (e) { d = {}; }
     if (d.until && Date.now() < d.until) {
       const m = Math.ceil((d.until - Date.now()) / 60000);
       throw new Error(`Too many attempts. Try after ${m} min.`);
@@ -1245,11 +1428,12 @@ const BruteForce = {
       attempts: a
     };
     if (a >= this.MAX) d.until = Date.now() + this.LOCK_MS;
-    localStorage.setItem("ab_bf", JSON.stringify(d));
+    // A full phone storage must never hide the real "wrong password" message.
+    try { localStorage.setItem("ab_bf", JSON.stringify(d)); } catch (e) { console.warn("BruteForce save:", e.message); }
     return this.MAX - a;
   },
   clear() {
-    localStorage.removeItem("ab_bf");
+    try { localStorage.removeItem("ab_bf"); } catch (e) {}
   }
 };
 
@@ -2508,7 +2692,10 @@ const WS = {
     }
   },
   // Images stay localStorage only (too large for Firestore)
+  // Images live in IndexedDB (StorageGuard); old localStorage copies are
+  // still read until the start-up migration has moved them.
   async getRawImg(k) {
+    try { const v = await ImgDB.get(k); if (v) return v; } catch {}
     try {
       const v = localStorage.getItem(`ab_img_${k}`);
       if (v) return v;
@@ -2516,6 +2703,7 @@ const WS = {
     return null;
   },
   async setRawImg(k, v) {
+    try { await ImgDB.put(k, v); return; } catch (e) { console.warn("Img save (IndexedDB):", e.message); }
     try {
       localStorage.setItem(`ab_img_${k}`, v);
     } catch (e) {
@@ -4139,14 +4327,15 @@ function LoginScreen({
           p: await SecUtils.hashPassword(x.p),
           mustChange: true
         })));
-        localStorage.setItem("ab_users", JSON.stringify(users));CloudSync.users(users);
+        try { localStorage.setItem("ab_users", JSON.stringify(users)); } catch (e) { console.warn("Staff list save:", e.message); }
+        CloudSync.users(users);
       } else if (!users.some(x => x.role === "Owner")) {
         // Migration: existing hotels (set up before Owner role existed) get
         // an Owner account added automatically so access control works.
         const ownerDef = STAFF.find(x => x.role === "Owner");
         const ownerUser = { ...ownerDef, p: await SecUtils.hashPassword(ownerDef.p), mustChange: true };
         users = [ownerUser, ...users];
-        localStorage.setItem("ab_users", JSON.stringify(users));
+        try { localStorage.setItem("ab_users", JSON.stringify(users)); } catch (e) { console.warn("Staff list save:", e.message); }
         CloudSync.users(users);
       }
       const cand = users.find(x => x.u === u.trim());
@@ -4155,10 +4344,15 @@ function LoginScreen({
       if (found && pv.upgrade) {
         // AUDIT-2 (F5): transparent upgrade of a legacy hash on a
         // successful login — the plaintext is only ever in memory here.
+        // Optional: if the phone's storage is full the upgrade simply waits
+        // for the next login — it must never block this one.
         const upgraded = await SecUtils.hashPassword(p);
-        users = users.map(x => x.u === found.u ? { ...x, p: upgraded } : x);
-        localStorage.setItem("ab_users", JSON.stringify(users));
-        CloudSync.users(users);
+        const upUsers = users.map(x => x.u === found.u ? { ...x, p: upgraded } : x);
+        try {
+          localStorage.setItem("ab_users", JSON.stringify(upUsers));
+          users = upUsers;
+          CloudSync.users(users);
+        } catch (e) { console.warn("Password-hash upgrade postponed:", e.message); }
         found = users.find(x => x.u === found.u);
       }
       if (found) {
@@ -4170,6 +4364,15 @@ function LoginScreen({
         Session.touch();
         AuditLog.add('LOGIN', found.u + ' — ' + found.role);
         await SecUtils.initKey(localStorage.getItem("ab_license_key") || "default");
+        // Still no room after the clean-up → tell the owner once a day, but log in.
+        if (!StorageGuard.hasSpace()) {
+          let last = 0;
+          try { last = Number(localStorage.getItem("ab_storeWarnAt") || 0); } catch (e) {}
+          if (Date.now() - last > 86400000) {
+            try { localStorage.setItem("ab_storeWarnAt", String(Date.now())); } catch (e) {}
+            setTimeout(() => alert("⚠️ Is phone/browser ki AtithiBook storage full hai.\n\nApp chalta rahega aur data cloud me save hota rahega, lekin is phone par offline copy nahi ban paayegi.\n\nPhone me thodi jagah khali karo (purani photos/videos) ya BizzSathi support ko call karo. ⚠️ Browser ka 'Clear data' MAT karna — guest ID photos sirf isi phone par hain."), 1200);
+          }
+        }
         onLogin(found);
       } else {
         const rem = BruteForce.fail(attempts);
@@ -4177,7 +4380,8 @@ function LoginScreen({
         sl(false);
       }
     } catch (e) {
-      se(e.message);
+      se(StorageGuard.isQuota(e) ? "Phone ki storage full hai — dobara 'Login' dabao (app ne jagah khali kar di hai). Agar phir bhi na ho to BizzSathi support ko call karo." : e.message);
+      if (StorageGuard.isQuota(e)) StorageGuard.migrate().catch(() => {});
       sl(false);
     }
   };
@@ -4300,7 +4504,7 @@ function LoginScreen({
       cursor: "pointer",
       textDecoration: "underline"
     }
-  }, "🔑 Forgot Password?"))), /*#__PURE__*/React.createElement("div", {
+  }, "🔑 Forgot Password?"))), !(() => { try { return localStorage.getItem("ab_users"); } catch (e) { return null; } })() && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 20,
       padding: "12px 16px",
@@ -4403,9 +4607,6 @@ function AadhaarScanner({
           [side]: du
         };
       });
-      try {
-        localStorage.setItem("ph_" + side + "_" + (tempId || "x"), du);
-      } catch (x) {}
     };
     rd.readAsDataURL(file);
     e.target.value = "";
@@ -6410,11 +6611,6 @@ Return one box for EVERY place the 12-digit number appears, in normalized 0-1 co
       // Aadhaar: store nothing yet — scanAadhaar masks and stores once it
       // knows the number's position. Other IDs store immediately.
       (side === "f" ? setPhotoF : setPhotoB)(isAadhaarDoc ? null : compressed);
-      try {
-        if (!isAadhaarDoc) localStorage.setItem("ph_" + side + "_" + tempId, compressed);
-      } catch (x) {
-        console.warn("localStorage quota:", x.message);
-      }
       // Auto-scan with the SHARP copy (OCR needs the real number)
       await scanAadhaar(side, scanQ);
     };
@@ -12231,22 +12427,12 @@ function App() {
       } catch (e) {
         console.warn("PhotoF vault:", e);
       }
-      try {
-        localStorage.setItem(`ab_img_front_${id}`, _photoF);
-      } catch (e) {
-        console.warn("PhotoF LS:", e);
-      }
     }
     if (_photoB) {
       try {
         await WS.setRawImg(`img_back_${id}`, _photoB);
       } catch (e) {
         console.warn("PhotoB vault:", e);
-      }
-      try {
-        localStorage.setItem(`ab_img_back_${id}`, _photoB);
-      } catch (e) {
-        console.warn("PhotoB LS:", e);
       }
     }
     await saveRooms(rooms.map(r => r.id === form.roomId ? {
