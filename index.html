@@ -3130,8 +3130,18 @@ function buildInvoicePDFBlob(b, roomObj) {
   L.push({ text: "Rs." + G.grandTotal, size: 9, bold: true, align: "right", lh: 18 });
 
   // ── Payment / totals ──
-  L.push({ text: "Received by " + payMode, size: 9, lh: 0 });
-  L.push({ text: "Rs. " + G.grandTotal, size: 9, align: "right", lh: 12 });
+  const advP = bkAdvance(b);
+  if (advP > 0) {
+    L.push({ text: "Advance received (earlier)", size: 9, lh: 0 });
+    L.push({ text: "Rs. " + advP, size: 9, align: "right", lh: 12 });
+    L.push({ text: (advP > G.grandTotal ? "Refund due to guest" : "Balance received by " + payMode), size: 9, lh: 0 });
+    L.push({ text: "Rs. " + Math.abs(G.grandTotal - advP), size: 9, align: "right", lh: 12 });
+    L.push({ text: "Invoice total", size: 9, lh: 0 });
+    L.push({ text: "Rs. " + G.grandTotal, size: 9, align: "right", lh: 12 });
+  } else {
+    L.push({ text: "Received by " + payMode, size: 9, lh: 0 });
+    L.push({ text: "Rs. " + G.grandTotal, size: 9, align: "right", lh: 12 });
+  }
   L.push({ text: "Subtotal", size: 8, lh: 0 });
   L.push({ text: "Rs. " + G.subtotal, size: 8, align: "right", lh: 11 });
   L.push({ text: "Total GST", size: 8, lh: 0 });
@@ -3189,6 +3199,7 @@ const buildInvoiceHTML = (b, roomObj) => {
     "\nTotal: ₹" + grand +
     "\n\n_Print/Save as PDF from the Print button and attach here._";
   const payMode = b.paymentMode || (b.status === "checkedout" ? "Cash" : "—");
+  const advV = bkAdvance(b);
   const rackTotal = (roomObj?.rate || 0) * n;
   const discAmt = rackTotal - (b.roomTotal || 0);
   const discPct = rackTotal > 0 ? (discAmt / rackTotal * 100) : 0;
@@ -3317,8 +3328,10 @@ ${itemRows}
 <div class="bottomgrid">
   <div class="bcol">
     <div class="metatitle">Payment</div>
-    <div class="totline"><span>Received by ${escHtml(payMode)}</span></div>
-    <div class="totline"><b>₹${grand}</b></div>
+    ${advV > 0 ? `<div class="totline"><span>Advance received (earlier)</span><b>₹${advV}</b></div>
+    <div class="totline"><span>${advV > grand ? "Refund due to guest" : "Balance received by " + escHtml(payMode)}</span><b>₹${Math.abs(grand - advV)}</b></div>
+    <div class="totline"><span>Invoice total</span><b>₹${grand}</b></div>` : `<div class="totline"><span>Received by ${escHtml(payMode)}</span></div>
+    <div class="totline"><b>₹${grand}</b></div>`}
   </div>
   <div class="bcol">
     <div class="totline"><span>Subtotal</span><b>₹${sub}</b></div>
@@ -3513,6 +3526,8 @@ body{background:#e9edf3;}
 div[style*="position: fixed"][style*="align-items: flex-end"]{align-items:center!important;justify-content:center!important;}
 div[style*="position: fixed"][style*="align-items: flex-end"] > div{max-width:620px!important;width:100%!important;border-radius:20px!important;max-height:90vh!important;margin:0 auto;}
 .ab-main[data-view=storage] .scrollable{max-width:880px!important;}
+.ab-res .ab-cols{grid-template-columns:repeat(auto-fill,minmax(400px,1fr))!important;align-items:start;}
+.ab-main[data-view=reserve] .scrollable{padding-left:max(28px,calc((100% - 1100px)/2))!important;padding-right:max(28px,calc((100% - 1100px)/2))!important;}
 .ab-cols{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:12px;align-items:start;}
 .ab-settings > div:not(:first-child){max-width:560px;margin-left:auto!important;margin-right:auto!important;}
 }
@@ -5016,9 +5031,153 @@ function SignaturePad({
 }
 
 /* ── DASHBOARD ────────────────────────────────────────────────── */
+/* ── FUTURE BOOKINGS (reservations) ───────────────────────────────
+   A reservation is NOT a booking: it never marks a room occupied and never
+   appears in billing, history, registers or revenue. The room becomes
+   occupied only when the guest actually checks in (Check-In Now), which
+   creates a normal booking. Until then the room can still be used for any
+   stay that ends before the reservation's arrival date. */
+const RES_PAY_MODES = ["Cash", "UPI", "Card", "Bank Transfer"];
+const resAdvTotal = r => (r && Array.isArray(r.advances) ? r.advances : []).reduce((s, a) => s + (Number(a.amount) || 0), 0);
+const bkAdvance = b => {
+  if (!b) return 0;
+  if (Array.isArray(b.advances) && b.advances.length) return b.advances.reduce((t, a) => t + (Number(a.amount) || 0), 0);
+  return Number(b.advance) || 0;
+};
+const datesOverlap = (aIn, aOut, bIn, bOut) => aIn < bOut && bIn < aOut;
+function roomConflict(roomId, ci, co, reservations, bookings, ignoreResId) {
+  for (const r of reservations || []) {
+    if (r.status === "reserved" && r.roomId === roomId && r.id !== ignoreResId && datesOverlap(ci, co, r.checkIn, r.checkOut)) return { kind: "res", r };
+  }
+  for (const b of bookings || []) {
+    if (b.status === "active" && b.roomId === roomId && datesOverlap(ci, co, b.checkIn, b.checkOut)) return { kind: "stay", b };
+  }
+  return null;
+}
+function roomStateOnDate(room, date, reservations, bookings) {
+  const today = todayStr();
+  const res = (reservations || []).find(r => r.status === "reserved" && r.roomId === room.id && r.checkIn <= date && date < r.checkOut);
+  if (date <= today) {
+    if (room.status === "occupied") return { s: "occupied" };
+    return res ? { s: "reserved", r: res } : { s: "free" };
+  }
+  const stay = (bookings || []).find(b => b.status === "active" && b.roomId === room.id && b.checkIn <= date && date < b.checkOut);
+  if (stay) return { s: "occupied", b: stay };
+  return res ? { s: "reserved", r: res } : { s: "free" };
+}
+function ReservationsView({ rooms, bookings, reservations, user, onAdd, onAddAdvance, onCancel, onCheckInNow }) {
+  const _h = React.createElement;
+  const blank = () => ({ roomId: rooms[0]?.id || "", checkIn: tomorrowStr(), checkOut: new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10), name: "", mobile: "", adults: "1", children: "0", rate: "", advance: "", mode: "UPI", note: "" });
+  const [f, setF] = useState(blank);
+  const [open, setOpen] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [advFor, setAdvFor] = useState(null);
+  const [advAmt, setAdvAmt] = useState("");
+  const [advMode, setAdvMode] = useState("UPI");
+  const [cancelFor, setCancelFor] = useState(null);
+  const [showOld, setShowOld] = useState(false);
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const room = rooms.find(r => r.id === f.roomId);
+  const rate = f.rate !== "" ? Number(f.rate) : (room?.rate || 0);
+  const nights = f.checkOut > f.checkIn ? nts(f.checkIn, f.checkOut) : 0;
+  const total = rate * nights;
+  const adv = Number(f.advance) || 0;
+  const submit = async () => {
+    if (!f.roomId) return alert("Room select karo");
+    if (!f.name.trim()) return alert("Guest ka naam daalo");
+    if (!f.mobile.trim()) return alert("Mobile number daalo");
+    if (f.checkIn < todayStr()) return alert("Check-in date aaj ya uske baad ki honi chahiye");
+    if (f.checkOut <= f.checkIn) return alert("Check-out date, check-in ke baad honi chahiye");
+    if (!(rate > 0)) return alert("Rate/night daalo");
+    if (adv < 0) return alert("Advance galat hai");
+    const c = roomConflict(f.roomId, f.checkIn, f.checkOut, reservations, bookings, null);
+    if (c) {
+      return alert(c.kind === "res"
+        ? "Room " + f.roomId + " in dates par already booked hai: " + c.r.name + " (" + fmtDate(c.r.checkIn) + " → " + fmtDate(c.r.checkOut) + "). Doosra room ya dates chuno."
+        : "Room " + f.roomId + " mein " + fmtDate(c.b.checkIn) + " → " + fmtDate(c.b.checkOut) + " tak " + c.b.name + " ka stay hai. Uske baad ki date chuno ya doosra room.");
+    }
+    await onAdd({ roomId: f.roomId, checkIn: f.checkIn, checkOut: f.checkOut, name: f.name.trim(), mobile: f.mobile.trim(), adults: f.adults, children: f.children, rate, roomTotal: total, note: f.note.trim(), advance: adv, mode: f.mode });
+    setMsg("✅ Booking save ho gayi: " + f.name.trim() + " · Room " + f.roomId + " · " + fmtDate(f.checkIn));
+    setF(blank());
+    setOpen(false);
+  };
+  const upcoming = (reservations || []).filter(r => r.status === "reserved").sort((a, b) => a.checkIn.localeCompare(b.checkIn));
+  const old = (reservations || []).filter(r => r.status !== "reserved").sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || "")).slice(0, 20);
+  const lbl = { fontSize: 12, fontWeight: 600, color: "var(--muted)", display: "block", marginBottom: 5 };
+  const chip = (txt, bg, col) => _h("span", { style: { fontSize: 10.5, fontWeight: 700, padding: "3px 8px", borderRadius: 20, background: bg, color: col } }, txt);
+  const card = r => {
+    const adT = resAdvTotal(r);
+    const today = todayStr();
+    const isToday = r.checkIn <= today;
+    const balance = Math.max(0, (r.roomTotal || 0) - adT);
+    const roomNow = rooms.find(x => x.id === r.roomId);
+    return _h("div", { key: r.id, className: "card", "data-res": r.id, style: { padding: "12px 14px", border: isToday ? "1.5px solid #f59e0b" : undefined } },
+      _h("div", { style: { display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" } },
+        _h("div", null, _h("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 15 } }, r.name), _h("div", { style: { fontSize: 12, color: "var(--muted)", marginTop: 2 } }, "📱 " + r.mobile + " · 👥 " + r.adults + "A" + (Number(r.children) > 0 ? " + " + r.children + "C" : ""))),
+        _h("div", { style: { textAlign: "right" } }, _h("div", { style: { fontWeight: 700, color: "var(--navy)" } }, "Room " + r.roomId), isToday ? chip(r.checkIn === today ? "Aaj aane wala" : "Late / Due", "#fef3c7", "#92400e") : chip("Upcoming", "#e0e7ff", "#3730a3"))),
+      _h("div", { style: { fontSize: 12.5, marginTop: 8, color: "#334155" } }, "📅 " + fmtDate(r.checkIn) + " → " + fmtDate(r.checkOut) + " (" + nts(r.checkIn, r.checkOut) + " night" + (nts(r.checkIn, r.checkOut) > 1 ? "s" : "") + ") · ₹" + (r.rate || 0) + "/night"),
+      r.note ? _h("div", { style: { fontSize: 12, color: "var(--muted)", marginTop: 4 } }, "📝 " + r.note) : null,
+      _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8, alignItems: "center" } },
+        chip("Room ₹" + (r.roomTotal || 0).toLocaleString("en-IN") + " + GST", "#f1f5f9", "#334155"),
+        chip(adT > 0 ? "💵 Advance ₹" + adT.toLocaleString("en-IN") : "Advance: —", adT > 0 ? "#dcfce7" : "#f1f5f9", adT > 0 ? "#166534" : "#64748b"),
+        adT > 0 ? chip("Baaki (GST se pehle) ₹" + balance.toLocaleString("en-IN"), "#fff7ed", "#9a3412") : null),
+      (r.advances || []).length ? _h("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 6 } }, (r.advances || []).map(a => "₹" + a.amount + " " + a.mode + " (" + fmtDate(a.date) + ")").join(" · ")) : null,
+      advFor === r.id ? _h("div", { style: { marginTop: 10, background: "#f0fdf4", borderRadius: 10, padding: 10 } },
+        _h("label", { style: lbl }, "ADVANCE AMOUNT ₹"),
+        _h("input", { type: "number", inputMode: "numeric", "data-t": "adv-amt", value: advAmt, onChange: e => setAdvAmt(e.target.value), placeholder: "e.g. 1000" }),
+        _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6, margin: "8px 0" } }, RES_PAY_MODES.map(m => _h("button", { key: m, onClick: () => setAdvMode(m), style: { padding: "7px 2px", borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", border: "1.5px solid " + (advMode === m ? "#16a34a" : "var(--border)"), background: advMode === m ? "#dcfce7" : "#fff", color: "#333" } }, m))),
+        _h("div", { style: { display: "flex", gap: 8 } },
+          _h("button", { className: "btn-o", style: { flex: 1 }, onClick: () => { setAdvFor(null); setAdvAmt(""); } }, "Cancel"),
+          _h("button", { className: "btn-p", "data-t": "adv-save", style: { flex: 1.5 }, onClick: async () => { const a = Number(advAmt); if (!(a > 0)) return alert("Advance amount daalo"); await onAddAdvance(r.id, a, advMode); setAdvFor(null); setAdvAmt(""); } }, "💾 Advance Save"))) : null,
+      cancelFor === r.id ? _h("div", { style: { marginTop: 10, background: "#fef2f2", borderRadius: 10, padding: 10 } },
+        _h("div", { style: { fontSize: 12.5, fontWeight: 700, color: "#991b1b", marginBottom: 8 } }, "Booking cancel karni hai?" + (adT > 0 ? " Advance ₹" + adT + " ka kya hua?" : "")),
+        _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+          _h("button", { className: "btn-o", style: { flex: 1 }, onClick: () => setCancelFor(null) }, "Wapas jao"),
+          adT > 0 ? _h("button", { style: { flex: 1, padding: 10, borderRadius: 8, border: "none", background: "#16a34a", color: "#fff", fontWeight: 700, cursor: "pointer", fontSize: 12 }, "data-t": "cancel-refund", onClick: async () => { await onCancel(r.id, "refunded"); setCancelFor(null); } }, "↩️ Cancel + Advance wapas") : null,
+          adT > 0 ? _h("button", { style: { flex: 1, padding: 10, borderRadius: 8, border: "none", background: "#b45309", color: "#fff", fontWeight: 700, cursor: "pointer", fontSize: 12 }, "data-t": "cancel-forfeit", onClick: async () => { await onCancel(r.id, "forfeited"); setCancelFor(null); } }, "Cancel + Advance rakha") : null,
+          adT > 0 ? null : _h("button", { style: { flex: 1, padding: 10, borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontWeight: 700, cursor: "pointer", fontSize: 12 }, "data-t": "cancel-ok", onClick: async () => { await onCancel(r.id, "none"); setCancelFor(null); } }, "❌ Haan, Cancel"))) : null,
+      advFor === r.id || cancelFor === r.id ? null : _h("div", { style: { display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", gap: 8, marginTop: 10 } },
+        _h("button", { className: "btn-p", "data-t": "res-checkin", disabled: roomNow?.status === "occupied", title: roomNow?.status === "occupied" ? "Room abhi occupied hai" : "", style: { padding: "9px 6px", fontSize: 12, opacity: roomNow?.status === "occupied" ? .5 : 1 }, onClick: () => onCheckInNow(r) }, roomNow?.status === "occupied" ? "Room occupied" : "✅ Check-In Now"),
+        _h("button", { className: "btn-o", "data-t": "res-adv", style: { padding: "9px 6px", fontSize: 12 }, onClick: () => { setAdvFor(r.id); setAdvMode("UPI"); } }, "💵 Advance"),
+        _h("button", { className: "btn-o", "data-t": "res-cancel", style: { padding: "9px 6px", fontSize: 12, color: "#dc2626" }, onClick: () => setCancelFor(r.id) }, "❌ Cancel")));
+  };
+  return _h("div", { className: "scrollable hs ab-res", style: { height: "100%", paddingBottom: 24 } },
+    _h("div", { style: { padding: "16px 14px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } },
+      _h("div", null, _h("h2", { style: { fontSize: 20 } }, "📅 Future Bookings"), _h("div", { style: { fontSize: 12, color: "var(--muted)", marginTop: 2 } }, "Room tab tak occupied nahi hota jab tak guest check-in na kare")),
+      _h("button", { className: "btn-p", "data-t": "res-new", style: { padding: "9px 14px", fontSize: 13 }, onClick: () => { setOpen(o => !o); setMsg(""); } }, open ? "✖ Band" : "➕ Nayi Booking")),
+    msg ? _h("div", { "data-t": "res-msg", style: { margin: "0 14px 10px", padding: "10px 12px", borderRadius: 10, background: "#dcfce7", color: "#166534", fontSize: 13, fontWeight: 600 } }, msg) : null,
+    open ? _h("div", { className: "card", style: { margin: "0 14px 12px", padding: "14px 16px" } },
+      _h("div", { className: "st" }, "NAYI FUTURE BOOKING"),
+      _h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+        _h("div", null, _h("label", { style: lbl }, "ROOM *"), _h("select", { "data-t": "f-room", value: f.roomId, onChange: e => { set("roomId", e.target.value); set("rate", ""); } }, rooms.map(r => _h("option", { key: r.id, value: r.id }, "Room " + r.id + " — " + r.type + " · ₹" + r.rate + "/night")))),
+        _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+          _h("div", null, _h("label", { style: lbl }, "CHECK-IN *"), _h("input", { type: "date", "data-t": "f-in", min: todayStr(), value: f.checkIn, onChange: e => { set("checkIn", e.target.value); if (f.checkOut <= e.target.value) set("checkOut", new Date(new Date(e.target.value + "T12:00:00").getTime() + 86400000).toISOString().slice(0, 10)); } })),
+          _h("div", null, _h("label", { style: lbl }, "CHECK-OUT *"), _h("input", { type: "date", "data-t": "f-out", min: f.checkIn, value: f.checkOut, onChange: e => set("checkOut", e.target.value) }))),
+        _h("div", null, _h("label", { style: lbl }, "GUEST NAME *"), _h("input", { "data-t": "f-name", value: f.name, onChange: e => set("name", e.target.value), placeholder: "Guest ka naam" })),
+        _h("div", null, _h("label", { style: lbl }, "MOBILE *"), _h("input", { "data-t": "f-mobile", type: "tel", inputMode: "numeric", value: f.mobile, onChange: e => set("mobile", e.target.value), placeholder: "+91 XXXXX XXXXX" })),
+        _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 } },
+          _h("div", null, _h("label", { style: lbl }, "ADULTS"), _h("input", { type: "number", min: "1", value: f.adults, onChange: e => set("adults", e.target.value) })),
+          _h("div", null, _h("label", { style: lbl }, "CHILDREN"), _h("input", { type: "number", min: "0", value: f.children, onChange: e => set("children", e.target.value) })),
+          _h("div", null, _h("label", { style: lbl }, "RATE/NIGHT ₹"), _h("input", { type: "number", "data-t": "f-rate", value: f.rate, onChange: e => set("rate", e.target.value), placeholder: String(room?.rate || "") }))),
+        _h("div", { style: { background: "#fef3c7", borderRadius: 10, padding: "9px 12px", display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, color: "#92400e" } }, _h("span", null, "🌙 " + nights + " night" + (nights !== 1 ? "s" : "")), _h("span", null, "Room: ₹" + total.toLocaleString("en-IN") + " + GST")),
+        _h("div", { style: { background: "#f0fdf4", borderRadius: 10, padding: "10px 12px" } },
+          _h("div", { style: { fontSize: 12, fontWeight: 700, color: "#166534", marginBottom: 6 } }, "💵 ADVANCE (optional)"),
+          _h("input", { type: "number", inputMode: "numeric", "data-t": "f-adv", value: f.advance, onChange: e => set("advance", e.target.value), placeholder: "Advance amount ₹ (jo abhi mila)" }),
+          _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6, marginTop: 8 } }, RES_PAY_MODES.map(m => _h("button", { key: m, onClick: () => set("mode", m), style: { padding: "7px 2px", borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", border: "1.5px solid " + (f.mode === m ? "#16a34a" : "var(--border)"), background: f.mode === m ? "#dcfce7" : "#fff", color: "#333" } }, m))),
+          adv > 0 ? _h("div", { style: { fontSize: 12, color: "#166534", marginTop: 8 } }, "Advance ₹" + adv.toLocaleString("en-IN") + " · baaki room amount (GST se pehle): ₹" + Math.max(0, total - adv).toLocaleString("en-IN")) : null),
+        _h("div", null, _h("label", { style: lbl }, "NOTE (optional)"), _h("input", { "data-t": "f-note", value: f.note, onChange: e => set("note", e.target.value), placeholder: "e.g. late arrival, extra bed, OTA ref" })),
+        _h("button", { className: "btn-p", "data-t": "f-save", onClick: submit }, "💾 Booking Save Karo"))) : null,
+    _h("div", { style: { paddingLeft: 14, paddingRight: 14, display: "flex", flexDirection: "column", gap: 10 } },
+      _h("div", { className: "st", style: { marginBottom: 0 } }, "UPCOMING (" + upcoming.length + ")"),
+      upcoming.length === 0 ? _h("div", { className: "card", style: { padding: 18, textAlign: "center", color: "var(--muted)", fontSize: 13 } }, "Koi future booking nahi hai. ➕ Nayi Booking se add karo.") : _h("div", { className: "ab-cols", style: { display: "grid", gridTemplateColumns: "1fr", gap: 10 } }, upcoming.map(card)),
+      old.length ? _h("button", { className: "btn-o", onClick: () => setShowOld(s => !s), style: { fontSize: 12 } }, (showOld ? "▲ " : "▼ ") + "Purani / Cancelled / Checked-in (" + old.length + ")") : null,
+      showOld ? old.map(r => _h("div", { key: r.id, className: "card", style: { padding: "10px 14px", opacity: .8, fontSize: 12.5 } }, _h("b", null, r.name), " · Room " + r.roomId + " · " + fmtDate(r.checkIn) + " → " + fmtDate(r.checkOut), _h("div", { style: { color: "var(--muted)", marginTop: 3 } }, (r.status === "checkedin" ? "✅ Check-in ho gaya" : r.status === "cancelled" ? "❌ Cancelled" + (r.advanceOutcome === "refunded" ? " · Advance wapas ₹" + resAdvTotal(r) : r.advanceOutcome === "forfeited" ? " · Advance rakha ₹" + resAdvTotal(r) : "") : r.status) + (resAdvTotal(r) && r.status === "checkedin" ? " · Advance ₹" + resAdvTotal(r) + " bill mein adjust" : "")))) : null));
+}
+
 function DashboardView({
   rooms,
   bookings,
+  reservations,
   user,
   setView,
   setModal,
@@ -5026,8 +5185,12 @@ function DashboardView({
   bookingRequests,
   onRequestDecision
 }) {
-  const occ = rooms.filter(r => r.status === "occupied");
-  const avail = rooms.filter(r => r.status === "empty");
+  const [mapDate, setMapDate] = useState(todayStr());
+  const mapState = r => roomStateOnDate(r, mapDate || todayStr(), reservations, bookings);
+  const occ = rooms.filter(r => mapState(r).s === "occupied");
+  const avail = rooms.filter(r => mapState(r).s === "free");
+  const resRooms = rooms.filter(r => mapState(r).s === "reserved");
+  const arrivals = (reservations || []).filter(r => r.status === "reserved").sort((a, b) => a.checkIn.localeCompare(b.checkIn));
   const active = bookings.filter(b => b.status === "active");
   const todayOut = bookings.filter(b => b.checkOut === todayStr() && b.status === "active");
   const todayRev = bookings.filter(b => b.status === "checkedout" && b.checkOutActual === todayStr()).reduce((s, b) => s + (b.grandTotal || 0), 0);
@@ -5306,14 +5469,14 @@ function DashboardView({
       flexDirection: "column",
       alignItems: "center",
       justifyContent: "center",
-      background: r.status === "occupied" ? "#fee2e2" : "#dcfce7",
-      border: `1.5px solid ${r.status === "occupied" ? "#fca5a5" : "#86efac"}`,
+      background: mapState(r).s === "occupied" ? "#fee2e2" : mapState(r).s === "reserved" ? "#fef3c7" : "#dcfce7",
+      border: `1.5px solid ${mapState(r).s === "occupied" ? "#fca5a5" : mapState(r).s === "reserved" ? "#fcd34d" : "#86efac"}`,
       cursor: "pointer",
       fontSize: 9,
       fontWeight: 700,
-      color: r.status === "occupied" ? "var(--red)" : "var(--green)"
+      color: mapState(r).s === "occupied" ? "var(--red)" : mapState(r).s === "reserved" ? "#b45309" : "var(--green)"
     }
-  }, r.status === "occupied" ? "🔴" : "🟢", r.id))), /*#__PURE__*/React.createElement("div", {
+  }, mapState(r).s === "occupied" ? "🔴" : mapState(r).s === "reserved" ? "📅" : "🟢", r.id))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 16,
@@ -5321,7 +5484,21 @@ function DashboardView({
       fontSize: 12,
       color: "var(--muted)"
     }
-  }, /*#__PURE__*/React.createElement("span", null, "🟢 ", avail.length, " Free"), /*#__PURE__*/React.createElement("span", null, "🔴 ", occ.length, " Occupied"))), hasFeature("direct_booking") && Array.isArray(bookingRequests) && bookingRequests.some(r => r.status === "pending") && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "🟢 ", avail.length, " Free"), /*#__PURE__*/React.createElement("span", null, "🔴 ", occ.length, " Occupied"), resRooms.length > 0 && /*#__PURE__*/React.createElement("span", null, "📅 ", resRooms.length, " Reserved")), /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontSize: 12, color: "var(--muted)", flexWrap: "wrap" }
+  }, /*#__PURE__*/React.createElement("span", { style: { fontWeight: 600 } }, "📆 Is date ka occupancy:"), /*#__PURE__*/React.createElement("input", {
+    type: "date", "data-t": "map-date", min: todayStr(), value: mapDate,
+    onChange: e => setMapDate(e.target.value || todayStr()),
+    style: { width: "auto", padding: "5px 8px", fontSize: 12 }
+  }), mapDate !== todayStr() && /*#__PURE__*/React.createElement("button", { className: "btn-s", onClick: () => setMapDate(todayStr()) }, "Aaj"))), /*#__PURE__*/React.createElement("div", {
+    className: "card", "data-t": "arrivals",
+    style: { padding: "14px 16px" }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }
+  }, /*#__PURE__*/React.createElement("div", { className: "st", style: { marginBottom: 0 } }, "📅 FUTURE BOOKINGS (", arrivals.length, ")"), /*#__PURE__*/React.createElement("button", { className: "btn-s", onClick: () => setView("reserve") }, "Open")), arrivals.length === 0 ? /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "var(--muted)" } }, "Koi upcoming booking nahi.") : arrivals.slice(0, 4).map(r => /*#__PURE__*/React.createElement("div", {
+    key: r.id, onClick: () => setView("reserve"),
+    style: { display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12.5, padding: "7px 0", borderTop: "1px solid var(--border)", cursor: "pointer" }
+  }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, r.name), " · Room ", r.roomId), /*#__PURE__*/React.createElement("span", { style: { color: r.checkIn <= todayStr() ? "#b45309" : "var(--muted)", fontWeight: 600 } }, fmtDate(r.checkIn), resAdvTotal(r) > 0 ? " · 💵₹" + resAdvTotal(r) : "")))), hasFeature("direct_booking") && Array.isArray(bookingRequests) && bookingRequests.some(r => r.status === "pending") && /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: { padding: "14px 16px", border: "1.5px solid #fbbf24" }
   }, /*#__PURE__*/React.createElement("div", {
@@ -5899,24 +6076,31 @@ function CheckInView({
   rooms,
   checkInRoom,
   onCheckIn,
-  setView
+  setView,
+  prefill,
+  reservations,
+  bookings
 }) {
+  const _h = React.createElement;
   const empty = rooms.filter(r => r.status === "empty");
+  const preAdv = prefill ? resAdvTotal(prefill) : 0;
+  const [advAmt, setAdvAmt] = useState("");
+  const [advMode, setAdvMode] = useState("Cash");
   const tempId = useRef(uid()).current;
   const [form, setForm] = useState({
-    roomId: checkInRoom?.id || empty[0]?.id || "",
-    name: "",
-    mobile: "",
+    roomId: prefill?.roomId || checkInRoom?.id || empty[0]?.id || "",
+    name: prefill?.name || "",
+    mobile: prefill?.mobile || "",
     docType: "Aadhaar Card",
     aadhaar: "",
     address: "",
     dob: "",
     gender: "",
     fatherName: "",
-    adults: "1",
-    children: "0",
+    adults: prefill?.adults || "1",
+    children: prefill?.children || "0",
     checkIn: todayStr(),
-    checkOut: tomorrowStr(),
+    checkOut: prefill?.checkOut && prefill.checkOut > todayStr() ? prefill.checkOut : tomorrowStr(),
     checkInTime: "12:00",
     checkOutTime: "11:00",
     purpose: "Leisure",
@@ -6787,12 +6971,26 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     setUseCustomRate(false);
     setCustomRate("");
   }, [form.roomId]);
+  // Reservation → check-in: carry the agreed per-night rate over (runs
+  // AFTER the reset effect above on mount, so it wins).
+  useEffect(() => {
+    if (prefill && Number(prefill.rate) > 0) { setUseCustomRate(true); setCustomRate(String(prefill.rate)); }
+  }, []);
   const submit = () => {
     if (!form.roomId) return alert("Select a room");
     if (!form.name.trim()) return alert("Enter guest name");
     if (!form.mobile.trim()) return alert("Enter mobile number");
     if (!consent) return alert("Guest ka consent lena zaroori hai — checkbox tick karwao (DPDP Act 2023)");
     if (!consent) return alert("Guest consent checkbox tick karna zaroori hai (DPDP Act compliance)");
+    // A DIFFERENT future reservation for this room must not be run over by
+    // this stay (the room is only blocked for those dates, not for today).
+    const rc = roomConflict(form.roomId, form.checkIn, form.checkOut, reservations, bookings, prefill?.id);
+    if (rc && rc.kind === "res") {
+      return alert("Room " + form.roomId + " par " + fmtDate(rc.r.checkIn) + " ko " + rc.r.name + " ki booking hai. Check-out " + fmtDate(rc.r.checkIn) + " se pehle rakho ya doosra room do.");
+    }
+    const extraAdv = Number(advAmt) || 0;
+    if (extraAdv < 0) return alert("Advance galat hai");
+    const advancesAll = [...(prefill?.advances || []), ...(extraAdv > 0 ? [{ amount: extraAdv, mode: advMode, date: todayStr(), src: "checkin" }] : [])];
     // Family members travel under this SAME booking (no separate transaction)
     // Photo is embedded DIRECTLY per member here — avoids the earlier bug where
     // photos were sent via a separate side-channel and matched back to members
@@ -6818,7 +7016,10 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       _signature: signature,
       _photoF: photoF,
       _photoB: photoB,
-      family: familyForBooking
+      family: familyForBooking,
+      advances: advancesAll,
+      advance: advancesAll.reduce((t, a) => t + (Number(a.amount) || 0), 0),
+      _resId: prefill?.id || null
     });
     setDone(true);
     setTimeout(() => {
@@ -6991,7 +7192,11 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     style: {
       color: "var(--gold2)"
     }
-  }, "Room: ", fmtMoney(rt))))), /*#__PURE__*/React.createElement("div", {
+  }, "Room: ", fmtMoney(rt))))), _h("div", { className: "card", "data-t": "advance-card", style: { padding: "14px 16px" } },
+    _h("div", { className: "st" }, "💵 ADVANCE / DEPOSIT"),
+    preAdv > 0 ? _h("div", { style: { fontSize: 12.5, background: "#dcfce7", color: "#166534", borderRadius: 8, padding: "8px 10px", marginBottom: 8, fontWeight: 600 } }, "Booking ke time mila advance: ₹" + preAdv.toLocaleString("en-IN") + " — final bill mein adjust hoga") : null,
+    _h("input", { type: "number", inputMode: "numeric", "data-t": "ci-adv", value: advAmt, onChange: e => setAdvAmt(e.target.value), placeholder: preAdv > 0 ? "Aur advance abhi liya? (optional)" : "Advance amount ₹ (optional)" }),
+    Number(advAmt) > 0 ? _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6, marginTop: 8 } }, RES_PAY_MODES.map(m => _h("button", { key: m, type: "button", onClick: () => setAdvMode(m), style: { padding: "7px 2px", borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", border: "1.5px solid " + (advMode === m ? "#16a34a" : "var(--border)"), background: advMode === m ? "#dcfce7" : "#fff", color: "#333" } }, m))) : null), /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       padding: "14px 16px"
@@ -8863,9 +9068,13 @@ function BookingModal({
   user,
   onCheckOut,
   onExtendStay,
+  onAddAdvance,
   onClose
 }) {
   const [showC, setSC] = useState(false);
+  const [advOpen, setAdvOpen] = useState(false);
+  const [advAmt, setAdvAmt] = useState("");
+  const [advMode, setAdvMode] = useState("Cash");
   const [showPayMode, setShowPayMode] = useState(false);
   const [payMode, setPayMode] = useState("Cash");
   const [showExtend, setShowExtend] = useState(false);
@@ -8875,6 +9084,26 @@ function BookingModal({
   const sub = G.subtotal;
   const gst = G.totalGST;
   const grand = G.grandTotal;
+  const adv = bkAdvance(b);
+  const advRows = adv > 0 ? /*#__PURE__*/React.createElement("div", { "data-t": "bm-adv" }, /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", justifyContent: "space-between", fontSize: 13, color: "#166534", marginTop: 6 }
+  }, /*#__PURE__*/React.createElement("span", null, "💵 Advance received"), /*#__PURE__*/React.createElement("span", null, "− ", fmtMoney(adv))), /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", justifyContent: "space-between", fontSize: 15, fontWeight: 700, color: adv > grand ? "#166534" : "#b45309", marginTop: 4 }
+  }, /*#__PURE__*/React.createElement("span", null, adv > grand ? "Wapas dena hai" : "Baaki lena hai"), /*#__PURE__*/React.createElement("span", null, fmtMoney(Math.abs(grand - adv))))) : null;
+  const advUI = !advOpen ? /*#__PURE__*/React.createElement("button", {
+    className: "btn-o", "data-t": "bm-adv-open", onClick: () => setAdvOpen(true),
+    style: { width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }
+  }, "💵 Advance Lo / Add Advance") : /*#__PURE__*/React.createElement("div", { style: { background: "#f0fdf4", borderRadius: 12, padding: 12 } }, /*#__PURE__*/React.createElement("input", {
+    type: "number", inputMode: "numeric", "data-t": "bm-adv-amt", value: advAmt, onChange: e => setAdvAmt(e.target.value), placeholder: "Advance amount ₹"
+  }), /*#__PURE__*/React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6, margin: "8px 0" } }, RES_PAY_MODES.map(m => /*#__PURE__*/React.createElement("button", {
+    key: m, onClick: () => setAdvMode(m),
+    style: { padding: "7px 2px", borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", border: "1.5px solid " + (advMode === m ? "#16a34a" : "var(--border)"), background: advMode === m ? "#dcfce7" : "#fff", color: "#333" }
+  }, m))), /*#__PURE__*/React.createElement("div", { style: { display: "flex", gap: 8 } }, /*#__PURE__*/React.createElement("button", {
+    className: "btn-o", style: { flex: 1 }, onClick: () => { setAdvOpen(false); setAdvAmt(""); }
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "btn-p", "data-t": "bm-adv-save", style: { flex: 1.5 },
+    onClick: async () => { const a = Number(advAmt); if (!(a > 0)) { alert("Advance amount daalo"); return; } await onAddAdvance(b.id, a, advMode); setAdvOpen(false); setAdvAmt(""); }
+  }, "💾 Save")));
   const n = nts(b.checkIn, b.checkOut);
   const extendNights = newCheckOut > b.checkOut ? nts(b.checkIn, newCheckOut) : n;
   const confirmExtend = () => {
@@ -9052,7 +9281,7 @@ function BookingModal({
       color: "var(--navy)",
       marginTop: 6
     }
-  }, /*#__PURE__*/React.createElement("span", null, "TOTAL"), /*#__PURE__*/React.createElement("span", null, fmtMoney(grand)))), showExtend && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "TOTAL"), /*#__PURE__*/React.createElement("span", null, fmtMoney(grand))), advRows), showExtend && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#eff6ff",
       border: "1px solid #bfdbfe",
@@ -9107,7 +9336,7 @@ function BookingModal({
       justifyContent: "center",
       gap: 8
     }
-  }, "➕ Add Food / Services"), /*#__PURE__*/React.createElement("button", {
+  }, "➕ Add Food / Services"), b.status === "active" && onAddAdvance && advUI, /*#__PURE__*/React.createElement("button", {
     className: "btn-p",
     onClick: () => openInvoice(b, room)
   }, "🖨️ Print / Share Invoice"), !showPayMode ? /*#__PURE__*/React.createElement("button", {
@@ -9117,7 +9346,7 @@ function BookingModal({
     style: { background: "#fff1f2", borderRadius: 12, padding: 12, marginTop: 4 }
   }, /*#__PURE__*/React.createElement("div", {
     style: { fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 8 }
-  }, "💳 Payment kaise mila? — Total: " + fmtMoney(grand)), /*#__PURE__*/React.createElement("div", {
+  }, "💳 Payment kaise mila? — " + (adv > 0 ? "Total " + fmtMoney(grand) + " − Advance " + fmtMoney(adv) + " = " + (adv > grand ? "Wapas " : "Baaki ") + fmtMoney(Math.abs(grand - adv)) : "Total: " + fmtMoney(grand))), /*#__PURE__*/React.createElement("div", {
     style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }
   }, ["Cash", "Card", "UPI", "Bank Transfer", "Online (OTA)", "Other"].map(m => /*#__PURE__*/React.createElement("button", {
     key: m,
@@ -9135,7 +9364,7 @@ function BookingModal({
     style: { flex: 1, padding: "10px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
-      if (window.confirm(`Check out ${b.name}?\nTotal: ${fmtMoney(grand)} (incl. GST)\nPayment: ${payMode}`)) onCheckOut(b.id, payMode);
+      if (window.confirm(`Check out ${b.name}?\nTotal: ${fmtMoney(grand)} (incl. GST)` + (adv > 0 ? `\nAdvance: ${fmtMoney(adv)}\n${adv > grand ? "Wapas dena" : "Baaki lena"}: ${fmtMoney(Math.abs(grand - adv))}` : "") + `\nPayment: ${payMode}`)) onCheckOut(b.id, payMode);
     },
     style: { flex: 1.5, padding: "10px", borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "✅ Confirm Check Out"))))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
@@ -11286,6 +11515,10 @@ function BottomNav({
     icon: "✅",
     label: "Check-In"
   }, {
+    id: "reserve",
+    icon: "📅",
+    label: "Bookings"
+  }, {
     id: "billing",
     icon: "💰",
     label: "Billing"
@@ -11313,7 +11546,7 @@ function BottomNav({
   const isOwner = role === "Owner";
   const allowed = isOwner ? baseItems.map(i => i.id) : permsFor(permissions, role);
   const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant") };
-  let items = baseItems.filter(i => allowed.includes(i.id) && (planGated[i.id] === undefined || planGated[i.id]));
+  let items = baseItems.filter(i => (allowed.includes(i.id) || (i.id === "reserve" && allowed.includes("checkin"))) && (planGated[i.id] === undefined || planGated[i.id]));
   if (isOwner && hasFeature("roles")) {
     items = [...items, { id: "access", icon: "🔐", label: "Access" }];
   }
@@ -11788,7 +12021,7 @@ function App() {
     const allowed = permsFor(permissions, user.role).filter(v => !FEATURE_GATED_VIEWS[v] || hasFeature(FEATURE_GATED_VIEWS[v]));
     const fallback = allowed[0] || "none";
     if (view === "access") { setView(fallback); return; }
-    if (view !== "none" && !allowed.includes(view)) { setView(fallback); return; }
+    if (view !== "none" && !allowed.includes(view) && !(view === "reserve" && allowed.includes("checkin"))) { setView(fallback); return; }
     if (view === "none" && allowed.length) setView(fallback);
   }, [view, user, permissions, enabledFeatures]);
   const [rooms, setRooms] = useState(() => {
@@ -11814,6 +12047,12 @@ function App() {
     try { const v = localStorage.getItem("ab_bookingRequests"); if (v) return JSON.parse(v); } catch {}
     return [];
   });
+  const [reservations, setReservations] = useState(() => {
+    try { const v = localStorage.getItem("ab_reservations"); if (v) return JSON.parse(v); } catch {}
+    return [];
+  });
+  const [resPrefill, setResPrefill] = useState(null);
+  useEffect(() => { if (view !== "checkin") setResPrefill(null); }, [view]);
   const [modal, setModal] = useState(null);
   const [checkInRoom, setCIR] = useState(null);
   const [profile, setProfile] = useState(() => {
@@ -11974,6 +12213,7 @@ function App() {
   useEffect(() => {
     let unsubRooms = () => {};
     let unsubBk = () => {};
+    let unsubRes = () => {};
     let unsubProfile = () => {};
     let unsubPerms = () => {};
     let cancelled = false;
@@ -12025,6 +12265,12 @@ function App() {
         setSyncing(false);
         setSyncErr(false);
       });
+      setTimeout(() => {
+        if (cancelled) return;
+        unsubRes = WS.onSnapshot("reservations", data => {
+          if (Array.isArray(data)) setReservations(data);
+        });
+      }, 450);
       setTimeout(() => {
         if (cancelled) return;
         unsubBk = WS.onSnapshot("bookings", data => {
@@ -12128,6 +12374,7 @@ function App() {
       document.removeEventListener("visibilitychange", onVisible);
       unsubRooms();
       unsubBk();
+      unsubRes();
       unsubProfile();
       unsubPerms();
     };
@@ -12437,6 +12684,7 @@ function App() {
       _signature,
       _photoF,
       _photoB,
+      _resId,
       ...clean
     } = form;
     const nb = {
@@ -12479,7 +12727,12 @@ function App() {
       status: "occupied",
       bookingId: id
     } : r));
+    if (_resId) nb.reservationId = _resId;
     await saveBk([...bookings, nb]);
+    if (_resId) {
+      await patchRes(_resId, { status: "checkedin", bookingId: id, checkedInAt: new Date().toISOString() });
+      AuditLog.add("RESERVATION_CHECKIN", _resId + " -> " + id);
+    }
     // Save to local computer folder (if hotel has selected one in Storage tab).
     // This was previously ONLY wired to the Storage Settings "Test Save"
     // button — real check-ins never triggered it, so photos never reached
@@ -12488,6 +12741,79 @@ function App() {
       LocalFS.saveCheckIn(nb, _photoF, _photoB).catch(e => console.warn("LocalFS save:", e.message));
     }
     setCIR(null);
+    setResPrefill(null);
+  };
+  // ── Future bookings (reservations) ─────────────────────────────
+  // Stored in their own "reservations" document: they never touch rooms,
+  // bookings, billing, history, registers or revenue until the guest
+  // actually checks in (which creates a normal booking).
+  const mergeRes = (a, b) => {
+    const m = {};
+    [...(Array.isArray(b) ? b : []), ...(Array.isArray(a) ? a : [])].forEach(r => {
+      if (!r || !r.id) return;
+      const o = m[r.id];
+      if (!o || String(r.updatedAt || "") >= String(o.updatedAt || "")) m[r.id] = r;
+    });
+    return Object.values(m);
+  };
+  const saveRes = async list => {
+    // Pull the server copy first and union by id, so two devices adding
+    // different bookings at about the same time never overwrite each other.
+    let merged = list;
+    try {
+      const fresh = await WS.get("reservations", true);
+      if (Array.isArray(fresh)) merged = mergeRes(list, fresh);
+    } catch (e) {}
+    setReservations(merged);
+    await WS.set("reservations", merged);
+    return merged;
+  };
+  const patchRes = async (id, patch) => {
+    const upd = reservations.map(r => r.id === id ? { ...r, ...patch, updatedAt: new Date().toISOString() } : r);
+    return saveRes(upd);
+  };
+  const handleAddReservation = async d => {
+    const now = new Date().toISOString();
+    const r = {
+      id: "RS" + Date.now().toString(36).toUpperCase().slice(-6) + Math.random().toString(36).slice(2, 4).toUpperCase(),
+      roomId: d.roomId, checkIn: d.checkIn, checkOut: d.checkOut,
+      name: d.name, mobile: d.mobile, adults: d.adults, children: d.children,
+      rate: d.rate, roomTotal: d.roomTotal, note: d.note || "",
+      advances: d.advance > 0 ? [{ amount: d.advance, mode: d.mode, date: todayStr(), by: user?.name || user?.u || "" }] : [],
+      status: "reserved", createdAt: now, updatedAt: now, createdBy: user?.name || user?.u || ""
+    };
+    await saveRes([...reservations, r]);
+    AuditLog.add("RESERVATION_ADDED", r.name + " · Room " + r.roomId + " · " + r.checkIn + (d.advance > 0 ? " · adv ₹" + d.advance : ""));
+  };
+  const handleResAdvance = async (id, amount, mode) => {
+    const r = reservations.find(x => x.id === id);
+    if (!r) return;
+    await patchRes(id, { advances: [...(r.advances || []), { amount, mode, date: todayStr(), by: user?.name || user?.u || "" }] });
+    AuditLog.add("RESERVATION_ADVANCE", r.name + " · ₹" + amount + " " + mode);
+  };
+  const handleResCancel = async (id, outcome) => {
+    const r = reservations.find(x => x.id === id);
+    if (!r) return;
+    await patchRes(id, { status: "cancelled", advanceOutcome: outcome, cancelledAt: new Date().toISOString(), cancelledBy: user?.name || user?.u || "" });
+    AuditLog.add("RESERVATION_CANCELLED", r.name + " · Room " + r.roomId + " · advance " + outcome);
+  };
+  const handleResCheckInNow = r => {
+    const room = rooms.find(x => x.id === r.roomId);
+    if (room && room.status === "occupied") { alert("Room " + r.roomId + " abhi occupied hai — pehle checkout karo ya room badlo."); return; }
+    if (r.checkIn > todayStr() && !window.confirm("Yeh booking " + fmtDate(r.checkIn) + " ki hai. Abhi (early) check-in karna hai?")) return;
+    setResPrefill(r);
+    setCIR({ id: r.roomId });
+    setView("checkin");
+  };
+  // Advance for a guest who is ALREADY in-house.
+  const handleBookingAdvance = async (bid, amount, mode) => {
+    const b = bookings.find(x => x.id === bid);
+    if (!b) return;
+    const advs = [...(Array.isArray(b.advances) ? b.advances : (Number(b.advance) > 0 ? [{ amount: Number(b.advance), mode: "Cash", date: b.checkIn }] : [])), { amount, mode, date: todayStr(), by: user?.name || user?.u || "" }];
+    const updated = { ...b, advances: advs, advance: advs.reduce((t, a) => t + (Number(a.amount) || 0), 0) };
+    await saveBk(bookings.map(x => x.id === bid ? updated : x));
+    AuditLog.add("ADVANCE_RECEIVED", b.name + " · Room " + b.roomId + " · ₹" + amount + " " + mode);
+    if (modal?.b?.id === bid) setModal(p => ({ ...p, b: updated }));
   };
   const handleAddCharge = async (bid, items) => {
     // Restaurant counter and reception may add orders to the same room
@@ -12619,6 +12945,9 @@ function App() {
       gstAmt: gst,
       invoiceNo,
       paymentMode: paymentMode || "Cash",
+      advancePaid: bkAdvance(b),
+      balanceReceived: Math.max(0, grand - bkAdvance(b)),
+      refundDue: Math.max(0, bkAdvance(b) - grand),
       gstBreakdown: {
         roomAmt: G.roomAmt, roomGST: G.roomGST, roomGSTRate: G.roomGSTRate,
         roomCGST: G.roomCGST, roomSGST: G.roomSGST, roomSAC: G.roomSAC, roomRuleId: G.roomRuleId,
@@ -12895,6 +13224,7 @@ function App() {
   }, view === "dash" && /*#__PURE__*/React.createElement(DashboardView, {
     rooms: rooms,
     bookings: bookings,
+    reservations: reservations,
     user: user,
     setView: setView,
     setModal: setModal,
@@ -12908,10 +13238,23 @@ function App() {
     setView: setView,
     setCheckInRoom: setCIR
   }), view === "checkin" && /*#__PURE__*/React.createElement(CheckInView, {
+    key: resPrefill?.id || "walkin",
     rooms: rooms,
     checkInRoom: checkInRoom,
     onCheckIn: handleCheckIn,
-    setView: setView
+    setView: setView,
+    prefill: resPrefill,
+    reservations: reservations,
+    bookings: bookings
+  }), view === "reserve" && /*#__PURE__*/React.createElement(ReservationsView, {
+    rooms: rooms,
+    bookings: bookings,
+    reservations: reservations,
+    user: user,
+    onAdd: handleAddReservation,
+    onAddAdvance: handleResAdvance,
+    onCancel: handleResCancel,
+    onCheckInNow: handleResCheckInNow
   }), view === "billing" && /*#__PURE__*/React.createElement(BillingView, {
     rooms: rooms,
     bookings: bookings,
@@ -12999,6 +13342,7 @@ function App() {
     onAddCharge: handleAddCharge,
     onCheckOut: handleCheckOut,
     onExtendStay: handleExtendStay,
+    onAddAdvance: handleBookingAdvance,
     onClose: () => setModal(null)
   }), modal?.type === "editRoom" && /*#__PURE__*/React.createElement(RoomEditModal, {
     room: modal.room,
