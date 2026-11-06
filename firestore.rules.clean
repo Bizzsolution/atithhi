@@ -1,0 +1,180 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.uid == 'bizzsathi-admin'
+        && request.auth.token.admin == true;
+    }
+
+    function validHotelId(id) {
+      return id is string
+        && id.size() >= 8
+        && id.size() <= 40
+        && id.matches('^ATITHI-[A-Za-z0-9]+$');
+    }
+
+    function verifiedHotel(id) {
+      return request.auth != null
+        && request.auth.token.hotelId == id;
+    }
+
+    function validVaultId(id) {
+      return id is string
+        && id.size() == 24
+        && id.matches('^V[A-Za-z0-9]+$');
+    }
+
+    match /hotels/{hotelId}/data/{docId} {
+
+      allow get: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+      allow list: if isAdmin() && validHotelId(hotelId);
+
+      allow create, update: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+
+      allow delete: if isAdmin();
+    }
+
+    match /hotels/{hotelId} {
+      allow get: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+      allow create, update: if validHotelId(hotelId) || verifiedHotel(hotelId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /licenses/{licenseKey} {
+      allow get: if isAdmin();
+      allow list: if false;
+      allow create, update: if isAdmin()
+        && validHotelId(licenseKey)
+        && request.resource.data.key == licenseKey
+        && request.resource.data.size() <= 40;
+      allow delete: if false;
+    }
+
+    match /admin/{docId} {
+      allow get: if isAdmin();
+      allow list: if false;
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    function verifiedHotelId() {
+      return request.auth != null
+        && request.auth.token.hotelId is string
+        && validHotelId(request.auth.token.hotelId);
+    }
+    function ownsBookingToken(token) {
+      return verifiedHotelId()
+        && exists(/databases/$(database)/documents/public_booking_owner/$(token))
+        && get(/databases/$(database)/documents/public_booking_owner/$(token)).data.hotelId == request.auth.token.hotelId;
+    }
+    function ownsBookingTokenAfter(token) {
+      return verifiedHotelId()
+        && existsAfter(/databases/$(database)/documents/public_booking_owner/$(token))
+        && getAfter(/databases/$(database)/documents/public_booking_owner/$(token)).data.hotelId == request.auth.token.hotelId;
+    }
+    function validBookingToken(token) {
+      return token is string && token.matches('^PB[A-Z2-9]{16}$');
+    }
+    function boundedString(v, maxLen) {
+      return v is string && v.size() <= maxLen;
+    }
+    function validSnapshotFields(d) {
+      return (!('hotelName' in d) || boundedString(d.hotelName, 200))
+        && (!('hotelAddr' in d) || boundedString(d.hotelAddr, 1000))
+        && (!('hotelPhone' in d) || boundedString(d.hotelPhone, 60))
+        && (!('roomTypes' in d) || (d.roomTypes is list && d.roomTypes.size() <= 50))
+        && (!('updatedAt' in d) || d.updatedAt is number);
+    }
+
+    match /public_booking/{token} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if validBookingToken(token)
+        && request.resource.data.keys().hasOnly(['hotelName', 'hotelAddr', 'hotelPhone', 'roomTypes', 'updatedAt'])
+        && validSnapshotFields(request.resource.data)
+        && (ownsBookingTokenAfter(token) || isAdmin());
+      allow update: if (ownsBookingToken(token) || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hotelName', 'hotelAddr', 'hotelPhone', 'roomTypes', 'updatedAt'])
+        && validSnapshotFields(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /public_booking_owner/{token} {
+      allow get: if isAdmin();
+      allow list: if false;
+      allow create: if request.resource.data.keys().hasOnly(['hotelId', 'createdAt'])
+        && request.resource.data.createdAt is number
+        && (
+          (verifiedHotelId()
+            && validBookingToken(token)
+            && request.resource.data.hotelId == request.auth.token.hotelId
+            && !exists(/databases/$(database)/documents/public_booking/$(token)))
+          || (isAdmin() && validHotelId(request.resource.data.hotelId))
+        );
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['hotelId', 'createdAt'])
+        && validHotelId(request.resource.data.hotelId);
+      allow delete: if isAdmin();
+    }
+
+    match /public_booking/{token}/requests/{reqId} {
+      allow create: if exists(/databases/$(database)/documents/public_booking/$(token))
+        && reqId.matches('^REQ[A-Z0-9]{4,24}$')
+        && request.resource.data.keys().hasOnly(['id', 'name', 'phone', 'email', 'checkIn', 'checkOut', 'roomType', 'notes', 'status', 'createdAt'])
+        && request.resource.data.id == reqId
+        && request.resource.data.status == 'pending'
+        && boundedString(request.resource.data.name, 100)
+        && boundedString(request.resource.data.phone, 20)
+        && (!('email' in request.resource.data) || boundedString(request.resource.data.email, 100))
+        && (!('notes' in request.resource.data) || boundedString(request.resource.data.notes, 300))
+        && (!('roomType' in request.resource.data) || boundedString(request.resource.data.roomType, 60))
+        && (!('checkIn' in request.resource.data) || boundedString(request.resource.data.checkIn, 10))
+        && (!('checkOut' in request.resource.data) || boundedString(request.resource.data.checkOut, 10))
+        && (!('createdAt' in request.resource.data) || boundedString(request.resource.data.createdAt, 40));
+      allow get, list: if ownsBookingToken(token) || isAdmin();
+      allow update: if (ownsBookingToken(token) || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'decidedAt', 'decisionReason'])
+        && request.resource.data.status in ['pending', 'confirmed', 'declined']
+        && (!('decisionReason' in request.resource.data) || boundedString(request.resource.data.decisionReason, 300))
+        && (!('decidedAt' in request.resource.data) || boundedString(request.resource.data.decidedAt, 40));
+      allow delete: if isAdmin();
+    }
+
+    match /billing/{vaultId} {
+      allow get: if isAdmin() && validVaultId(vaultId);
+      allow list: if false;
+      allow create, update: if isAdmin() && validVaultId(vaultId);
+      allow delete: if false;
+    }
+    match /billing/{vaultId}/invoices/{invoiceId} {
+      allow get, list: if isAdmin() && validVaultId(vaultId);
+      allow create, update: if isAdmin() && validVaultId(vaultId);
+      allow delete: if false;
+    }
+    match /billing/{vaultId}/clients/{clientKey} {
+      allow get, list: if isAdmin() && validVaultId(vaultId);
+      allow create, update: if isAdmin() && validVaultId(vaultId);
+      allow delete: if false;
+    }
+
+    match /admin_vault/{vaultId} {
+      allow get: if isAdmin() && validVaultId(vaultId);
+      allow list: if false;
+      allow create, update: if isAdmin() && validVaultId(vaultId)
+        && request.resource.data.keys().hasOnly(['licenseKeys', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    match /backups/{hotelId}/snaps/{snapId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

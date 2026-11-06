@@ -85,6 +85,13 @@ async function firestoreGetDoc(path) {
 }
 
 // ── PER-LICENSE RATE LIMITING (in-memory, no external deps) ──
+// AUDIT-2 (F6): bounded LRU instead of Map.clear() on overflow.
+const RL_MAX_BUCKETS = 5000;
+function lruTouch(map, key, value) {
+  map.delete(key);
+  if (map.size >= RL_MAX_BUCKETS) { const oldest = map.keys().next(); if (!oldest.done) map.delete(oldest.value); }
+  map.set(key, value);
+}
 const rateMap = new Map();
 function checkScanRateLimit(license) {
   const now = Date.now();
@@ -92,8 +99,53 @@ function checkScanRateLimit(license) {
   if (now - entry.windowStart > 60000) { entry.count = 0; entry.windowStart = now; }
   if (entry.count >= 20) return false;
   entry.count++;
-  rateMap.set(license, entry);
-  if (rateMap.size > 5000) rateMap.clear();
+  lruTouch(rateMap, license, entry);
+  return true;
+}
+
+// ── PER-CLIENT RATE LIMITING, applied BEFORE any license lookup ──
+// AUDIT-2 (F6): previously the only limiter ran AFTER license validation,
+// so an unauthenticated caller could send unlimited made-up keys and each
+// one cost two Firestore reads — one of them the whole legacy
+// admin/licenses array document. 30 requests/min per IPv4 address or
+// IPv6 /64 is far above what a front desk scanning IDs can produce.
+const ipRateMap = new Map();
+const IP_LIMIT_PER_MIN = 30;
+function clientBucket(event) {
+  const h = (event && event.headers) || {};
+  const raw = String(h["x-nf-client-connection-ip"] || h["client-ip"] || "").trim().slice(0, 64);
+  if (!raw) return "unknown";
+  if (raw.indexOf(":") === -1) return raw;
+  const mapped = raw.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (mapped) return mapped[1];
+  const clean = raw.split("%")[0].toLowerCase();
+  const halves = clean.split("::");
+  if (halves.length > 2) return "v6:invalid";
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? new Array(Math.max(0, 8 - head.length - tail.length)).fill("0") : [];
+  const groups = head.concat(fill, tail);
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/.test(g))) return "v6:invalid";
+  return "v6:" + groups.slice(0, 4).map(g => g.replace(/^0+(?=.)/, "")).join(":");
+}
+function checkIpRateLimit(bucket) {
+  const now = Date.now();
+  const e = ipRateMap.get(bucket) || { count: 0, windowStart: now };
+  if (now - e.windowStart > 60000) { e.count = 0; e.windowStart = now; }
+  e.count++;
+  lruTouch(ipRateMap, bucket, e);
+  return e.count <= IP_LIMIT_PER_MIN;
+}
+
+// Short negative cache: a key confirmed absent is not looked up again for
+// 60 s, so repeating one bogus key costs nothing. Kept short so a key the
+// admin has just issued starts working within a minute.
+const notFoundCache = new Map();
+const NOT_FOUND_TTL_MS = 60000;
+function knownMissing(key) {
+  const t = notFoundCache.get(key);
+  if (t === undefined) return false;
+  if (Date.now() - t > NOT_FOUND_TTL_MS) { notFoundCache.delete(key); return false; }
   return true;
 }
 
@@ -202,6 +254,10 @@ export async function handler(event) {
   if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers, body: "" };
   if (event.httpMethod !== "POST") return { statusCode: 405, headers, body: JSON.stringify({ error: "Method not allowed" }) };
 
+  if (!checkIpRateLimit(clientBucket(event))) {
+    return { statusCode: 429, headers, body: JSON.stringify({ error: "RATE_LIMITED", message: "Too many requests. Wait a minute and try again." }) };
+  }
+
   try {
     let parsed;
     try { parsed = JSON.parse(event.body || "{}"); } catch { return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid request" }) }; }
@@ -219,21 +275,32 @@ export async function handler(event) {
     // ── LICENSE VALIDATION — Firestore (live) checked first, env var as fallback ──
     const licenseUpper = license.trim().toUpperCase();
     if (!ANY_KEY_RE.test(licenseUpper)) return { statusCode: 403, headers, body: JSON.stringify({ error: "INVALID_LICENSE", message: "Invalid license key. Contact support." }) };
-    const [fsResult, envResult] = await Promise.all([
-      checkFirestoreLicense(licenseUpper),
-      Promise.resolve(checkEnvLicense(licenseUpper))
-    ]);
+    // The cache entry is written ONLY after a real lookup, never refreshed
+    // by a cache hit — otherwise a client retrying every <60 s would keep
+    // a just-issued key "missing" indefinitely (review finding S3).
+    let fsResult;
+    if (knownMissing(licenseUpper)) {
+      fsResult = { found: false };
+    } else {
+      fsResult = await checkFirestoreLicense(licenseUpper);
+      if (!fsResult.found && !fsResult.error) lruTouch(notFoundCache, licenseUpper, Date.now());
+    }
+    const envResult = checkEnvLicense(licenseUpper);
 
     let valid = false;
     let expired = false;
 
+    // AUDIT-2 (F6): Firestore is AUTHORITATIVE whenever it has a record.
+    // The env-var list is consulted only for keys Firestore does not know
+    // (legacy keys) or when Firestore could not be reached. Previously a
+    // key revoked in the admin panel (active:false) was re-validated by
+    // the VALID_LICENSES fallback and kept getting OCR billed to BizzSathi.
     if (fsResult.found) {
-      valid = fsResult.active;
-      if (fsResult.expired) expired = true;
-    }
-    if (!valid && envResult.found) {
-      valid = envResult.active && !envResult.expired;
-      expired = expired || envResult.expired;
+      valid = fsResult.active === true;
+      expired = !!fsResult.expired;
+    } else if (envResult.found) {
+      valid = envResult.active === true && !envResult.expired;
+      expired = !!envResult.expired;
     }
 
     if (!valid && expired) {
@@ -411,16 +478,21 @@ export async function handler(event) {
       }
     }
 
-    if (!result) return { statusCode: 503, headers, body: JSON.stringify({
-      error: "OCR service unavailable. API keys may need updating — contact admin.",
-      details: {
+    if (!result) {
+      // AUDIT-2 (F6): provider error text (account/quota/model-access
+      // details) stays in the function log; the client gets a stable code.
+      console.error("scan: all OCR providers failed —", JSON.stringify({
         groq: lastErrors.groq ? String(lastErrors.groq).slice(0, 200) : null,
         gemini: lastErrors.gemini ? String(lastErrors.gemini).slice(0, 200) : null
-      }
-    }) };
+      }));
+      return { statusCode: 503, headers, body: JSON.stringify({ error: "OCR service unavailable. API keys may need updating — contact admin.", code: "OCR_UNAVAILABLE" }) };
+    }
     return { statusCode: 200, headers, body: JSON.stringify(result) };
 
   } catch (e) {
+    console.error("scan:", e && e.message ? e.message.slice(0, 160) : "unknown");
     return { statusCode: 500, headers, body: JSON.stringify({ error: "Server error. Try again." }) };
   }
 }
+
+export const __test = { clientBucket, ipRateMap, rateMap, notFoundCache, tokenCache };

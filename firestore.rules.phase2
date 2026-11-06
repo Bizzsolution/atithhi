@@ -135,6 +135,14 @@ service cloud.firestore {
     // `validHotelId(hotelId)` from these OR's and leaves only
     // `verifiedHotel(hotelId)` — the point at which a leaked license key
     // alone stops being sufficient to read or write that hotel's data.
+    function notWiping(docId) {
+      return !(docId in ['bookings', 'users', 'rooms', 'reservations', 'creditNotes'])
+        || !(resource.data.get('value', null) is list)
+        || (request.resource.data.get('value', null) is list
+            && (resource.data.value.size() == 0 || request.resource.data.value.size() > 0)
+            && (docId != 'bookings' || request.resource.data.value.size() >= resource.data.value.size() - 300));
+    }
+
     function verifiedHotel(id) {
       return request.auth != null
         && request.auth.token.hotelId == id
@@ -219,7 +227,14 @@ service cloud.firestore {
       // under here ever needs stricter treatment, it must be excluded
       // from this block's conditions explicitly (or live outside this
       // subtree entirely, the way public_booking/ does).
-      allow create, update: if verifiedHotel(hotelId) || isAdmin();
+      allow create: if verifiedHotel(hotelId) || isAdmin();
+      // WIPE GUARD (2026-10 hardening): "no delete" alone did not protect
+      // the guest register — an update could set `value: []`. A verified
+      // hotel device may still edit freely, but may not empty the core
+      // lists, and may shrink `bookings` by at most 300 records per write
+      // (the app's archive batch size; archiving moves records to
+      // bookings_archive_* first). Admin is exempt (Data Manager restore).
+      allow update: if isAdmin() || (verifiedHotel(hotelId) && notWiping(docId));
 
       // Guest registers are a legal retention requirement under the
       // Indian hospitality/police-reporting rules, and the app itself
@@ -475,6 +490,17 @@ service cloud.firestore {
       allow create, update: if isAdmin() && validVaultId(vaultId)
         && request.resource.data.keys().hasOnly(['licenseKeys', 'updatedAt']);
       allow delete: if false;
+    }
+
+    // ---- automatic server backups (admin-only) --------------------
+    // Written ONLY by the scheduled Netlify function netlify/functions/
+    // backup.mjs (service account — bypasses rules). No hotel device can
+    // create, change or delete a backup, so a wiped or overwritten hotel
+    // document can always be restored from here by the admin panel
+    // (Data Manager → 🛟 Auto Backups).
+    match /backups/{hotelId}/snaps/{snapId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     // ---- default deny --------------------------------------------

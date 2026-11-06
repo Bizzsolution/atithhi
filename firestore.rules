@@ -446,6 +446,17 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ---- automatic server backups (admin-only) --------------------
+    // Written ONLY by the scheduled Netlify function netlify/functions/
+    // backup.mjs (service account — bypasses rules). No hotel device can
+    // create, change or delete a backup, so a wiped or overwritten hotel
+    // document can always be restored from here by the admin panel
+    // (Data Manager → 🛟 Auto Backups).
+    match /backups/{hotelId}/snaps/{snapId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // ---- default deny --------------------------------------------
     // Anything not explicitly matched above is refused. New collections
     // added later start closed and must be opened deliberately, rather

@@ -20,7 +20,7 @@ const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 20
 const PEM = privateKey.export({ type: "pkcs8", format: "pem" });
 const SA_EMAIL = "firebase-adminsdk-test@atithibook-saas.iam.gserviceaccount.com";
 function setEnv(extra) {
-  for (const k of ["ADMIN_PASSWORD", "ADMIN_SECRET", "FIREBASE_CLIENT_EMAIL", "FIREBASE_PRIVATE_KEY", "FIREBASE_SERVICE_ACCOUNT", "GEMINI_API_KEY", "GROQ_API_KEY", "VALID_LICENSES", "URL"]) delete process.env[k];
+  for (const k of ["ADMIN_PASSWORD", "ADMIN_SECRET", "FIREBASE_CLIENT_EMAIL", "FIREBASE_PRIVATE_KEY", "FIREBASE_SERVICE_ACCOUNT", "GEMINI_API_KEY", "GROQ_API_KEY", "VALID_LICENSES", "URL", "ALLOW_SUPPORT_OVERRIDE"]) delete process.env[k];
   Object.assign(process.env, extra || {});
 }
 const SA_ENV = { FIREBASE_CLIENT_EMAIL: SA_EMAIL, FIREBASE_PRIVATE_KEY: PEM.replace(/\n/g, "\\n") }; // as pasted in Netlify
@@ -95,7 +95,7 @@ if (aa) {
 // ═════════ manage-keys ═════════
 console.log("=== manage-keys.mjs ===");
 const mk = await load("manage-keys");
-setEnv({ ADMIN_SECRET: "SuperSecretValue123" });
+setEnv({ ALLOW_SUPPORT_OVERRIDE: "true", ADMIN_SECRET: "SuperSecretValue123" });
 const r401 = await mk.handler(ev("GET", undefined, { "x-admin-key": "S" + "x".repeat(17) + "3" }));
 const b401 = parse(r401);
 check("401 on wrong key", r401.statusCode === 401);
@@ -106,17 +106,46 @@ check("correct key still works", (await mk.handler(ev("GET", undefined, { "x-adm
 // ═════════ verify-access ═════════
 console.log("=== verify-access.mjs ===");
 const va = await load("verify-access");
-setEnv({ ADMIN_SECRET: "AdminBypass#2026", ...SA_ENV });
-let r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "+91 98765 43210" }));
+setEnv({ ALLOW_SUPPORT_OVERRIDE: "true", ADMIN_SECRET: "AdminBypass#2026", ...SA_ENV });
+let r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "+91 98765 43210", deviceId: "kiosk-front-desk-1" }));
 check("registered phone verifies under hardened rules (service-account read)", r.statusCode === 200 && parse(r).ok === true, parse(r));
+// ── AD-1 remediation: verify-access mints a hotel-scoped custom token ──
+{
+  const tok = parse(r).token || "";
+  check("successful verification also returns a hotel-scoped token", tok.split(".").length === 3, parse(r));
+  if (tok) {
+    const [h, p, s] = tok.split(".");
+    const sigOk = createVerify("RSA-SHA256").update(h + "." + p).verify(publicKey, Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64"));
+    const claims = JSON.parse(Buffer.from(p.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
+    check("hotel token signature verifies with service-account public key", sigOk);
+    check("hotel token carries hotelId claim matching the verified license", claims.claims?.hotelId === "ATITHI-HOTELGANGA01", claims);
+    check("hotel token uid is scoped to hotel+device (not shared across hotels)", claims.uid === "hotel:ATITHI-HOTELGANGA01:kiosk-front-desk-1", claims);
+    check("hotel token audience is Identity Toolkit", claims.aud === "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit");
+    check("hotel token lifetime ≤ 3600s", claims.exp - claims.iat <= 3600);
+  }
+}
+r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "+91 98765 43210", deviceId: "../../etc/passwd" }));
+{
+  const tok = parse(r).token || "";
+  const [, p] = tok.split(".");
+  const claims = JSON.parse(Buffer.from(p.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
+  check("malformed deviceId is sanitized rather than embedded verbatim in the uid", claims.uid === "hotel:ATITHI-HOTELGANGA01:unknown", claims);
+}
 r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "9000000000" }));
 check("wrong phone → 403", r.statusCode === 403);
+check("no token on a failed verification", parse(r).token === undefined, parse(r));
 r = await va.handler(ev("POST", { licenseKey: "ATITHI-REVOKED0001", phone: "9876543210" }));
 check("revoked license cannot activate a new device", r.statusCode === 403, parse(r));
+check("no token for a revoked license", parse(r).token === undefined, parse(r));
 r = await va.handler(ev("POST", { licenseKey: "../admin/licenses", phone: "9876543210" }));
 check("path-injection key rejected before any Firestore call", r.statusCode === 404 && !calls.some(c => c.url.includes("..")));
-r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "AdminBypass#2026" }));
+r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "AdminBypass#2026", deviceId: "admin-console" }));
 check("admin bypass still works", r.statusCode === 200 && parse(r).adminOverride === true);
+check("admin bypass also gets a scoped hotel token when a valid key is given", (parse(r).token || "").split(".").length === 3, parse(r));
+delete process.env.ALLOW_SUPPORT_OVERRIDE;
+r = await va.handler(ev("POST", { licenseKey: "ATITHI-HOTELGANGA01", phone: "AdminBypass#2026", deviceId: "x" }));
+check("[hardening] ADMIN_SECRET no longer unlocks a hotel unless ALLOW_SUPPORT_OVERRIDE=true", r.statusCode !== 200 && parse(r).adminOverride === undefined && parse(r).token === undefined, parse(r));
+process.env.ALLOW_SUPPORT_OVERRIDE = "true";
 calls.length = 0;
 fetch.__throwNext = true;
 const origFetch = globalThis.fetch;

@@ -26,7 +26,10 @@ function allowRequest(ip) {
   const e = rateMap.get(ip) || { count: 0, windowStart: now };
   if (now - e.windowStart > 60000) { e.count = 0; e.windowStart = now; }
   e.count++;
-  if (rateMap.size > 5000) rateMap.clear();
+  // AUDIT-2 (F7): LRU eviction instead of Map.clear(), which reset every
+  // client's counter whenever 5000 distinct addresses had been seen.
+  rateMap.delete(ip);
+  if (rateMap.size >= 5000) { const oldest = rateMap.keys().next(); if (!oldest.done) rateMap.delete(oldest.value); }
   rateMap.set(ip, e);
   return e.count <= 60;
 }

@@ -86,6 +86,12 @@
 [functions]
   node_bundler = "esbuild"
 
+# Daily server-side backups of every hotel's important documents into the
+# admin-only backups/ tree (see netlify/functions/backup.mjs). Runs hourly;
+# each run handles 1/24th of the hotels, so each hotel is copied once a day.
+[functions."backup"]
+  schedule = "@hourly"
+
 # ── SECURITY HEADERS ─────────────────────────────────────
 # AUDIT-2 (F9) changes:
 #  • script-src: the bare "https://unpkg.com" allowed ANY of the ~3M npm

@@ -1449,6 +1449,15 @@ const escHtml = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/
 // script tag early and start executing whatever follows as markup or
 // script. Escaping "<" to its unicode form breaks that sequence while
 // still round-tripping to the exact same string once JS parses it back.
+// CSV/Excel formula-injection guard: a cell that starts with = + - @ (or
+// tab/CR) is executed as a formula by Excel/Sheets. Prefix it with ' so it
+// opens as text — but leave plain numbers/phone numbers ("+91 98...",
+// "-500") readable as they are.
+const csvSafeText = v => {
+  const t = v === null || v === undefined ? "" : String(v);
+  if (/^[=+\-@\t\r]/.test(t) && !/^[+-]?[\d][\d\s().-]*$/.test(t)) return "'" + t;
+  return t;
+};
 const jsonForScript = v => JSON.stringify(v).replace(/</g, "\\u003c");
 
 // ── SIMPLE INDEXEDDB HELPERS — FileSystemDirectoryHandle objects can't be
@@ -1759,7 +1768,7 @@ const AuditLog = {
         ts: new Date().toISOString(),
         action,
         detail: String(detail).slice(0, 100),
-        user: JSON.parse(localStorage.getItem("ab_cu") || "{}").name || "unknown"
+        user: AUDIT_USER || "unknown"
       });
       if (logs.length > 500) logs.splice(0, 100); // keep last 500
       localStorage.setItem("ab_audit", JSON.stringify(logs));
@@ -1779,7 +1788,8 @@ const AuditLog = {
   },
   export() {
     const logs = this.get();
-    const csv = ["Timestamp,Action,User,Detail", ...logs.map(l => `${l.ts},${l.action},${l.user},${l.detail}`)].join("\n");
+    const cell = v => { const t = csvSafeText(v); return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+    const csv = ["Timestamp,Action,User,Detail", ...logs.map(l => [l.ts, l.action, l.user, l.detail].map(cell).join(","))].join("\n");
     const a = document.createElement("a");
     a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
     a.download = "atithibook_audit_" + new Date().toISOString().slice(0, 10) + ".csv";
@@ -1788,6 +1798,12 @@ const AuditLog = {
 };
 
 // ── SESSION MANAGEMENT ───────────────────────────
+// Who is logged in on THIS device, for the audit trail. Set by App on every
+// login/logout. (The audit log used to read the name from the "ab_cu"
+// session cache, which normal logins never wrote — so every entry said
+// "unknown" — and after the first logout that cache held null, which made
+// AuditLog.add throw and silently stop recording anything at all.)
+let AUDIT_USER = "";
 const Session = {
   TIMEOUT: 8 * 60 * 60 * 1000,
   touch() {
@@ -2654,8 +2670,73 @@ const WS = {
     }
     return null;
   },
+  // Atomic read-modify-write of one {value: [...]} document. Two devices
+  // saving the SAME whole-array document at nearly the same time used to
+  // be "last write wins": the slower device silently erased what the
+  // other had just added (e.g. a check-in done on the reception phone
+  // vanished when the restaurant tablet saved a charge from stale state).
+  // A Firestore transaction re-reads the server copy and lets `mutate`
+  // merge into it; Firestore retries automatically on a conflict.
+  // Returns the array that was written, or null if a transaction is not
+  // possible right now (offline / SDK missing) — callers then fall back
+  // to the old plain write so offline work still gets saved.
+  async txArray(k, mutate, timeoutMs) {
+    const ref = this._ref(k);
+    if (!ref || !window._db || typeof window._db.runTransaction !== "function") return null;
+    let out = null;
+    try {
+      await Promise.race([
+        window._db.runTransaction(async t => {
+          const snap = await t.get(ref);
+          const d = snap && snap.exists ? snap.data() : null;
+          const cur = d && Array.isArray(d.value) ? d.value : [];
+          out = mutate(cur);
+          t.set(ref, { value: out, ts: Date.now() }, { merge: true });
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("transaction timeout")), timeoutMs || 8000))
+      ]);
+      return out;
+    } catch (e) {
+      console.warn("txArray " + k + ":", e.message);
+      return null;
+    }
+  },
+  // Raw document (all fields, not just .value) straight from the server.
+  async getRawServer(k) {
+    const ref = this._ref(k);
+    if (!ref) return null;
+    const snap = await ref.get({ source: "server" });
+    return snap.exists ? snap.data() : null;
+  },
+  // A month's archive may be split over several part documents
+  // (bookings_archive_YYYY_MM, ..._p2, ..._p3) once one month holds more
+  // than one Firestore document can. The base document records `parts`.
+  async getArchiveMonth(monthKey) {
+    try {
+      const base = await this.getRawServer(monthKey);
+      if (!base) return [];
+      let all = Array.isArray(base.value) ? base.value.slice() : [];
+      const parts = Number(base.parts) || 1;
+      for (let i = 2; i <= parts; i++) {
+        const d = await this.getRawServer(monthKey + "_p" + i).catch(() => null);
+        if (d && Array.isArray(d.value)) all = all.concat(d.value);
+      }
+      return all;
+    } catch (e) {
+      // offline: fall back to whatever single-document copy is cached
+      const v = await this.get(monthKey).catch(() => null);
+      return Array.isArray(v) ? v : [];
+    }
+  },
   // SET: localStorage (instant) + Firestore (cloud sync)
   async set(k, v) {
+    // Wipe guard: the app never legitimately empties the staff list or the
+    // room list. An empty array here is a bug (or tampering) — refuse it
+    // rather than overwrite every device's copy with nothing.
+    if ((k === "users" || k === "rooms") && Array.isArray(v) && v.length === 0) {
+      console.error("Blocked: refusing to overwrite '" + k + "' with an empty list.");
+      return;
+    }
     try {
       localStorage.setItem(`ab_${k}`, JSON.stringify(v));
     } catch {}
@@ -5044,6 +5125,30 @@ const bkAdvance = b => {
   if (Array.isArray(b.advances) && b.advances.length) return b.advances.reduce((t, a) => t + (Number(a.amount) || 0), 0);
   return Number(b.advance) || 0;
 };
+// Merge this device's bookings (already cloud-sanitised) into the server
+// copy: keep server-only records (added by another device) unless this save
+// archived them; never undo another device's checkout; union room charges
+// added elsewhere (except ones voided here).
+function mergeBookingLists(localArr, serverArr, removedIds) {
+  const srvById = new Map((serverArr || []).filter(x => x && x.id).map(x => [x.id, x]));
+  const seen = new Set();
+  const out = [];
+  for (const l of localArr || []) {
+    if (!l || !l.id) continue;
+    seen.add(l.id);
+    const s = srvById.get(l.id);
+    if (!s) { out.push(l); continue; }
+    if (s.status === "checkedout" && l.status !== "checkedout") { out.push(s); continue; }
+    const voided = new Set((l.voidedCharges || []).map(c => c && c.id).filter(Boolean));
+    const haveC = new Set((l.charges || []).map(c => c && c.id).filter(Boolean));
+    const extraC = (s.charges || []).filter(c => c && c.id && !haveC.has(c.id) && !voided.has(c.id));
+    out.push(extraC.length && l.status === "active" ? { ...l, charges: [...(l.charges || []), ...extraC] } : l);
+  }
+  for (const s of serverArr || []) {
+    if (s && s.id && !seen.has(s.id) && !(removedIds && removedIds.has(s.id))) out.push(s);
+  }
+  return out;
+}
 const datesOverlap = (aIn, aOut, bIn, bOut) => aIn < bOut && bIn < aOut;
 function roomConflict(roomId, ci, co, reservations, bookings, ignoreResId) {
   for (const r of reservations || []) {
@@ -5595,7 +5700,8 @@ function RoomsView({
   bookings,
   setModal,
   setView,
-  setCheckInRoom
+  setCheckInRoom,
+  onReleaseRoom
 }) {
   const [fl, setFl] = useState("all");
   const floors = [...new Set(rooms.map(r => r.fl))].sort((a, b) => a - b);
@@ -5694,7 +5800,12 @@ function RoomsView({
     }
   }, "Koi room nahi is floor pe"), rooms.filter(r => r.fl === floor).map(r => {
     const occ = r.status === "occupied";
-    const b = occ ? bookings.find(bk => bk.id === r.bookingId) : null;
+    // Find the stay by its id, or — if the id link is broken — by the
+    // active booking sitting in this room.
+    const b = occ ? bookings.find(bk => bk.id === r.bookingId && bk.status === "active") || bookings.find(bk => bk.status === "active" && bk.roomId === r.id) || bookings.find(bk => bk.id === r.bookingId) : null;
+    // "Stuck" room: marked occupied but no guest is in it (e.g. one device
+    // saved an old copy of the room list over a checkout done on another).
+    const stuck = occ && (!b || b.status !== "active");
     const meta = TYPE_META[r.type] || TYPE_META["Standard"];
     const thumb = r.photos && r.photos[0];
     return /*#__PURE__*/React.createElement("div", {
@@ -5711,7 +5822,9 @@ function RoomsView({
       }
     }, /*#__PURE__*/React.createElement("div", {
       onClick: () => {
-        if (occ && b) setModal({
+        if (stuck) {
+          if (onReleaseRoom) onReleaseRoom(r);
+        } else if (occ && b) setModal({
           type: "booking",
           b,
           room: r
@@ -5772,13 +5885,13 @@ function RoomsView({
       }
     }, meta.emoji, " ", r.name || `Room ${r.id}`), /*#__PURE__*/React.createElement("span", {
       className: `badge ${occ ? "br" : "bg"}`
-    }, occ ? "Occupied" : "Available")), /*#__PURE__*/React.createElement("div", {
+    }, stuck ? "⚠️ Stuck" : occ ? "Occupied" : "Available")), /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 12,
         color: "var(--muted)",
         marginTop: 3
       }
-    }, r.type, " · ", occ && b ? `${b.name} · Out: ${fmtDate(b.checkOut)}` : `₹${r.rate}/night`))), hasFeature("room_edit") && /*#__PURE__*/React.createElement("button", {
+    }, r.type, " · ", stuck ? "Koi guest nahi — tap karke room free karo" : occ && b ? `${b.name} · Out: ${fmtDate(b.checkOut)}` : `₹${r.rate}/night`))), hasFeature("room_edit") && /*#__PURE__*/React.createElement("button", {
       onClick: e => {
         e.stopPropagation();
         setModal({
@@ -10463,8 +10576,7 @@ function StorageSettingsView({
   // comma/quote/newline wrapped. Leading "=+-@" are prefixed with a quote
   // so a guest name like "=cmd" can't become a spreadsheet formula.
   const csvCell = v => {
-    let t = v === null || v === undefined ? "" : String(v);
-    if (/^[=+\-@]/.test(t)) t = "'" + t;
+    const t = csvSafeText(v);
     return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
   };
   const csvDownload = (rows, filename) => {
@@ -11074,8 +11186,8 @@ function bookingsToCSV(bookings, rooms) {
     "Total Occupants", "Family Members (Name : Relation : Masked ID)"
   ];
   const esc = (v) => {
-    const s = String(v == null ? "" : v);
-    if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    const s = csvSafeText(v);
+    if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
       return '"' + s.replace(/"/g, '""') + '"';
     }
     return s;
@@ -11172,7 +11284,7 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
       }
       setArchiveLoading(true);
       try {
-        const results = await Promise.all(toFetch.map(k => WS.get(k).catch(() => null)));
+        const results = await Promise.all(toFetch.map(k => WS.getArchiveMonth(k).catch(() => null)));
         toFetch.forEach((k, i) => { archiveCacheRef.current[k] = Array.isArray(results[i]) ? results[i] : []; });
         const merged = monthKeys.flatMap(k => archiveCacheRef.current[k] || []);
         if (!cancelled) setArchivedExtra(merged);
@@ -11822,6 +11934,7 @@ function PublicBookingPage({ bookingToken }) {
 function App() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState(null);
+  useEffect(() => { AUDIT_USER = user ? String(user.name || user.u || "") + " (" + String(user.role || "") + ")" : ""; }, [user]);
   const [changePwd, setChangePwd] = useState(false);
   const [permissions, setPermissions] = useState(DEFAULT_PERMISSIONS);
   const [licenseAlert, setLicenseAlert] = useState(null);
@@ -12155,9 +12268,24 @@ function App() {
         // Sequential (not Promise.all) — deliberately avoids ANY concurrent
         // Firestore operations at boot, which is what was triggering
         // internal SDK "Target ID already exists" errors.
-        const u = await WS.get("cu");
+        // SECURITY: a login session is NEVER restored from the "cu" document.
+        // It lives in the hotel's shared cloud space, so trusting it let a
+        // brand-new device (license key + phone only) open straight into
+        // whoever last edited their name there — usually the Owner — without
+        // a password. Every session now starts at the login screen (which is
+        // what already happened after a reload). Stale copies are cleared
+        // once per device.
+        try {
+          if (!localStorage.getItem("ab_cu_cleared_v1")) {
+            localStorage.removeItem("ab_cu");
+            const cuRef = WS._ref("cu");
+            if (cuRef) cuRef.set({ value: null, ts: Date.now() }, { merge: true }).catch(() => {});
+            localStorage.setItem("ab_cu_cleared_v1", "1");
+          } else {
+            localStorage.removeItem("ab_cu");
+          }
+        } catch (e) {}
         const perms = await WS.get("permissions");
-        if (u) setUser(u);
         if (perms) setPermissions(perms);
         // NOTE: rooms/bookings instant-paint from localStorage now happens
         // in their useState lazy initializers (synchronous, runs before any
@@ -12485,18 +12613,35 @@ function App() {
   // migrated gradually across several ordinary check-in/checkout saves
   // instead of attempting one very large write the first time this runs.
   const ARCHIVE_BATCH_CAP = 300;
+  // SCALE FIX: a typical booking is ~3 KB in the cloud, so a 90-day live
+  // window crosses Firestore's 1 MiB per-document ceiling at about 15–20
+  // rooms — after which EVERY check-in/checkout silently failed to reach
+  // the cloud. The live window now shrinks automatically (90 → 1 day,
+  // checked-out stays only) until the live document is back under
+  // LIVE_SOFT_BYTES. Active stays are never archived.
+  const LIVE_SOFT_BYTES = 450000;
+  const ARCHIVE_PART_BYTES = 700000;
+  const cloudBytes = arr => { try { return JSON.stringify(sanitizeBookingsForCloud(arr)).length; } catch (e) { return 0; } };
   const archiveOldBookings = async (allBookings) => {
-    const cutoff = Date.now() - ARCHIVE_WINDOW_DAYS * 86400000;
-    const eligible = [];
-    const liveIndexByBookingId = new Map();
-    allBookings.forEach((b, idx) => {
-      liveIndexByBookingId.set(b.id, idx);
-      if (b.status === "checkedout" && b.checkOutActual) {
-        const t = new Date(b.checkOutActual + "T12:00:00").getTime();
-        if (!isNaN(t) && t < cutoff) eligible.push(b);
+    const outTime = b => (b.status === "checkedout" && b.checkOutActual) ? new Date(b.checkOutActual + "T12:00:00").getTime() : NaN;
+    let windowDays = ARCHIVE_WINDOW_DAYS;
+    if (cloudBytes(allBookings) > LIVE_SOFT_BYTES) {
+      for (const w of [60, 45, 30, 14, 7, 3, 1]) {
+        windowDays = w;
+        const cut = Date.now() - w * 86400000;
+        const remain = allBookings.filter(b => { const t = outTime(b); return isNaN(t) || t >= cut; });
+        if (cloudBytes(remain) <= LIVE_SOFT_BYTES) break;
       }
+    }
+    const cutoff = Date.now() - windowDays * 86400000;
+    const eligible = [];
+    allBookings.forEach(b => {
+      const t = outTime(b);
+      if (!isNaN(t) && t < cutoff) eligible.push(b);
     });
-    if (eligible.length === 0) return { live: allBookings, archivedCount: 0 };
+    // Oldest first, so a capped batch always moves the oldest records.
+    eligible.sort((a, b) => outTime(a) - outTime(b));
+    if (eligible.length === 0) return { live: allBookings, archivedCount: 0, archivedIds: new Set() };
 
     const batch = eligible.slice(0, ARCHIVE_BATCH_CAP);
     const byMonth = new Map(); // monthKey -> [bookings]
@@ -12510,9 +12655,17 @@ function App() {
     const successfullyArchivedIds = new Set();
     for (const [monthKey, monthBookings] of byMonth) {
       try {
-        const existing = await WS.get(monthKey, true); // force-server: never trust a stale local cache for a merge
-        const existingArr = Array.isArray(existing) ? existing : [];
-        const existingIds = new Set(existingArr.map(x => x.id));
+        // Read the month's base document and every part (force-server:
+        // never trust a stale local cache for a merge).
+        const base = await WS.getRawServer(monthKey);
+        const partCount = (base && Number(base.parts)) || 1;
+        const partKey = i => i === 1 ? monthKey : monthKey + "_p" + i;
+        const parts = [Array.isArray(base?.value) ? base.value : []];
+        for (let i = 2; i <= partCount; i++) {
+          const d = await WS.getRawServer(partKey(i));
+          parts.push(Array.isArray(d?.value) ? d.value : []);
+        }
+        const existingIds = new Set(parts.flat().map(x => x.id));
         // Only append records not already present in that month's
         // archive — safe to re-run this whole function against a month
         // that was partially archived before (e.g. a previous attempt
@@ -12524,10 +12677,28 @@ function App() {
           monthBookings.forEach(b => successfullyArchivedIds.add(b.id));
           continue;
         }
-        const merged = [...existingArr, ...sanitizeBookingsForCloud(toAppend)];
-        const ref = WS._ref(monthKey);
-        if (!ref) continue; // no Firestore connection — leave these in live, retry later
-        await ref.set({ value: merged, ts: Date.now() }, { merge: true });
+        if (!WS._ref(monthKey)) continue; // no Firestore connection — leave these in live, retry later
+        // Append into the last part; open a new part whenever one would
+        // pass ARCHIVE_PART_BYTES (each Firestore document caps at 1 MiB).
+        const clean = sanitizeBookingsForCloud(toAppend);
+        let idx = parts.length - 1;
+        const dirty = new Set();
+        for (const rec of clean) {
+          const recBytes = JSON.stringify(rec).length + 1;
+          if (parts[idx].length && JSON.stringify(parts[idx]).length + recBytes > ARCHIVE_PART_BYTES) { parts.push([]); idx = parts.length - 1; }
+          parts[idx] = [...parts[idx], rec];
+          dirty.add(idx);
+        }
+        // Write the parts first; only then record the new part count on
+        // the base document, so a reader never looks for a part that is
+        // not there yet.
+        for (const i of [...dirty].sort((a, b) => b - a)) {
+          if (i === 0) continue;
+          await WS._ref(partKey(i + 1)).set({ value: parts[i], ts: Date.now() }, { merge: true });
+        }
+        const baseUpdate = { ts: Date.now(), parts: parts.length };
+        if (dirty.has(0)) baseUpdate.value = parts[0];
+        await WS._ref(monthKey).set(baseUpdate, { merge: true });
         // Only mark as archived AFTER the write above has resolved
         // successfully — this is the exact line that guarantees no
         // booking is ever removed from "live" without first being
@@ -12541,9 +12712,9 @@ function App() {
       }
     }
 
-    if (successfullyArchivedIds.size === 0) return { live: allBookings, archivedCount: 0 };
+    if (successfullyArchivedIds.size === 0) return { live: allBookings, archivedCount: 0, archivedIds: new Set() };
     const live = allBookings.filter(b => !successfullyArchivedIds.has(b.id));
-    return { live, archivedCount: successfullyArchivedIds.size };
+    return { live, archivedCount: successfullyArchivedIds.size, archivedIds: successfullyArchivedIds };
   };
 
   // Root-cause fix for localStorage quota exhaustion: every checked-in
@@ -12579,6 +12750,18 @@ function App() {
     await WS.set("rooms", r);
     setSyncing(false);
   };
+  // Change ONE room's status without overwriting the rest of the list from
+  // this device's possibly-stale copy (another device may have just
+  // checked a guest into a different room).
+  const patchRoom = async (roomId, patch) => {
+    const apply = arr => arr.map(r => r.id === roomId ? { ...r, ...patch } : r);
+    setSyncing(true);
+    const res = await WS.txArray("rooms", srv => apply(srv.length ? srv : rooms));
+    if (res === null) { await saveRooms(apply(rooms)); return; }
+    setRooms(res);
+    try { localStorage.setItem("ab_rooms", JSON.stringify(res)); } catch (e) {}
+    setSyncing(false);
+  };
   const saveBk = async rawB => {
     // Auto-archive: moves any checked-out booking older than the live
     // window into its monthly archive document — see archiveOldBookings
@@ -12588,7 +12771,7 @@ function App() {
     // calls (there's usually nothing old enough to move); the extra
     // archive read/write only happens on the rare save where there
     // actually is something to relocate.
-    const { live: b, archivedCount } = await archiveOldBookings(rawB);
+    const { live: b, archivedCount, archivedIds } = await archiveOldBookings(rawB);
     if (archivedCount > 0) {
       AuditLog.add("BOOKINGS_ARCHIVED", archivedCount + " record(s) moved to monthly archive");
     }
@@ -12642,8 +12825,41 @@ function App() {
           ), 500);
         }
       }
-      if (ref) await ref.set({ value: cloudPayload, ts: Date.now() }, { merge: true });
-    } catch (e) { console.warn("FB set bookings:", e.message); }
+      // MULTI-DEVICE FIX: merge into the server copy inside a transaction
+      // instead of overwriting it — bookings another device added (or a
+      // checkout it did) since this device last synced are kept. Records
+      // this save deliberately moved to the archive are not brought back.
+      const merged = await WS.txArray("bookings", srv => mergeBookingLists(cloudPayload, srv, archivedIds || new Set()));
+      if (merged === null) {
+        if (ref) await ref.set({ value: cloudPayload, ts: Date.now() }, { merge: true });
+      } else {
+        const have = new Set(b.map(x => x.id));
+        const extra = merged.filter(x => !have.has(x.id));
+        const changed = merged.filter(x => have.has(x.id) && x.status === "checkedout" && (b.find(y => y.id === x.id) || {}).status !== "checkedout");
+        if (extra.length || changed.length) {
+          setBookings(prev => {
+            const byId = new Map(prev.map(x => [x.id, x]));
+            changed.forEach(x => byId.set(x.id, { ...x, photoFront: byId.get(x.id)?.photoFront, photoBack: byId.get(x.id)?.photoBack, signature: byId.get(x.id)?.signature }));
+            const out = [...byId.values()];
+            extra.forEach(x => { if (!byId.has(x.id)) out.push(x); });
+            return out;
+          });
+        }
+      }
+      setSyncErr(false);
+    } catch (e) {
+      console.warn("FB set bookings:", e.message);
+      // Data is still safe on this device, but tell staff instead of
+      // failing silently.
+      setSyncErr(true);
+      try {
+        const k = "ab_bookingsSyncFailAlertAt";
+        if (Date.now() - Number(localStorage.getItem(k) || 0) > 6 * 3600 * 1000) {
+          localStorage.setItem(k, String(Date.now()));
+          setTimeout(() => alert("⚠️ Bookings cloud par save nahi ho payi (" + String(e.message || "").slice(0, 80) + ").\nData is device par safe hai. Internet check karo; problem rahe to BizzSathi support ko batao."), 300);
+        }
+      } catch (x) {}
+    }
     setSyncing(false);
     AuditLog.add('CHECKIN', b[b.length - 1]?.name || 'guest');
   };
@@ -12722,11 +12938,7 @@ function App() {
         console.warn("PhotoB vault:", e);
       }
     }
-    await saveRooms(rooms.map(r => r.id === form.roomId ? {
-      ...r,
-      status: "occupied",
-      bookingId: id
-    } : r));
+    await patchRoom(form.roomId, { status: "occupied", bookingId: id });
     if (_resId) nb.reservationId = _resId;
     await saveBk([...bookings, nb]);
     if (_resId) {
@@ -12814,6 +13026,26 @@ function App() {
     await saveBk(bookings.map(x => x.id === bid ? updated : x));
     AuditLog.add("ADVANCE_RECEIVED", b.name + " · Room " + b.roomId + " · ₹" + amount + " " + mode);
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: updated }));
+  };
+  // A room that shows "occupied" with no active guest in it. Before freeing
+  // it, re-read bookings from the SERVER (another device may have a guest
+  // this device has not received yet) — never free a room that is really
+  // in use.
+  const handleReleaseStuckRoom = async room => {
+    let fresh = null;
+    try { fresh = await WS.get("bookings", true); } catch (e) {}
+    const list = Array.isArray(fresh) ? fresh : bookings;
+    const live = list.find(bk => bk.status === "active" && (bk.id === room.bookingId || bk.roomId === room.id));
+    if (live) {
+      setModal({ type: "booking", b: live, room });
+      return;
+    }
+    if (!Array.isArray(fresh) && !window.confirm("Internet/cloud se bookings check nahi ho payi. Phir bhi Room " + room.id + " free karna hai?")) return;
+    if (!window.confirm("Room " + room.id + " 'occupied' dikh raha hai lekin isme koi active guest nahi hai.\n\nRoom ko FREE (available) kar dein?")) return;
+    // Only this one room changes (atomic, same as check-in/checkout).
+    await patchRoom(room.id, { status: "empty", bookingId: null });
+    AuditLog.add("ROOM_RELEASED_STUCK", "Room " + room.id + " (bookingId " + (room.bookingId || "-") + ") freed — no active booking found");
+    alert("✅ Room " + room.id + " ab free hai.");
   };
   const handleAddCharge = async (bid, items) => {
     // Restaurant counter and reception may add orders to the same room
@@ -12967,11 +13199,7 @@ function App() {
         gstMode: G.gstMode
       }
     };
-    await saveRooms(rooms.map(r => r.id === b.roomId ? {
-      ...r,
-      status: "empty",
-      bookingId: null
-    } : r));
+    await patchRoom(b.roomId, { status: "empty", bookingId: null });
     await saveBk(bookings.map(x => x.id === bid ? ub : x));
     openInvoice(ub, room);
     setModal(null);
@@ -13236,7 +13464,8 @@ function App() {
     bookings: bookings,
     setModal: setModal,
     setView: setView,
-    setCheckInRoom: setCIR
+    setCheckInRoom: setCIR,
+    onReleaseRoom: handleReleaseStuckRoom
   }), view === "checkin" && /*#__PURE__*/React.createElement(CheckInView, {
     key: resPrefill?.id || "walkin",
     rooms: rooms,
@@ -13377,7 +13606,6 @@ function App() {
           } catch (e) { console.warn("Update staff name:", e.message); }
           const nu = { ...user, name: newName };
           setUser(nu);
-          WS.set("cu", nu).catch(() => {});
         }
       }
       const { _selfName, ...rest } = p;

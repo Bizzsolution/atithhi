@@ -2976,6 +2976,7 @@ async function billingUseVault() {
       <button class="dm-b pri" onclick="dmExportFull()">⬇️ Full Backup (JSON)</button>
       <button class="dm-b grn" onclick="dmExportRegister()">📊 Guest Register (CSV)</button>
       <button class="dm-b" onclick="document.getElementById('dmRestoreFile').click()">♻️ Restore from Backup</button>
+      <button class="dm-b grn" onclick="dmOpenAutoBackups()" title="Server ke roz ke automatic backups (pichhle 14 din)">🛟 Auto Backups</button>
       <button class="dm-b amb" id="dmUndoBtn" onclick="dmUndo()" disabled>↩️ Undo</button>
       <button class="dm-b red" style="margin-left:auto" onclick="dmOpenDeleteAll()">🗑️ Delete ALL Data</button>
       <input type="file" id="dmRestoreFile" accept="application/json,.json" style="display:none" onchange="dmRestoreFromFile(this)"/>
@@ -3035,7 +3036,7 @@ const DM_BIG_DOC_BYTES = 700000;       // warn when a doc is approaching the lim
 const DM_ID_RE = /^[A-Za-z0-9_-]{1,120}$/; // safe Firestore doc id (no '/', no dots-only)
 const DM_PAGE = 100;
 // Documents whose loss would really hurt — deleting these needs a typed "DELETE".
-const DM_CRITICAL = /^(bookings|bookings_archive_\d{4}_\d{2}|rooms|users|profile|creditNotes)$/;
+const DM_CRITICAL = /^(bookings|bookings_archive_\d{4}_\d{2}(_p\d+)?|rooms|users|profile|creditNotes|reservations)$/;
 // Docs the hotel app reacts to LIVE (onSnapshot) vs. only on next app open.
 const DM_LIVE = /^(rooms|bookings|profile|permissions)$/;
 
@@ -3085,8 +3086,9 @@ function dmLabel(id) {
     authVersion: "Secure sign-in status (device ne verified login kiya)"
   };
   if (fixed[id]) return fixed[id];
-  let m = id.match(/^bookings_archive_(\d{4})_(\d{2})$/);
-  if (m) return "Archived bookings — " + (DM_MONTHS[+m[2] - 1] || m[2]) + " " + m[1];
+  let m = id.match(/^bookings_archive_(\d{4})_(\d{2})(?:_p(\d+))?$/);
+  if (m) return "Archived bookings — " + (DM_MONTHS[+m[2] - 1] || m[2]) + " " + m[1] + (m[3] ? " (part " + m[3] + ")" : "");
+  if (id === "reservations") return "Future bookings (advance ke saath)";
   m = id.match(/^(inv|cn|dn)Counter_(\d{2}-\d{2})$/i);
   if (m) return ({ inv: "Invoice", cn: "Credit note", dn: "Debit note" }[m[1].toLowerCase()]) + " number counter — FY 20" + m[2];
   return "Other document";
@@ -3643,6 +3645,84 @@ async function dmDeleteAllRun() {
 }
 
 // ── restore from a backup file made by this manager ─────────────
+// ── 🛟 AUTO BACKUPS — written daily by netlify/functions/backup.mjs into
+// backups/{KEY}/snaps/{YYYY-MM-DD}__{doc}. Admin can read (rules), nobody
+// can write from a browser. Restore copies a snapshot back over the live
+// hotel document, after downloading the current data first.
+async function dmOpenAutoBackups() {
+  if (DM.busy || !DM.key) return;
+  dmSetBusy("Auto backups dhoondh rahe hain...");
+  try {
+    const snap = await window._db.collection("backups").doc(DM.key).collection("snaps").get();
+    const byDay = {};
+    snap.docs.forEach(d => {
+      const id = d.id, day = id.slice(0, 10), src = id.slice(12);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || id.slice(10, 12) !== "__" || !DM_ID_RE.test(src)) return;
+      (byDay[day] = byDay[day] || []).push({ id, src, data: d.data() });
+    });
+    DM.auto = byDay;
+    dmSetBusy("");
+    dmRenderAutoBackups();
+  } catch (e) {
+    dmSetBusy("");
+    dmMsg("❌ Auto backups nahi khul paye: " + dmErrText(e) + " — kya firestore.rules ka naya 'backups' block publish hua hai, aur Netlify par backup function chal raha hai?", "bad");
+  }
+}
+function dmAutoClean(data) { const o = Object.assign({}, data); delete o._backupAt; delete o._srcDoc; return o; }
+function dmRenderAutoBackups() {
+  DM.cur = -2;
+  const days = Object.keys(DM.auto || {}).sort().reverse();
+  let h = `<div class="dm-note">🛟 <b>Automatic server backups</b> — roz ek baar, pichhle ~14 din. Inhe koi hotel device badal ya mita nahi sakta.<br>Restore karne se pehle abhi ka data apne aap download hoga.</div>
+    <button class="dm-b" onclick="dmBackToList()" style="margin-bottom:10px">← Documents par wapas</button>`;
+  if (!days.length) h += `<div class="dm-note warn">Is hotel ka abhi koi auto backup nahi mila. (Backup function deploy hone ke baad 24 ghante ke andar pehla backup banega.)</div>`;
+  days.forEach(day => {
+    const items = DM.auto[day].sort((a, b) => a.src.localeCompare(b.src));
+    h += `<div class="dm-sec">${escHtml(day)} <button class="dm-b sm amb" style="margin-left:8px" onclick="dmAutoRestoreDay('${day}')">♻️ Poora din restore</button></div>`;
+    h += items.map((it, i) => {
+      const v = it.data && it.data.value;
+      const what = Array.isArray(v) ? `<b>${v.length}</b> records` : v === null || v === undefined ? "khaali" : "data";
+      return `<div class="dm-row"><div style="min-width:0;flex:1">
+        <div class="dm-id">${escHtml(it.src)}</div><div class="dm-lbl">${escHtml(dmLabel(it.src))}</div>
+        <div class="dm-meta">${what} · ${dmFmtBytes(dmBytes(it.data))} · Backup: <b>${escHtml(dmFmtTime(Number(it.data && it.data._backupAt) || 0))}</b></div></div>
+        <div class="dm-acts">
+          <button class="dm-b sm" onclick="dmAutoDownload('${day}',${i})">⬇️ JSON</button>
+          <button class="dm-b sm amb" onclick="dmAutoRestore('${day}',${i})">♻️ Restore</button>
+        </div></div>`;
+    }).join("");
+  });
+  document.getElementById("dmBody").innerHTML = h;
+}
+function dmAutoDownload(day, i) {
+  const it = (DM.auto[day] || [])[i]; if (!it) return;
+  dmDownload("atithibook-" + dmSafeName(DM.key) + "-autobackup-" + day + "-" + dmSafeName(it.src) + ".json", JSON.stringify(dmAutoClean(it.data), null, 2));
+}
+async function dmAutoRestoreItems(items, label) {
+  if (DM.busy || !items.length) return;
+  const t = prompt("♻️ " + label + "\n" + items.map(x => "• " + x.src).join("\n") + "\n\nYe documents backup wale version se REPLACE ho jaayenge (us din ke baad ke changes hat jaayenge).\nPehle abhi ke data ka backup download hoga.\n\nConfirm karne ke liye is hotel ki license key type karo:");
+  if (t === null) return;
+  if (t.trim().toUpperCase() !== DM.key) { dmMsg("Restore cancel — license key match nahi hui.", "inf"); return; }
+  if (DM.docs.length) dmDownload("atithibook-" + dmSafeName(DM.key) + "-BEFORE-RESTORE-backup-" + dmToday() + ".json", JSON.stringify(dmBackupObject(), null, 2));
+  let done = 0;
+  try {
+    for (const it of items) {
+      dmSetBusy("Restore ho raha hai... " + (done + 1) + "/" + items.length + " (" + it.src + ")");
+      await dmRef(it.src).set(Object.assign(dmAutoClean(it.data), { ts: Date.now() }));
+      done++;
+    }
+    DM.undo = [];
+    dmSetBusy("");
+    dmMsg("♻️ " + done + " document(s) auto-backup se restore ho gaye. Hotel app me turant dikhega (rooms/bookings) ya agli baar khulne par.", "ok");
+    if (typeof logAudit === "function") { try { logAudit("AUTO_BACKUP_RESTORE", DM.key + " · " + label); } catch (e) {} }
+  } catch (e) {
+    dmSetBusy("");
+    dmMsg("❌ Restore " + done + "/" + items.length + " pe ruk gaya: " + dmErrText(e), "bad");
+  }
+  DM.cur = -1;
+  await dmRefresh();
+}
+function dmAutoRestore(day, i) { const it = (DM.auto[day] || [])[i]; if (it) dmAutoRestoreItems([it], it.src + " ← " + day); }
+function dmAutoRestoreDay(day) { dmAutoRestoreItems((DM.auto[day] || []).slice(), "Poora din " + day); }
+
 async function dmRestoreFromFile(input) {
   const file = input.files && input.files[0];
   input.value = "";

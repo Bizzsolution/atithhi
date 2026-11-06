@@ -43,7 +43,7 @@ check(
   mountEffectSrc.includes("requests").onSnapshot
 );
 
-const reactiveEffectMatch = src.match(/useEffect\(\(\) => \{\s*const tok = \(profile\?\.publicBookingToken[\s\S]*?\n {2}\}, \[profile\?\.publicBookingToken\]\);/);
+const reactiveEffectMatch = src.match(/useEffect\(\(\) => \{\s*const tok = \(profile\?\.publicBookingToken[\s\S]*?\n {2}\}, \[profile\?\.publicBookingToken(?:, authUid)?\]\);/); // AUDIT-2: also re-subscribes on auth change
 check(
   "booking-requests subscription now lives in its own effect keyed on profile?.publicBookingToken (re-subscribes the moment the token becomes known, on ANY device)",
   !!reactiveEffectMatch
