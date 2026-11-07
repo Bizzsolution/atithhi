@@ -3550,11 +3550,15 @@ function buildCreditNotePDFBlob(note, hotelProfile) {
 
 // ── GLOBAL CSS ─────────────────────────────────────────────────
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@300;400;600;700&family=Hind:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@300;400;600;700&family=Hind:wght@300;400;500;600&family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&display=swap');
 :root{--navy:#1e3a5f;--navy2:#152c49;--gold:#d97706;--gold2:#b45309;--cream:#fdf8f0;--card:#fff;
 --green:#16a34a;--gbg:#dcfce7;--red:#dc2626;--rbg:#fee2e2;--blue:#0369a1;--bbg:#e0f2fe;
 --purple:#7c3aed;--pbg:#f3e8ff;--muted:#6b7280;--border:#e5e0d8;--r:14px;--sh:0 2px 12px rgba(30,58,95,.1);}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+@media(max-width:899px){.ab-login-hero{display:none!important;}}
+.ab-login label + div:focus-within{border-color:#f2c46d!important;box-shadow:0 0 0 3px rgba(242,196,109,.18);}
+.ab-login input::placeholder{color:#6f7f98;}
+.ab-login button:focus-visible{outline:2px solid #e0a43a;outline-offset:2px;}
 body{font-family:'Hind',sans-serif;background:var(--cream);color:var(--navy);}
 h1,h2,h3,h4{font-family:'Josefin Sans',sans-serif;}
 input:not([type=file]):not([type=date]),select,textarea{font-family:'Hind',sans-serif;font-size:15px;outline:none;border:1.5px solid var(--border);border-radius:10px;padding:11px 14px;background:#fff;color:var(--navy);width:100%;transition:border-color .2s;}
@@ -4433,6 +4437,7 @@ function LoginScreen({
   const [err, se] = useState("");
   const [ld, sl] = useState(false);
   const [showForgot, setForgot] = useState(false);
+  const [showPw, setShowPw] = useState(false);
   if (showForgot) return /*#__PURE__*/React.createElement(ForgotPasswordScreen, {
     onBack: () => setForgot(false)
   });
@@ -4512,139 +4517,68 @@ function LoginScreen({
       sl(false);
     }
   };
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      minHeight: "100vh",
-      background: "linear-gradient(145deg,#152c49,#1e3a5f,#2a4a7a)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 24
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "absolute",
-      inset: 0,
-      opacity: .05,
-      backgroundImage: "repeating-linear-gradient(45deg,#fff 0,#fff 1px,transparent 0,transparent 50%)",
-      backgroundSize: "20px 20px"
-    }
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "card fu",
-    style: {
-      width: "100%",
-      maxWidth: 380,
-      padding: "36px 28px",
-      position: "relative"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "center",
-      marginBottom: 32
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 54,
-      marginBottom: 8
-    }
-  }, "🏨"), /*#__PURE__*/React.createElement("h1", {
-    style: {
-      fontSize: 28,
-      color: "var(--navy)",
-      letterSpacing: 2
-    }
-  }, "ATITHIBOOK"), /*#__PURE__*/React.createElement("p", {
-    style: {
-      color: "var(--gold)",
-      fontStyle: "italic",
-      fontSize: 14,
-      marginTop: 4
-    }
-  }, CURRENT_PROFILE.hotelTagline || HOTEL.tagline), /*#__PURE__*/React.createElement("p", {
-    style: {
-      color: "var(--muted)",
-      fontSize: 12,
-      marginTop: 6
-    }
-  }, CURRENT_PROFILE.hotelName || HOTEL.name, " · Staff Portal")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      height: 1,
-      background: "linear-gradient(90deg,transparent,var(--border),transparent)",
-      marginBottom: 24
-    }
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 14
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
-    style: {
-      fontSize: 12,
-      fontWeight: 600,
-      color: "var(--muted)",
-      display: "block",
-      marginBottom: 6
-    }
-  }, "USERNAME"), /*#__PURE__*/React.createElement("input", {
-    placeholder: "Enter username",
-    value: u,
-    onChange: e => su(e.target.value),
-    onKeyDown: e => e.key === "Enter" && go()
-  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
-    style: {
-      fontSize: 12,
-      fontWeight: 600,
-      color: "var(--muted)",
-      display: "block",
-      marginBottom: 6
-    }
-  }, "PASSWORD"), /*#__PURE__*/React.createElement("input", {
-    type: "password",
-    placeholder: "Enter password",
-    value: p,
-    onChange: e => sp(e.target.value),
-    onKeyDown: e => e.key === "Enter" && go()
-  })), err && /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: "var(--rbg)",
-      color: "var(--red)",
-      padding: "10px 14px",
-      borderRadius: 10,
-      fontSize: 13
-    }
-  }, "⚠️ ", err), /*#__PURE__*/React.createElement("button", {
-    className: "btn-p",
-    onClick: go,
-    disabled: ld
-  }, ld ? "⏳ Verifying..." : "Login to Dashboard →"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "center"
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setForgot(true),
-    style: {
-      background: "none",
-      border: "none",
-      color: "var(--gold)",
-      fontSize: 12,
-      cursor: "pointer",
-      textDecoration: "underline"
-    }
-  }, "🔑 Forgot Password?"))), !(() => { try { return localStorage.getItem("ab_users"); } catch (e) { return null; } })() && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 20,
-      padding: "12px 16px",
-      background: "var(--cream)",
-      borderRadius: 10,
-      fontSize: 12,
-      color: "var(--muted)"
-    }
-  }, /*#__PURE__*/React.createElement("b", {
-    style: {
-      color: "var(--navy)"
-    }
-  }, "Demo:"), " owner / owner123 \xA0|\xA0 admin / admin123 \xA0|\xA0 front / front123")));
+  // ── Option A look (navy + gold). Logic above is unchanged. ──────────
+  const _h = React.createElement;
+  const hotelName = CURRENT_PROFILE.hotelName || HOTEL.name;
+  const initials = String(hotelName || "AB").trim().split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase();
+  const lab = { fontSize: 12, fontWeight: 600, letterSpacing: 1, color: "#a9b7cc", display: "block", marginBottom: 7 };
+  const box = { display: "flex", alignItems: "center", gap: 10, background: "#0b1526", border: "1px solid #2a3b58", borderRadius: 12, padding: "0 6px 0 14px" };
+  const inp = { flex: 1, minWidth: 0, height: 48, background: "transparent", border: "none", outline: "none", boxShadow: "none", color: "#ffffff", fontSize: 15, fontWeight: 500, padding: 0, margin: 0, width: "auto" };
+  const ico = (d) => _h("svg", { width: 18, height: 18, viewBox: "0 0 24 24", fill: "none", stroke: "#a9b7cc", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true", style: { flexShrink: 0 } }, _h("path", { d }));
+  const feat = (d, t, s) => _h("div", { style: { background: "rgba(11,21,38,.82)", border: "1px solid rgba(242,196,109,.18)", borderRadius: 16, padding: 16, display: "flex", flexDirection: "column", gap: 8 } },
+    _h("svg", { width: 22, height: 22, viewBox: "0 0 24 24", fill: "none", stroke: "#f2c46d", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, _h("path", { d })),
+    _h("div", { style: { fontSize: 14, fontWeight: 700, color: "#fff" } }, t),
+    _h("div", { style: { fontSize: 12.5, lineHeight: 1.5, color: "#a9b7cc" } }, s));
+  return _h("div", { className: "ab-login", style: { minHeight: "100vh", background: "#0b1526", color: "#e8edf5", display: "flex", flexDirection: "column", fontFamily: "'Hind',system-ui,sans-serif" } },
+    _h("header", { style: { display: "flex", alignItems: "center", gap: 12, padding: "16px clamp(16px,4vw,48px)", borderBottom: "1px solid rgba(242,196,109,.14)" } },
+      _h("div", { style: { width: 40, height: 40, borderRadius: 10, border: "1px solid rgba(242,196,109,.5)", background: "#111f38", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 } },
+        _h("svg", { width: 22, height: 22, viewBox: "0 0 24 24", fill: "none", stroke: "#f2c46d", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, _h("path", { d: "M3 21h18M5 21V10l7-5 7 5v11M9 21v-6h6v6M12 5V3" }))),
+      _h("div", null,
+        _h("div", { style: { fontFamily: "'Fraunces',Georgia,serif", fontSize: 20, fontWeight: 600, color: "#fff", letterSpacing: .5 } }, "AtithiBook"),
+        _h("div", { style: { fontSize: 11, letterSpacing: 1.6, textTransform: "uppercase", color: "#a9b7cc" } }, "Staff Portal"))),
+    _h("main", { style: { flex: 1, display: "flex", flexWrap: "wrap", gap: 28, padding: "clamp(16px,4vw,48px)", alignItems: "center", justifyContent: "center", boxSizing: "border-box" } },
+      _h("section", { className: "ab-login-hero", "aria-label": "AtithiBook", style: { flex: "999 1 480px", minWidth: 0, position: "relative", overflow: "hidden", borderRadius: 24, border: "1px solid rgba(242,196,109,.16)", background: "#0f1d34", padding: "clamp(24px,4vw,52px)", display: "flex", flexDirection: "column", justifyContent: "space-between", gap: 36, minHeight: 520, boxSizing: "border-box" } },
+        _h("svg", { viewBox: "0 0 600 400", preserveAspectRatio: "xMidYMax slice", "aria-hidden": "true", style: { position: "absolute", inset: 0, width: "100%", height: "100%", opacity: .18 } },
+          _h("g", { fill: "none", stroke: "#f2c46d", strokeWidth: 1 },
+            _h("path", { d: "M0 400V250h600v150" }),
+            _h("path", { d: "M40 400V300a30 30 0 0 1 60 0v100M130 400V300a30 30 0 0 1 60 0v100M220 400V300a30 30 0 0 1 60 0v100M310 400V300a30 30 0 0 1 60 0v100M400 400V300a30 30 0 0 1 60 0v100M490 400V300a30 30 0 0 1 60 0v100" }),
+            _h("path", { d: "M20 250l280-120 280 120M60 233l240-103 240 103M300 130V90M285 90h30M0 260h600M0 268h600" }))),
+        _h("div", { style: { position: "relative", display: "flex", flexDirection: "column", gap: 18, maxWidth: 600 } },
+          _h("div", { style: { alignSelf: "flex-start", padding: "7px 14px", borderRadius: 999, background: "rgba(242,196,109,.12)", border: "1px solid rgba(242,196,109,.35)", color: "#f2c46d", fontSize: 12, fontWeight: 600, letterSpacing: 1.2, textTransform: "uppercase" } }, "Front desk se hisaab tak"),
+          _h("h2", { style: { margin: 0, fontFamily: "'Fraunces',Georgia,serif", fontWeight: 500, fontSize: "clamp(32px,4.2vw,56px)", lineHeight: 1.08, color: "#fff" } }, "Aapka poora hotel, ", _h("em", { style: { color: "#f2c46d" } }, "ek hi screen par.")),
+          _h("p", { style: { margin: 0, fontSize: 17, lineHeight: 1.6, color: "#c3cee0", maxWidth: 520 } }, "Check-in, GST billing, police register, future bookings aur restaurant — sab ek app mein.")),
+        _h("div", { style: { position: "relative", display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14 } },
+          feat("M3 7V4h3M18 4h3v3M21 17v3h-3M6 20H3v-3M7 8h3v3H7zM14 8h3v3h-3zM7 14h3v3H7z", "Aadhaar QR check-in", "Scan karo, details apne aap bhar jaati hain"),
+          feat("M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6M9 16h3", "GST invoice", "Slab-wise GST, PDF aur WhatsApp"),
+          feat("M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6zM9 12l2 2 4-4", "Police register", "Guest register hamesha taiyaar"))),
+      _h("section", { "aria-label": "Login", className: "fu", style: { flex: "1 1 340px", maxWidth: 460, width: "100%", boxSizing: "border-box", borderRadius: 24, border: "1px solid rgba(242,196,109,.22)", background: "#111f38", padding: "clamp(22px,3vw,34px)", display: "flex", flexDirection: "column", gap: 18 } },
+        _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 } },
+          _h("div", { style: { minWidth: 0 } },
+            _h("div", { style: { fontSize: 12, fontWeight: 700, letterSpacing: 1.6, textTransform: "uppercase", color: "#f2c46d" } }, "Welcome back"),
+            _h("h1", { style: { margin: "6px 0 0", fontFamily: "'Fraunces',Georgia,serif", fontWeight: 500, fontSize: 26, lineHeight: 1.2, color: "#fff", letterSpacing: 0 } }, hotelName),
+            _h("div", { style: { marginTop: 4, fontSize: 13, color: "#f2c46d", fontStyle: "italic" } }, CURRENT_PROFILE.hotelTagline || HOTEL.tagline)),
+          CURRENT_PROFILE.hotelLogo
+            ? _h("img", { src: CURRENT_PROFILE.hotelLogo, alt: "", style: { width: 52, height: 52, borderRadius: 14, objectFit: "cover", border: "1px solid rgba(242,196,109,.4)", flexShrink: 0 } })
+            : _h("div", { "aria-hidden": "true", style: { width: 52, height: 52, borderRadius: 14, background: "#0b1526", border: "1px solid rgba(242,196,109,.4)", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Fraunces',Georgia,serif", fontSize: 21, color: "#f2c46d", flexShrink: 0 } }, initials)),
+        _h("div", { style: { fontSize: 13.5, color: "#a9b7cc", marginTop: -6 } }, "Apna username aur password daalo"),
+        _h("div", null,
+          _h("label", { htmlFor: "ab-login-u", style: lab }, "USERNAME"),
+          _h("div", { style: box }, ico("M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"),
+            _h("input", { id: "ab-login-u", autoComplete: "username", autoCapitalize: "none", placeholder: "Enter username", value: u, onChange: e => su(e.target.value), onKeyDown: e => e.key === "Enter" && go(), style: inp }))),
+        _h("div", null,
+          _h("label", { htmlFor: "ab-login-p", style: lab }, "PASSWORD"),
+          _h("div", { style: box }, ico("M5 11h14v10H5zM8 11V8a4 4 0 0 1 8 0v3"),
+            _h("input", { id: "ab-login-p", type: showPw ? "text" : "password", autoComplete: "current-password", placeholder: "Enter password", value: p, onChange: e => sp(e.target.value), onKeyDown: e => e.key === "Enter" && go(), style: inp }),
+            _h("button", { type: "button", onClick: () => setShowPw(v => !v), "aria-label": showPw ? "Password chhupao" : "Password dikhao", style: { width: 44, height: 44, border: "none", background: "transparent", borderRadius: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0, flexShrink: 0 } },
+              _h("svg", { width: 18, height: 18, viewBox: "0 0 24 24", fill: "none", stroke: "#a9b7cc", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, _h("path", { d: showPw ? "M3 3l18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 5.2A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4.2M6.6 6.6C3.9 8.4 2 12 2 12s3.6 7 10 7a9.6 9.6 0 0 0 4.4-1" : "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" }))))),
+        err && _h("div", { role: "alert", style: { background: "rgba(220,38,38,.14)", border: "1px solid rgba(248,113,113,.45)", color: "#fecaca", padding: "10px 14px", borderRadius: 10, fontSize: 13 } }, "⚠️ ", err),
+        _h("button", { onClick: go, disabled: ld, style: { height: 52, border: "none", borderRadius: 12, background: "#f2c46d", color: "#1a1205", fontSize: 15.5, fontWeight: 700, letterSpacing: .3, cursor: ld ? "wait" : "pointer", opacity: ld ? .75 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 10, width: "100%", fontFamily: "inherit" } }, ld ? "⏳ Verifying..." : "Login to Dashboard →"),
+        _h("div", { style: { textAlign: "center" } },
+          _h("button", { onClick: () => setForgot(true), style: { background: "none", border: "none", color: "#f2c46d", fontSize: 13, fontWeight: 600, cursor: "pointer", padding: "6px 10px", fontFamily: "inherit" } }, "Forgot Password?")),
+        !(() => { try { return localStorage.getItem("ab_users"); } catch (e) { return null; } })() && _h("div", { style: { padding: "12px 14px", background: "#0b1526", border: "1px solid #22324d", borderRadius: 10, fontSize: 12, color: "#a9b7cc" } }, _h("b", { style: { color: "#f2c46d" } }, "Demo:"), " owner / owner123 \xA0|\xA0 admin / admin123 \xA0|\xA0 front / front123"),
+        _h("div", { style: { borderTop: "1px solid #22324d", paddingTop: 14, display: "flex", alignItems: "center", gap: 10, fontSize: 12.5, color: "#a9b7cc" } },
+          _h("span", { "aria-hidden": "true", style: { width: 8, height: 8, borderRadius: "50%", background: "#34d399", display: "inline-block", flexShrink: 0 } }),
+          "Device verified · 8 ghante baad apne aap logout"))));
 }
 function StatCard({
   emoji,
