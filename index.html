@@ -12762,6 +12762,46 @@ function App() {
     try { localStorage.setItem("ab_rooms", JSON.stringify(res)); } catch (e) {}
     setSyncing(false);
   };
+  // Room edit / add room: change ONLY that room's own details (number,
+  // floor, name, type, rate, photos) on the server's latest copy. It used to
+  // save this device's whole room list, which could undo a check-in or
+  // checkout another device had just done (a guest's room showing free, or
+  // an empty room stuck on "occupied"). Status/bookingId are never taken
+  // from the edit screen.
+  const saveRoomEdit = async (updated, originalId, isNew) => {
+    const EDITABLE = ["id", "fl", "name", "type", "rate", "photos"];
+    let problem = null;
+    const apply = arr => {
+      problem = null;
+      if (isNew) {
+        if (arr.some(r => r.id === updated.id)) { problem = "Room number '" + updated.id + "' already exists — doosra number chuno"; return arr; }
+        return [...arr, { ...updated, status: "empty", bookingId: null }];
+      }
+      const cur = arr.find(r => r.id === originalId);
+      if (!cur) { problem = "Room " + originalId + " nahi mila — shayad doosre device par badal diya gaya. Screen refresh karke dobara try karo."; return arr; }
+      if (updated.id !== originalId) {
+        if (arr.some(r => r.id === updated.id)) { problem = "Room number '" + updated.id + "' already exists — doosra number chuno"; return arr; }
+        if (cur.status === "occupied") { problem = "Room " + originalId + " mein abhi guest hai — number change nahi kar sakte. Pehle checkout karo."; return arr; }
+      }
+      const patch = {};
+      EDITABLE.forEach(k => { if (k in updated) patch[k] = updated[k]; });
+      return arr.map(r => r.id === originalId ? { ...r, ...patch } : r);
+    };
+    setSyncing(true);
+    const res = await WS.txArray("rooms", srv => apply(srv.length ? srv : rooms));
+    if (res === null) {
+      // Offline / no transaction possible: same edit on this device's copy.
+      const out = apply(rooms);
+      if (problem) { setSyncing(false); alert(problem); return false; }
+      await saveRooms(out);
+      return true;
+    }
+    setRooms(res);
+    try { localStorage.setItem("ab_rooms", JSON.stringify(res)); } catch (e) {}
+    setSyncing(false);
+    if (problem) { alert(problem); return false; }
+    return true;
+  };
   const saveBk = async rawB => {
     // Auto-archive: moves any checked-out booking older than the live
     // window into its monthly archive document — see archiveOldBookings
@@ -13578,12 +13618,8 @@ function App() {
     isNew: !!modal.isNew,
     existingIds: rooms.map(r => r.id),
     onSave: async (updated, originalId) => {
-      if (modal.isNew) {
-        await saveRooms([...rooms, updated]);
-      } else {
-        await saveRooms(rooms.map(r => r.id === originalId ? updated : r));
-      }
-      setModal(null);
+      const ok = await saveRoomEdit(updated, originalId, !!modal.isNew);
+      if (ok) setModal(null);
     },
     onClose: () => setModal(null)
   }), modal?.type === "editProfile" && /*#__PURE__*/React.createElement(ProfileEditModal, {
