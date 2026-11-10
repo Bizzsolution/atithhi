@@ -3285,7 +3285,7 @@ const buildInvoiceHTML = (b, roomObj) => {
     addr: CURRENT_PROFILE.hotelAddr || HOTEL.addr,
     phone: CURRENT_PROFILE.hotelPhone || HOTEL.phone,
     email: CURRENT_PROFILE.hotelEmail || HOTEL.email,
-    gstin: CURRENT_PROFILE.hotelGstin || HOTEL.gstin,
+    gstin: CURRENT_PROFILE.hotelGstin || "", // never the demo GSTIN — blank if hotel has none
     footerName: CURRENT_PROFILE.invoiceFooterName || CURRENT_PROFILE.hotelName || HOTEL.name
   };
   const shareText = "🏨 *" + (RH.name || "") + "*\nTax Invoice: " + (b.invoiceNo || b.id) +
