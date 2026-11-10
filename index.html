@@ -1218,13 +1218,29 @@ async function checkLicenseExpiry() {
 }
 // Synced with App's `enabledFeatures` state — lets top-level functions (and
 // components far from App) check feature gating without prop-drilling.
-// Empty array = feature list not loaded yet; treated as "everything allowed"
-// (fail-open) so a slow/failed Firestore fetch never locks a legitimate
-// hotel out of features they already had access to.
-let CURRENT_FEATURES = null; // null = not yet checked; array = authoritative list
+// Only features BizzSathi admin has switched ON for this hotel are shown.
+// The last list the server returned is remembered on the device
+// (ab_feat_cache, tied to the license key) so the app starts with the
+// right features even before / without the network check. A device that
+// has never received the list shows NO paid features until it does —
+// it used to show everything ("fail-open"), which let hidden features
+// appear on a new device or whenever the check failed.
+const FeatCache = {
+  _key() { try { return (localStorage.getItem("ab_license_key") || "").trim().toUpperCase(); } catch (e) { return ""; } },
+  load() {
+    try {
+      const c = JSON.parse(localStorage.getItem("ab_feat_cache") || "null");
+      const key = this._key();
+      return c && key && c.key === key && Array.isArray(c.features) ? c.features.filter(x => typeof x === "string") : null;
+    } catch (e) { return null; }
+  },
+  save(features) {
+    try { localStorage.setItem("ab_feat_cache", JSON.stringify({ key: this._key(), features: Array.isArray(features) ? features : [], at: Date.now() })); } catch (e) {}
+  }
+};
+let CURRENT_FEATURES = FeatCache.load() || []; // array = what this hotel may see
 function hasFeature(id) {
-  if (CURRENT_FEATURES === null) return true; // fail-open until first check completes
-  return CURRENT_FEATURES.includes(id);
+  return Array.isArray(CURRENT_FEATURES) && CURRENT_FEATURES.includes(id);
 }
 
 // ── STORAGE GUARD (2026-10 login fix) ───────────────────────────────
@@ -11872,7 +11888,7 @@ function App() {
   const [changePwd, setChangePwd] = useState(false);
   const [permissions, setPermissions] = useState(DEFAULT_PERMISSIONS);
   const [licenseAlert, setLicenseAlert] = useState(null);
-  const [enabledFeatures, setEnabledFeatures] = useState(null); // null = not checked yet (fail-open)
+  const [enabledFeatures, setEnabledFeatures] = useState(null); // re-render trigger; the list itself is CURRENT_FEATURES
   const [alertDismissed, setAlertDismissed] = useState(false);
 
   // Hide loading screen on mount
@@ -12241,6 +12257,7 @@ function App() {
         checkLicenseExpiry().then(status => {
           if (status) {
             CURRENT_FEATURES = status.features || [];
+            FeatCache.save(CURRENT_FEATURES);
             setEnabledFeatures(CURRENT_FEATURES);
           }
           if (status && (status.status === "expiring_soon" || status.status === "expired" || status.status === "revoked")) {
@@ -12254,11 +12271,17 @@ function App() {
   }, []);
   // Re-check once every 6 hours while the app stays open (covers hotels
   // that keep a tab open for days without reloading)
+  // Also re-checked whenever the app comes back to the screen (at most once
+  // every 5 minutes), so a feature BizzSathi admin switches off/on reaches
+  // the hotel without waiting hours.
   useEffect(() => {
-    const iv = setInterval(() => {
+    let last = Date.now();
+    const run = () => {
+      last = Date.now();
       checkLicenseExpiry().then(status => {
         if (status) {
           CURRENT_FEATURES = status.features || [];
+          FeatCache.save(CURRENT_FEATURES);
           setEnabledFeatures(CURRENT_FEATURES);
         }
         if (status && (status.status === "expiring_soon" || status.status === "expired" || status.status === "revoked")) {
@@ -12267,8 +12290,11 @@ function App() {
           setLicenseAlert(null);
         }
       }).catch(() => {});
-    }, 6 * 60 * 60 * 1000);
-    return () => clearInterval(iv);
+    };
+    const iv = setInterval(run, 6 * 60 * 60 * 1000);
+    const onVis = () => { if (document.visibilityState === "visible" && Date.now() - last >= 5 * 60 * 1000) run(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
   // Real-time Firestore listeners — sync across devices

@@ -1317,6 +1317,7 @@ function renderDashboard() {
           <button class="btn btn-copy" onclick="copyKey(${i})">📋</button>
           <button class="btn" style="background:#1e293b;color:#93c5fd" onclick="openEditHotelModal(${i})">✏️ Edit</button>
           <button class="btn" style="background:#3730a3;color:#c7d2fe" onclick="openFeatureControl(${i})">🎛️ Features</button>
+          <button class="btn" style="background:#1e3a5f;color:#bae6fd" onclick="openRoomManager(${i})">🛏️ Rooms</button>
           <button class="btn" style="background:#134e4a;color:#5eead4" onclick="openDataManager(${i})">🗂️ Data</button>
           <button class="btn" style="background:#3b1d0b;color:#fdba74" onclick="openMenuImport(${i})">🍽️ Menu</button>
           ${l.plan !== "TRIAL" ? `<button class="btn" style="background:#78350f;color:#fcd34d" onclick="generateInvoiceForLicense(${i})">🧾 Invoice</button>` : ''}
@@ -1494,6 +1495,171 @@ function applyPlanDefaultsToFeatures() {
 function openFeatureControlWithFeatures(i, features) {
   licenses[i].features = [...features];
   openFeatureControl(i);
+}
+
+// ── ROOM MANAGER (admin) — add / delete a hotel's rooms ─────────────
+// Works on hotels/{key}/data/rooms ({value:[...], ts}) inside a Firestore
+// transaction, so a check-in/checkout happening on the hotel's device at
+// the same moment is never overwritten. The hotel app listens to this
+// document live, so changes show on their devices straight away.
+// Safety: a room with a guest in it, an active booking or an upcoming
+// reservation can NOT be deleted from here.
+const RM_TYPES = ["Standard", "AC Std", "Deluxe", "Suite"];
+const RM = { key: null, hotel: "", rooms: [], bookings: [], reservations: [], busy: false };
+function rmRef(id) { return window._db.collection("hotels").doc(RM.key).collection("data").doc(id); }
+function rmMsg(text, type) {
+  const el = document.getElementById("rmMsg"); if (!el) return;
+  el.textContent = text || "";
+  el.style.display = text ? "block" : "none";
+  el.style.background = type === "bad" ? "#450a0a" : type === "ok" ? "#052e16" : "#1e293b";
+  el.style.color = type === "bad" ? "#fca5a5" : type === "ok" ? "#4ade80" : "#cbd5e1";
+}
+function rmEnsureModal() {
+  if (document.getElementById("rmModal")) return;
+  const d = document.createElement("div");
+  d.id = "rmModal";
+  d.style.cssText = "display:none;position:fixed;inset:0;background:rgba(2,6,23,.8);z-index:3000;align-items:flex-start;justify-content:center;padding:20px 12px;overflow-y:auto";
+  d.innerHTML = `
+    <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;width:100%;max-width:640px;padding:18px;color:#e2e8f0">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:6px">
+        <div><div id="rmTitle" style="font-size:16px;font-weight:700">🛏️ Rooms</div><div id="rmSub" style="font-size:11px;color:#94a3b8;margin-top:3px"></div></div>
+        <button class="btn" onclick="rmClose()" style="background:#1e293b;color:#e2e8f0">✕ Close</button>
+      </div>
+      <div id="rmMsg" style="display:none;padding:10px 12px;border-radius:8px;font-size:12.5px;margin:10px 0"></div>
+      <div style="background:#1e293b;border-radius:10px;padding:12px;margin:12px 0">
+        <div style="font-size:12px;font-weight:700;color:#fbbf24;margin-bottom:10px">➕ NAYA ROOM JODO</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px">
+          <label style="font-size:11px;color:#94a3b8">Room number *<input id="rmNewId" maxlength="10" placeholder="e.g. 106" style="margin-top:4px"></label>
+          <label style="font-size:11px;color:#94a3b8">Floor<input id="rmNewFl" type="number" min="0" max="99" value="1" style="margin-top:4px"></label>
+          <label style="font-size:11px;color:#94a3b8">Type<select id="rmNewType" style="margin-top:4px">${RM_TYPES.map(t => `<option>${escHtml(t)}</option>`).join("")}</select></label>
+          <label style="font-size:11px;color:#94a3b8">Rate ₹/night *<input id="rmNewRate" type="number" min="1" value="1000" style="margin-top:4px"></label>
+          <label style="font-size:11px;color:#94a3b8">Naam (optional)<input id="rmNewName" maxlength="40" placeholder="e.g. Garden View" style="margin-top:4px"></label>
+        </div>
+        <button id="rmAddBtn" class="btn btn-success" onclick="rmAdd()" style="margin-top:10px;width:100%;padding:10px">➕ Room Add karo</button>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin:4px 0 8px">
+        <div id="rmCount" style="font-size:12px;font-weight:700;color:#94a3b8"></div>
+        <button class="btn" onclick="rmLoad()" style="background:#1e293b;color:#93c5fd">🔄 Refresh</button>
+      </div>
+      <div id="rmList"></div>
+    </div>`;
+  document.body.appendChild(d);
+}
+async function openRoomManager(i) {
+  const l = licenses[i];
+  if (!l) return;
+  if (!window._db) { showMsg("❌ Firebase connected nahi hai — Rooms nahi khul sakte.", "error"); return; }
+  const key = String(l.key || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
+  if (!/^ATITHI-[A-Z0-9]+$/.test(key)) { showMsg("❌ Is license ki key format galat hai.", "error"); return; }
+  rmEnsureModal();
+  Object.assign(RM, { key, hotel: l.hotel || "", rooms: [], bookings: [], reservations: [], exists: false });
+  document.getElementById("rmTitle").textContent = "🛏️ Rooms — " + (l.hotel || "Hotel");
+  document.getElementById("rmSub").textContent = key + (l.owner ? " · " + l.owner : "");
+  document.getElementById("rmList").innerHTML = "";
+  rmMsg("");
+  document.getElementById("rmModal").style.display = "flex";
+  await rmLoad();
+}
+function rmClose() { if (RM.busy) return; const m = document.getElementById("rmModal"); if (m) m.style.display = "none"; }
+async function rmLoad() {
+  rmMsg("⏳ Rooms load ho rahe hain...", "inf");
+  try {
+    const [r, b, s] = await Promise.all([rmRef("rooms").get(), rmRef("bookings").get(), rmRef("reservations").get()]);
+    RM.exists = r.exists && Array.isArray(r.data().value);
+    RM.rooms = RM.exists ? r.data().value : [];
+    RM.bookings = b.exists && Array.isArray(b.data().value) ? b.data().value : [];
+    RM.reservations = s.exists && Array.isArray(s.data().value) ? s.data().value : [];
+    rmMsg(RM.exists ? "" : "⚠️ Is hotel ke rooms abhi cloud me save nahi hue hain (hotel app ne abhi tak koi room/check-in save nahi kiya). Pehle hotel app ek baar kholke koi room save/check-in karwao, tab yahan se add/delete karo.", RM.exists ? "" : "bad");
+  } catch (e) {
+    rmMsg("❌ Load nahi hua: " + (e && e.message || e), "bad");
+  }
+  rmRender();
+}
+// Why a room can't be deleted right now (null = safe to delete).
+function rmBlockReason(room, bookings, reservations) {
+  if (room.status === "occupied") return "abhi guest hai (occupied)";
+  if ((bookings || []).some(b => b && b.roomId === room.id && b.status === "active")) return "active booking hai";
+  if ((reservations || []).some(x => x && x.roomId === room.id && x.status === "reserved")) return "future booking hai";
+  return null;
+}
+function rmRender() {
+  const list = document.getElementById("rmList"); if (!list) return;
+  const sorted = RM.rooms.slice().sort((a, b) => (Number(a.fl) || 0) - (Number(b.fl) || 0) || String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+  document.getElementById("rmCount").textContent = RM.rooms.length + " room(s)";
+  document.getElementById("rmAddBtn").disabled = !RM.exists;
+  list.innerHTML = sorted.map(r => {
+    const block = rmBlockReason(r, RM.bookings, RM.reservations);
+    const idx = RM.rooms.indexOf(r);
+    return `<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#1e293b;border-radius:10px;margin-bottom:6px">
+      <div style="font-size:16px;font-weight:700;min-width:54px">${escHtml(r.id)}</div>
+      <div style="flex:1;min-width:0;font-size:12px;color:#94a3b8">Floor ${escHtml(r.fl)} · ${escHtml(r.type || "")} · ₹${escHtml(r.rate)}/night${r.name ? " · " + escHtml(r.name) : ""}
+        <div style="color:${block ? "#fbbf24" : "#4ade80"};margin-top:2px">${block ? "🔒 " + escHtml(block) : (r.status === "occupied" ? "Occupied" : "Khali")}</div></div>
+      <button class="btn btn-danger" ${block || RM.busy ? "disabled" : ""} title="${block ? "Delete nahi ho sakta — " + escHtml(block) : "Room delete karo"}" onclick="rmDelete(${idx})" style="${block ? "opacity:.4;cursor:not-allowed" : ""}">🗑️ Delete</button>
+    </div>`;
+  }).join("") || `<div style="color:#64748b;text-align:center;padding:16px;font-size:13px">Koi room nahi</div>`;
+}
+async function rmTx(mutate) {
+  // mutate(rooms, bookings, reservations) -> { rooms } or { error }
+  RM.busy = true; rmRender();
+  try {
+    let out = null;
+    await window._db.runTransaction(async tx => {
+      const rs = await tx.get(rmRef("rooms"));
+      if (!rs.exists || !Array.isArray(rs.data().value)) { out = { error: "Hotel ke rooms cloud me nahi mile — 🔄 Refresh karo." }; return; }
+      const [bs, ss] = [await tx.get(rmRef("bookings")), await tx.get(rmRef("reservations"))];
+      const bookings = bs.exists && Array.isArray(bs.data().value) ? bs.data().value : [];
+      const reservations = ss.exists && Array.isArray(ss.data().value) ? ss.data().value : [];
+      out = mutate(rs.data().value, bookings, reservations);
+      if (out.error) return;
+      tx.set(rmRef("rooms"), Object.assign({}, rs.data(), { value: out.rooms, ts: Date.now() }));
+      out.bookings = bookings; out.reservations = reservations;
+    });
+    if (out && out.rooms) { RM.rooms = out.rooms; RM.bookings = out.bookings; RM.reservations = out.reservations; }
+    return out || { error: "Save nahi hua" };
+  } catch (e) {
+    return { error: "Save nahi hua: " + (e && e.message || e) };
+  } finally {
+    RM.busy = false; rmRender();
+  }
+}
+async function rmAdd() {
+  if (RM.busy || !RM.exists) return;
+  const id = document.getElementById("rmNewId").value.trim();
+  const fl = parseInt(document.getElementById("rmNewFl").value, 10);
+  const type = document.getElementById("rmNewType").value;
+  const rate = Math.round(Number(document.getElementById("rmNewRate").value));
+  const name = document.getElementById("rmNewName").value.trim().slice(0, 40);
+  if (!/^[A-Za-z0-9-]{1,10}$/.test(id)) return rmMsg("❌ Room number sirf letters/numbers (max 10), jaise 106 ya A1.", "bad");
+  if (!(fl >= 0 && fl <= 99)) return rmMsg("❌ Floor 0 se 99 ke beech daalo.", "bad");
+  if (!RM_TYPES.includes(type)) return rmMsg("❌ Room type galat hai.", "bad");
+  if (!(rate >= 1 && rate <= 1000000)) return rmMsg("❌ Rate ₹1 se ₹10,00,000 ke beech daalo.", "bad");
+  const res = await rmTx(rooms => {
+    if (rooms.some(r => String(r.id).toLowerCase() === id.toLowerCase())) return { error: "Room '" + id + "' pehle se hai — doosra number chuno." };
+    const room = { id, fl, type, rate, status: "empty", bookingId: null, photos: [] };
+    if (name) room.name = name;
+    return { rooms: rooms.concat([room]) };
+  });
+  if (res.error) return rmMsg("❌ " + res.error, "bad");
+  document.getElementById("rmNewId").value = "";
+  document.getElementById("rmNewName").value = "";
+  rmMsg("✅ Room " + id + " add ho gaya — hotel app me turant dikh jaayega.", "ok");
+}
+async function rmDelete(idx) {
+  if (RM.busy) return;
+  const room = RM.rooms[idx]; if (!room) return;
+  const block = rmBlockReason(room, RM.bookings, RM.reservations);
+  if (block) return rmMsg("❌ Room " + room.id + " delete nahi ho sakta — " + block + ".", "bad");
+  if (!confirm("Room " + room.id + " (" + (room.type || "") + ", ₹" + room.rate + ") delete karein?\n\nHotel app se yeh room hat jaayega. Purane bills/history par asar nahi padega.")) return;
+  const id = room.id;
+  const res = await rmTx((rooms, bookings, reservations) => {
+    const cur = rooms.find(r => r.id === id);
+    if (!cur) return { error: "Room " + id + " ab list me nahi hai — 🔄 Refresh karo." };
+    const why = rmBlockReason(cur, bookings, reservations);
+    if (why) return { error: "Room " + id + " delete nahi ho sakta — " + why + "." };
+    return { rooms: rooms.filter(r => r.id !== id) };
+  });
+  if (res.error) return rmMsg("❌ " + res.error, "bad");
+  rmMsg("✅ Room " + id + " delete ho gaya.", "ok");
 }
 
 // ── GENERATE KEY (sanitized inputs) ─────────────────────
