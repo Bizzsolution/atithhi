@@ -2567,7 +2567,7 @@ const RestaurantBills = {
           const snap = await tx.get(ref);
           const cur = (snap.exists && Array.isArray(snap.data().value)) ? snap.data().value : [];
           const next = cur.concat([bill]);
-          tx.set(ref, { value: next, ts: Date.now() });
+          tx.set(ref, { value: cloudSafe(next), ts: Date.now() });
           return next;
         });
         try { localStorage.setItem("ab_" + k, JSON.stringify(all)); } catch (e) {}
@@ -2810,6 +2810,16 @@ const compressForScan = (dataUrl, maxW = 1800) => new Promise((res, rej) => {
 
 // ── DUAL STORAGE (window.storage primary + localStorage backup) ─
 // ── STORAGE: Firebase Firestore PRIMARY + localStorage cache ────────
+// Firestore rejects a whole write if any field anywhere is `undefined`
+// ("Unsupported field value: undefined") — one missing optional field
+// (e.g. a booking with no Aadhaar number, or an Owner-deleted entry
+// stub) used to make the ENTIRE bookings save fail and the sync dot turn
+// red. Everything sent to the cloud goes through this first: JSON
+// round-trip drops undefined object fields (array holes become null).
+function cloudSafe(v) {
+  if (v === undefined) return null;
+  try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
+}
 const WS = {
   // Hotel-isolated path in Firestore (one per license key)
   _hid() {
@@ -2864,7 +2874,7 @@ const WS = {
           const d = snap && snap.exists ? snap.data() : null;
           const cur = d && Array.isArray(d.value) ? d.value : [];
           out = mutate(cur);
-          t.set(ref, { value: out, ts: Date.now() }, { merge: true });
+          t.set(ref, { value: cloudSafe(out), ts: Date.now() }, { merge: true });
         }),
         new Promise((_, rej) => setTimeout(() => rej(new Error("transaction timeout")), timeoutMs || 8000))
       ]);
@@ -2916,7 +2926,7 @@ const WS = {
     try {
       const ref = this._ref(k);
       if (ref) await ref.set({
-        value: v,
+        value: cloudSafe(v),
         ts: Date.now()
       }, {
         merge: true
@@ -2936,7 +2946,7 @@ const WS = {
     try {
       const ref = this._ref(k);
       if (ref) await ref.set({
-        value: cloudVal,
+        value: cloudSafe(cloudVal),
         ts: Date.now()
       }, {
         merge: true
@@ -3943,6 +3953,7 @@ body{background:#e9edf3;}
 .ab-nav-ic{font-size:18px!important;filter:none!important;}
 .ab-nav-lb{font-size:14px!important;letter-spacing:.4px!important;color:rgba(255,255,255,.72)!important;}
 .ab-nav-btn.on .ab-nav-lb{color:#fff!important;}
+.ab-nav-more{display:none!important;}
 .ab-header{padding:14px 32px!important;}
 .ab-main{background:var(--cream);}
 .ab-main .scrollable{padding-left:max(28px,calc((100% - 1240px)/2))!important;padding-right:max(28px,calc((100% - 1240px)/2))!important;}
@@ -9530,7 +9541,7 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
           }, _h("div", { style: { fontWeight: 800, fontSize: 15, color: "var(--navy)" } }, "Room ", b.roomId), _h("div", { style: { fontSize: 11, color: "var(--muted)", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, b.name)))),
       sel && _h("div", { style: { display: "flex", gap: 8, marginTop: 10 } }, seg("restaurant", src, setSrc, "🍽️ Restaurant me khaya"), seg("room", src, setSrc, "🛎️ Room service"))),
     mode === "walkin" && _h("div", { style: { padding: "0 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 } },
-      _h("input", { value: cust, onChange: e => setCust(e.target.value), placeholder: "Customer naam (optional)", "aria-label": "Customer name", style: field }),
+      _h("input", { value: cust, onChange: e => setCust(e.target.value), placeholder: "Customer name (optional)", "aria-label": "Customer name", style: field }),
       _h("input", { value: phone, onChange: e => setPhone(e.target.value), placeholder: "Mobile (optional)", type: "tel", "aria-label": "Customer mobile", style: field })),
     (mode === "walkin" || (sel && src === "restaurant")) && _h("div", { style: { padding: "8px 14px 0" } }, _h("input", { value: table, onChange: e => setTable(e.target.value), placeholder: "Table no. (optional)", "aria-label": "Table number", style: field })),
     (mode === "walkin" || sel) && _h(MenuPicker, { menu, cart, setCart, cats, height: "46vh" }),
@@ -12424,8 +12435,17 @@ function BottomNav({
   if (isOwner && hasFeature("roles")) {
     items = [...items, { id: "access", icon: "🔐", label: "Access" }];
   }
+  // On a phone the tabs can run past the screen edge (e.g. Drivers, Access
+  // at the end). Show a "more" arrow on the right while there are hidden
+  // tabs; tapping it scrolls the bar.
+  const navRef = useRef(null);
+  const [moreRight, setMoreRight] = useState(false);
+  const checkMore = () => { const el = navRef.current; if (el) setMoreRight(el.scrollWidth - el.clientWidth - el.scrollLeft > 8); };
+  useEffect(() => { checkMore(); window.addEventListener("resize", checkMore); return () => window.removeEventListener("resize", checkMore); }, [items.length]);
   return /*#__PURE__*/React.createElement("div", {
     className: "ab-nav",
+    ref: navRef,
+    onScroll: checkMore,
     style: {
       display: "flex",
       background: "#fff",
@@ -12478,7 +12498,17 @@ function BottomNav({
       letterSpacing: .5,
       color: view === i.id ? "var(--navy)" : "var(--muted)"
     }
-  }, i.label))));
+  }, i.label))), moreRight && /*#__PURE__*/React.createElement("button", {
+    className: "ab-nav-more",
+    "data-t": "nav-more",
+    "aria-label": "More tabs",
+    onClick: () => { const el = navRef.current; if (el) el.scrollBy({ left: el.clientWidth * 0.7, behavior: "smooth" }); },
+    style: {
+      position: "sticky", right: 0, flex: "none", width: 34, marginLeft: -34, border: "none", cursor: "pointer",
+      background: "linear-gradient(to right, rgba(255,255,255,0), #fff 45%)", color: "var(--navy)",
+      fontSize: 22, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "flex-end", paddingRight: 6
+    }
+  }, "›"));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -13091,9 +13121,9 @@ function App() {
   }, []);
   // Re-check once every 6 hours while the app stays open (covers hotels
   // that keep a tab open for days without reloading)
-  // Also re-checked whenever the app comes back to the screen (at most once
-  // every 5 minutes), so a feature BizzSathi admin switches off/on reaches
-  // the hotel without waiting hours.
+  // Also re-checked every 5 minutes while the app is on screen, and whenever
+  // the app comes back to the screen or is focused (at most every 30 s), so
+  // a feature BizzSathi admin switches on/off reaches the hotel quickly.
   useEffect(() => {
     let last = Date.now();
     const run = () => {
@@ -13111,10 +13141,11 @@ function App() {
         }
       }).catch(() => {});
     };
-    const iv = setInterval(run, 6 * 60 * 60 * 1000);
-    const onVis = () => { if (document.visibilityState === "visible" && Date.now() - last >= 5 * 60 * 1000) run(); };
+    const iv = setInterval(() => { if (document.visibilityState !== "hidden") run(); }, 5 * 60 * 1000);
+    const onVis = () => { if (document.visibilityState !== "hidden" && Date.now() - last >= 30 * 1000) run(); };
     document.addEventListener("visibilitychange", onVis);
-    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVis); };
+    window.addEventListener("focus", onVis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVis); window.removeEventListener("focus", onVis); };
   }, []);
 
   // Real-time Firestore listeners — sync across devices
@@ -13156,6 +13187,27 @@ function App() {
       };
     });
 
+    // Owner deletes made while cloud saves were failing (v5.22–v5.24.1:
+    // a deleted-entry stub carried `undefined` fields, which Firestore
+    // rejects) exist only on this device. When the cloud copy still has
+    // such an entry un-deleted, send the delete up once, now.
+    // (Read once here, before the cloud listener refreshes this device's copy.)
+    let pendingDelBusy = false;
+    const bootStubs = {};
+    try {
+      const local = JSON.parse(localStorage.getItem("ab_bookings") || "[]");
+      (Array.isArray(local) ? local : []).forEach(b => { if (b && b.status === "deleted" && b.id) bootStubs[b.id] = b; });
+    } catch (e) {}
+    const pushPendingDeletes = srv => {
+      if (pendingDelBusy) return;
+      const stubs = bootStubs;
+      if (!srv.some(x => x && stubs[x.id] && x.status !== "deleted")) return;
+      pendingDelBusy = true;
+      WS.txArray("bookings", cur => cur.map(x => (x && stubs[x.id] && x.status !== "deleted") ? stubs[x.id] : x))
+        .then(r => { if (r) setSyncErr(false); })
+        .catch(e => console.warn("pending deletes:", e && e.message))
+        .finally(() => { pendingDelBusy = false; });
+    };
     const trySetup = () => {
       if (cancelled) return;
       if (!window._db) {
@@ -13185,6 +13237,7 @@ function App() {
         unsubBk = WS.onSnapshot("bookings", data => {
           if (data) setBookings(prevLocal => mergeBookings(data, prevLocal));
           setSyncing(false);
+          if (Array.isArray(data)) pushPendingDeletes(data);
         });
       }, 300);
       // Profile (hotel name/address/GSTIN + GST pricing mode) — WITHOUT this,
@@ -13352,7 +13405,7 @@ function App() {
   // Firestore: raw Aadhaar/ID numbers (masked instead) and all photos
   // (signature, Aadhaar front/back, family member ID photos). Full data
   // still lives in localStorage on this device via setSplit's localVal.
-  const sanitizeBookingsForCloud = (bk) => bk.map(b => {
+  const sanitizeBookingsForCloud = (bk) => cloudSafe(bk.map(b => {
     const { photoFront, photoBack, signature, ...rest } = b;
     return {
       ...rest,
@@ -13362,7 +13415,7 @@ function App() {
         return { ...mRest, idNumber: m.idNumber ? maskAadhaar(m.idNumber) : m.idNumber };
       }) : b.family
     };
-  });
+  }));
 
   // ── ARCHIVING — keeps the "live" bookings document small forever ──
   // The single-document design (every booking a hotel has EVER had, in
@@ -13485,7 +13538,7 @@ function App() {
         // not there yet.
         for (const i of [...dirty].sort((a, b) => b - a)) {
           if (i === 0) continue;
-          await WS._ref(partKey(i + 1)).set({ value: parts[i], ts: Date.now() }, { merge: true });
+          await WS._ref(partKey(i + 1)).set({ value: cloudSafe(parts[i]), ts: Date.now() }, { merge: true });
         }
         const baseUpdate = { ts: Date.now(), parts: parts.length };
         if (dirty.has(0)) baseUpdate.value = parts[0];
@@ -13973,7 +14026,7 @@ function App() {
       if (clash) { alert("Room " + changes.roomId + " is already booked for these dates (" + (clash.r ? clash.r.name : clash.b.name) + ")"); return false; }
     }
     const nowIso = new Date().toISOString();
-    let ub = { ...b, ...changes, editedAt: nowIso, editHistory: [...(Array.isArray(b.editHistory) ? b.editHistory : []).slice(-19), { at: nowIso, by: user.name || user.u || "Owner", reason: reason || "", from: { name: b.name, roomId: b.roomId, checkIn: b.checkIn, checkOut: b.checkOut, roomTotal: b.roomTotal, grandTotal: b.grandTotal } }] };
+    let ub = { ...b, ...changes, editedAt: nowIso, editHistory: [...(Array.isArray(b.editHistory) ? b.editHistory : []).slice(-19), { at: nowIso, by: user.name || user.u || "Owner", reason: reason || "", from: { name: b.name || "", roomId: b.roomId || "", checkIn: b.checkIn || "", checkOut: b.checkOut || "", roomTotal: b.roomTotal ?? null, grandTotal: b.grandTotal ?? null } }] };
     let G2 = null;
     if (!isActive) {
       const rb = rebuildSettledBill(ub, newRoom, rooms);

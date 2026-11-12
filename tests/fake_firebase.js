@@ -12,7 +12,19 @@
   }
   function DocRef(path) { this.path = path; this.id = path.split("/").pop(); }
   DocRef.prototype.get = async function () { return snap(this.path); };
+  // Like real Firestore: a write containing `undefined` anywhere is rejected
+  // ("Unsupported field value: undefined"). JSON cloning used to drop such
+  // fields silently, which hid real save failures from the tests.
+  const findUndef = (v, p) => {
+    if (v === undefined) return p || "(document)";
+    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) { const r = findUndef(v[i], p + "[" + i + "]"); if (r) return r; } return null; }
+    if (v && typeof v === "object") { for (const k of Object.keys(v)) { const r = findUndef(v[k], p ? p + "." + k : k); if (r) return r; } }
+    return null;
+  };
+  window.__rejectedWrites = [];
   DocRef.prototype.set = async function (data, opts) {
+    const bad = findUndef(data, "");
+    if (bad) { window.__rejectedWrites.push([this.path, bad]); const e = new Error("Function setDoc() called with invalid data. Unsupported field value: undefined (found in field " + bad + ")"); e.code = "invalid-argument"; throw e; }
     if (opts && opts.merge && store[this.path]) store[this.path] = Object.assign({}, store[this.path], clone(data));
     else store[this.path] = clone(data);
     window.__writes.push(["set", this.path]);
