@@ -1318,6 +1318,7 @@ function renderDashboard() {
           <button class="btn" style="background:#1e293b;color:#93c5fd" onclick="openEditHotelModal(${i})">✏️ Edit</button>
           <button class="btn" style="background:#3730a3;color:#c7d2fe" onclick="openFeatureControl(${i})">🎛️ Features</button>
           <button class="btn" style="background:#1e3a5f;color:#bae6fd" onclick="openRoomManager(${i})">🛏️ Rooms</button>
+          <button class="btn" style="background:#14532d;color:#bbf7d0" onclick="openBillSettings(${i})">🧾 Bill Settings</button>
           <button class="btn" style="background:#134e4a;color:#5eead4" onclick="openDataManager(${i})">🗂️ Data</button>
           <button class="btn" style="background:#3b1d0b;color:#fdba74" onclick="openMenuImport(${i})">🍽️ Menu</button>
           ${l.plan !== "TRIAL" ? `<button class="btn" style="background:#78350f;color:#fcd34d" onclick="generateInvoiceForLicense(${i})">🧾 Invoice</button>` : ''}
@@ -1354,7 +1355,8 @@ const FEATURE_CATALOG = [
 const ADDON_CATALOG = [
   { id: "ota_import", label: "OTA Booking Import", desc: "Quick-entry bookings from Agoda/MakeMyTrip/Goibibo etc, blocks the room like a normal check-in" },
   { id: "direct_booking", label: "Direct Booking Link", desc: "Public shareable link (for Facebook/Instagram/WhatsApp) where guests request a room; hotel confirms from the app" },
-  { id: "restaurant", label: "Restaurant & Room Service", desc: "Restaurant counter (orders straight to the room bill), walk-in GST bills, KOT kitchen slips, separate Restaurant staff login" }
+  { id: "restaurant", label: "Restaurant & Room Service", desc: "Restaurant counter (orders straight to the room bill), walk-in GST bills, KOT kitchen slips, separate Restaurant staff login" },
+  { id: "driver_commission", label: "Auto/Driver Commission", desc: "Auto/taxi driver ka % commission room rent (bina GST) par — guest ka bill nahi badalta; Diya/Baaki record, driver-wise report, CSV" }
 ];
 const PLAN_DEFAULT_FEATURES = {
   TRIAL: [],
@@ -1552,7 +1554,8 @@ async function openRoomManager(i) {
   const key = String(l.key || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
   if (!/^ATITHI-[A-Z0-9]+$/.test(key)) { showMsg("❌ Is license ki key format galat hai.", "error"); return; }
   rmEnsureModal();
-  Object.assign(RM, { key, hotel: l.hotel || "", rooms: [], bookings: [], reservations: [], exists: false });
+  Object.assign(RM, { key, hotel: l.hotel || "", rooms: [], bookings: [], reservations: [], exists: false, floorNames: {} });
+  RM_EDIT = null;
   document.getElementById("rmTitle").textContent = "🛏️ Rooms — " + (l.hotel || "Hotel");
   document.getElementById("rmSub").textContent = key + (l.owner ? " · " + l.owner : "");
   document.getElementById("rmList").innerHTML = "";
@@ -1569,6 +1572,7 @@ async function rmLoad() {
     RM.rooms = RM.exists ? r.data().value : [];
     RM.bookings = b.exists && Array.isArray(b.data().value) ? b.data().value : [];
     RM.reservations = s.exists && Array.isArray(s.data().value) ? s.data().value : [];
+    try { RM.floorNames = (await acfgLoad(RM.key)).floorNames || {}; } catch (e) { RM.floorNames = {}; }
     rmMsg(RM.exists ? "" : "⚠️ Is hotel ke rooms abhi cloud me save nahi hue hain (hotel app ne abhi tak koi room/check-in save nahi kiya). Pehle hotel app ek baar kholke koi room save/check-in karwao, tab yahan se add/delete karo.", RM.exists ? "" : "bad");
   } catch (e) {
     rmMsg("❌ Load nahi hua: " + (e && e.message || e), "bad");
@@ -1590,13 +1594,16 @@ function rmRender() {
   list.innerHTML = sorted.map(r => {
     const block = rmBlockReason(r, RM.bookings, RM.reservations);
     const idx = RM.rooms.indexOf(r);
+    if (RM_EDIT === r.id) return rmEditRow(r);
     return `<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:#1e293b;border-radius:10px;margin-bottom:6px">
       <div style="font-size:16px;font-weight:700;min-width:54px">${escHtml(r.id)}</div>
       <div style="flex:1;min-width:0;font-size:12px;color:#94a3b8">Floor ${escHtml(r.fl)} · ${escHtml(r.type || "")} · ₹${escHtml(r.rate)}/night${r.name ? " · " + escHtml(r.name) : ""}
         <div style="color:${block ? "#fbbf24" : "#4ade80"};margin-top:2px">${block ? "🔒 " + escHtml(block) : (r.status === "occupied" ? "Occupied" : "Khali")}</div></div>
+      <button class="btn" ${RM.busy ? "disabled" : ""} onclick="rmStartEdit(${idx})" style="background:#1e3a5f;color:#bae6fd">✏️ Edit</button>
       <button class="btn btn-danger" ${block || RM.busy ? "disabled" : ""} title="${block ? "Delete nahi ho sakta — " + escHtml(block) : "Room delete karo"}" onclick="rmDelete(${idx})" style="${block ? "opacity:.4;cursor:not-allowed" : ""}">🗑️ Delete</button>
     </div>`;
   }).join("") || `<div style="color:#64748b;text-align:center;padding:16px;font-size:13px">Koi room nahi</div>`;
+  list.innerHTML += RM.exists ? rmFloorBox() : "";
 }
 async function rmTx(mutate) {
   // mutate(rooms, bookings, reservations) -> { rooms } or { error }
@@ -1660,6 +1667,247 @@ async function rmDelete(idx) {
   });
   if (res.error) return rmMsg("❌ " + res.error, "bad");
   rmMsg("✅ Room " + id + " delete ho gaya.", "ok");
+}
+
+// ── Room edit (floor / type / rate / name) + floor names ────────────
+// Room NUMBER is not renamed here: bookings and bills point at it. The
+// hotel app's own room edit handles a rename with its safety checks.
+let RM_EDIT = null; // room id being edited
+function rmStartEdit(idx) { const r = RM.rooms[idx]; if (!r || RM.busy) return; RM_EDIT = r.id; rmRender(); }
+function rmCancelEdit() { RM_EDIT = null; rmRender(); }
+async function rmSaveEdit() {
+  if (RM.busy || !RM_EDIT) return;
+  const id = RM_EDIT;
+  const fl = parseInt(document.getElementById("rmEdFl").value, 10);
+  const type = document.getElementById("rmEdType").value;
+  const rate = Math.round(Number(document.getElementById("rmEdRate").value));
+  const name = document.getElementById("rmEdName").value.trim().slice(0, 40);
+  if (!(fl >= 0 && fl <= 99)) return rmMsg("❌ Floor 0 se 99 ke beech daalo.", "bad");
+  if (!RM_TYPES.includes(type)) return rmMsg("❌ Room type galat hai.", "bad");
+  if (!(rate >= 1 && rate <= 1000000)) return rmMsg("❌ Rate ₹1 se ₹10,00,000 ke beech daalo.", "bad");
+  const res = await rmTx(rooms => {
+    if (!rooms.some(r => r.id === id)) return { error: "Room " + id + " ab list me nahi hai — 🔄 Refresh karo." };
+    // Only these fields change — status / guest / photos stay exactly as the hotel has them.
+    return { rooms: rooms.map(r => {
+      if (r.id !== id) return r;
+      const u = { ...r, fl, type, rate };
+      if (name) u.name = name; else delete u.name;
+      return u;
+    }) };
+  });
+  if (res.error) return rmMsg("❌ " + res.error, "bad");
+  RM_EDIT = null; rmRender();
+  rmMsg("✅ Room " + id + " update ho gaya — hotel app me turant dikh jaayega.", "ok");
+}
+function rmEditRow(r) {
+  return `<div style="padding:10px 12px;background:#1e293b;border:1px solid #3b82f6;border-radius:10px;margin-bottom:6px">
+    <div style="font-size:13px;font-weight:700;margin-bottom:8px">✏️ Room ${escHtml(r.id)} edit</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px">
+      <label style="font-size:11px;color:#94a3b8">Floor<input id="rmEdFl" type="number" min="0" max="99" value="${escHtml(r.fl)}" style="margin-top:4px"></label>
+      <label style="font-size:11px;color:#94a3b8">Type<select id="rmEdType" style="margin-top:4px">${RM_TYPES.map(t => `<option${t === r.type ? " selected" : ""}>${escHtml(t)}</option>`).join("")}</select></label>
+      <label style="font-size:11px;color:#94a3b8">Rate ₹/night<input id="rmEdRate" type="number" min="1" value="${escHtml(r.rate)}" style="margin-top:4px"></label>
+      <label style="font-size:11px;color:#94a3b8">Naam<input id="rmEdName" maxlength="40" value="${escHtml(r.name || "")}" placeholder="optional" style="margin-top:4px"></label>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn btn-success" onclick="rmSaveEdit()" style="flex:1">💾 Save</button>
+      <button class="btn" onclick="rmCancelEdit()" style="flex:1;background:#334155;color:#e2e8f0">Cancel</button>
+    </div>
+  </div>`;
+}
+// Floor names live in the hotel's adminConfig document (floorNames map).
+async function rmSaveFloorNames() {
+  if (RM.busy) return;
+  const inputs = [...document.querySelectorAll("[data-floor-name]")];
+  const names = {};
+  for (const el of inputs) {
+    const v = el.value.trim().slice(0, 30);
+    if (v) names[el.getAttribute("data-floor-name")] = v;
+  }
+  RM.busy = true;
+  try {
+    await acfgSave(cur => ({ ...cur, floorNames: names }));
+    RM.floorNames = names;
+    rmMsg("✅ Floor names save ho gaye.", "ok");
+  } catch (e) {
+    rmMsg("❌ Save nahi hua: " + (e && e.message || e), "bad");
+  } finally { RM.busy = false; rmRender(); }
+}
+function rmFloorBox() {
+  const floors = [...new Set(RM.rooms.map(r => Number(r.fl) || 0))].sort((a, b) => a - b);
+  if (!floors.length) return "";
+  const fn = RM.floorNames || {};
+  return `<div style="background:#1e293b;border-radius:10px;padding:12px;margin:12px 0">
+    <div style="font-size:12px;font-weight:700;color:#fbbf24;margin-bottom:8px">🏢 FLOOR NAMES (optional)</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
+      ${floors.map(f => `<label style="font-size:11px;color:#94a3b8">Floor ${f}<input data-floor-name="${f}" maxlength="30" value="${escHtml(fn[String(f)] || "")}" placeholder="e.g. ${f === 0 ? "Ground Floor" : f === 1 ? "First Floor" : "Floor " + f}" style="margin-top:4px"></label>`).join("")}
+    </div>
+    <button class="btn" onclick="rmSaveFloorNames()" style="margin-top:10px;width:100%;background:#334155;color:#e2e8f0">💾 Floor names save karo</button>
+  </div>`;
+}
+
+// ── Hotel admin config (hotels/{key}/data/adminConfig) ──────────────
+// { invoice: {...bill settings}, bookingPrefix, floorNames, updatedAt }
+// Written in a transaction that keeps every key it isn't changing.
+function acfgRef(key) { return window._db.collection("hotels").doc(key || RM.key).collection("data").doc("adminConfig"); }
+async function acfgLoad(key) {
+  const s = await acfgRef(key).get();
+  const v = s.exists ? s.data().value : null;
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+}
+async function acfgSave(mutate, key) {
+  let out = null;
+  await window._db.runTransaction(async tx => {
+    const ref = acfgRef(key);
+    const s = await tx.get(ref);
+    const cur = s.exists && s.data().value && typeof s.data().value === "object" ? s.data().value : {};
+    out = { ...mutate(cur), updatedAt: new Date().toISOString() };
+    tx.set(ref, { value: out, ts: Date.now() });
+  });
+  return out;
+}
+
+// ── BILL SETTINGS (per hotel) ───────────────────────────────────────
+const BS = { key: null, hotel: "", cfg: {}, counter: 0, busy: false };
+const BS_FIELDS = [
+  ["title", "Bill ka title", "TAX INVOICE", 30],
+  ["hotelName", "Hotel naam (bill par)", "e.g. HOTEL SHASHI RESIDENCY", 60],
+  ["tagline", "Tagline / doosri line", "optional", 80],
+  ["address", "Address", "Poora address", 200, "area"],
+  ["phone", "Phone", "9520998899, 8791223322", 60],
+  ["email", "Email", "hotel@gmail.com", 80],
+  ["website", "Website", "www.hotel.com", 80],
+  ["gstin", "GSTIN", "09ABCDE1234F1Z5", 15],
+  ["roomSac", "Room HSN/SAC code", "996311", 8],
+  ["foodSac", "Food HSN/SAC code", "996331", 8],
+  ["footerNote", "Footer note", "e.g. Issue Cheque/D.D. in favour of ... Payable at Mathura", 300, "area"],
+  ["checkoutNote", "Remark (check-out time etc.)", "e.g. Check out time 12 noon", 80],
+  ["jurisdiction", "Jurisdiction (city)", "e.g. Mathura", 40],
+  ["signatory", "Signature ke neeche", "Authorised Signatory", 40],
+  ["thanksName", "\"Thank you for staying with ___\"", "hotel ka naam", 60]
+];
+function bsFY(d) { const dt = d || new Date(); const y = dt.getFullYear(); const s = (dt.getMonth() + 1) >= 4 ? y : y - 1; return String(s).slice(-2) + "-" + String(s + 1).slice(-2); }
+function bsCounterRef() { return window._db.collection("hotels").doc(BS.key).collection("data").doc("invCounter_" + bsFY()); }
+function bsMsg(t, type) { const el = document.getElementById("bsMsg"); if (!el) return; el.textContent = t || ""; el.style.display = t ? "block" : "none"; el.style.background = type === "bad" ? "#450a0a" : type === "ok" ? "#052e16" : "#1e293b"; el.style.color = type === "bad" ? "#fca5a5" : type === "ok" ? "#4ade80" : "#cbd5e1"; }
+function bsEnsureModal() {
+  if (document.getElementById("bsModal")) return;
+  const d = document.createElement("div");
+  d.id = "bsModal";
+  d.style.cssText = "display:none;position:fixed;inset:0;background:rgba(2,6,23,.8);z-index:3000;align-items:flex-start;justify-content:center;padding:20px 12px;overflow-y:auto";
+  d.innerHTML = `<div style="background:#0f172a;border:1px solid #334155;border-radius:14px;width:100%;max-width:680px;padding:18px;color:#e2e8f0">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">
+      <div><div id="bsTitle" style="font-size:16px;font-weight:700">🧾 Bill Settings</div><div id="bsSub" style="font-size:11px;color:#94a3b8;margin-top:3px"></div></div>
+      <button class="btn" onclick="bsClose()" style="background:#1e293b;color:#e2e8f0">✕ Close</button>
+    </div>
+    <div style="font-size:11.5px;color:#94a3b8;margin:10px 0">Jo field khaali chhodoge, wahan hotel ki apni Settings wali detail chalegi. Jo yahan bharoge, wo hotel ke Settings me 🔒 lock ho jaayegi.</div>
+    <div id="bsMsg" style="display:none;padding:10px 12px;border-radius:8px;font-size:12.5px;margin:10px 0"></div>
+    <div id="bsBody"></div>
+  </div>`;
+  document.body.appendChild(d);
+}
+async function openBillSettings(i) {
+  const l = licenses[i]; if (!l) return;
+  if (!window._db) { showMsg("❌ Firebase connected nahi hai.", "error"); return; }
+  const key = String(l.key || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
+  if (!/^ATITHI-[A-Z0-9]+$/.test(key)) { showMsg("❌ Is license ki key format galat hai.", "error"); return; }
+  bsEnsureModal();
+  Object.assign(BS, { key, hotel: l.hotel || "", cfg: {}, counter: 0 });
+  document.getElementById("bsTitle").textContent = "🧾 Bill Settings — " + (l.hotel || "Hotel");
+  document.getElementById("bsSub").textContent = key;
+  document.getElementById("bsBody").innerHTML = "";
+  bsMsg("⏳ Load ho raha hai...", "inf");
+  document.getElementById("bsModal").style.display = "flex";
+  try {
+    BS.cfg = await acfgLoad(key);
+    const c = await bsCounterRef().get();
+    BS.counter = c.exists ? (Number(c.data().value) || 0) : 0;
+    bsMsg("");
+  } catch (e) { bsMsg("❌ Load nahi hua: " + (e && e.message || e), "bad"); }
+  bsRender();
+}
+function bsClose() { if (BS.busy) return; const m = document.getElementById("bsModal"); if (m) m.style.display = "none"; }
+function bsRender() {
+  const inv = BS.cfg.invoice || {};
+  const inp = (k, label, ph, max, kind) => `<label style="font-size:11px;color:#94a3b8;display:block">${escHtml(label)}${kind === "area"
+    ? `<textarea id="bs_${k}" maxlength="${max}" rows="2" placeholder="${escHtml(ph)}" style="margin-top:4px;width:100%;box-sizing:border-box">${escHtml(inv[k] || "")}</textarea>`
+    : `<input id="bs_${k}" maxlength="${max}" value="${escHtml(inv[k] || "")}" placeholder="${escHtml(ph)}" style="margin-top:4px">`}</label>`;
+  const sec = (t, html) => `<div style="background:#1e293b;border-radius:10px;padding:12px;margin-bottom:12px"><div style="font-size:12px;font-weight:700;color:#fbbf24;margin-bottom:10px">${t}</div>${html}</div>`;
+  const grid = html => `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">${html}</div>`;
+  const F = k => BS_FIELDS.find(f => f[0] === k);
+  const fx = k => { const f = F(k); return inp(f[0], f[1], f[2], f[3], f[4]); };
+  const pad = inv.pad === 0 || inv.pad ? inv.pad : 6;
+  document.getElementById("bsBody").innerHTML =
+    sec("🏨 HEADER", grid(["title", "hotelName", "tagline", "phone", "email", "website", "gstin"].map(fx).join("")) + `<div style="margin-top:10px">${fx("address")}</div>`) +
+    sec("🔢 BILL NUMBER SERIES", grid(
+      `<label style="font-size:11px;color:#94a3b8;display:block">Prefix<input id="bs_prefix" maxlength="10" value="${escHtml(inv.prefix || "")}" placeholder="INV" style="margin-top:4px"></label>` +
+      `<label style="font-size:11px;color:#94a3b8;display:block">Number kitne digit ka<select id="bs_pad" style="margin-top:4px">${[0, 3, 4, 5, 6].map(n => `<option value="${n}"${n === Number(pad) ? " selected" : ""}>${n === 0 ? "Jitna ho (8, 9, 10...)" : n + " digit (" + "1".padStart(n, "0") + ")"}</option>`).join("")}</select></label>` +
+      `<label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:8px;margin-top:20px"><input id="bs_fy" type="checkbox" ${inv.fy === false ? "" : "checked"} style="width:auto"> Financial year jodo (${bsFY()})</label>` +
+      `<label style="font-size:11px;color:#94a3b8;display:block">Agla bill number (optional)<input id="bs_next" type="number" min="${BS.counter + 1}" placeholder="${BS.counter + 1}" style="margin-top:4px"></label>`) +
+      `<div style="font-size:11.5px;color:#94a3b8;margin-top:8px">Is saal ab tak <b>${BS.counter}</b> bill bane hain. Agla number isse kam nahi ho sakta (duplicate bill number na bane).</div>` +
+      `<div id="bsPrev" style="margin-top:8px;font-size:12.5px;color:#4ade80"></div>`) +
+    sec("🧾 HSN / SAC", grid(["roomSac", "foodSac"].map(fx).join(""))) +
+    sec("📝 FOOTER", grid(["checkoutNote", "jurisdiction", "signatory", "thanksName"].map(fx).join("")) + `<div style="margin-top:10px">${fx("footerNote")}</div>`) +
+    sec("🆔 BOOKING ID", grid(`<label style="font-size:11px;color:#94a3b8;display:block">Booking ID ke shuru ke akshar (1-6)<input id="bs_bkPrefix" maxlength="6" value="${escHtml(BS.cfg.bookingPrefix || "")}" placeholder="BK" style="margin-top:4px;text-transform:uppercase"></label>`) +
+      `<div style="font-size:11.5px;color:#94a3b8;margin-top:8px">Sirf naye check-in par lagega. Purane booking ID nahi badlenge.</div>`) +
+    `<button id="bsSaveBtn" class="btn btn-success" onclick="bsSave()" style="width:100%;padding:12px;font-size:14px">💾 Save karo</button>`;
+  ["bs_prefix", "bs_pad", "bs_fy", "bs_next", "bs_bkPrefix"].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener("input", bsPreview); if (el) el.addEventListener("change", bsPreview); });
+  bsPreview();
+}
+function bsRead() {
+  const v = id => (document.getElementById(id) || {}).value || "";
+  const inv = {};
+  for (const [k, , , max] of BS_FIELDS) { const x = v("bs_" + k).trim().slice(0, max); if (x) inv[k] = x; }
+  const prefix = v("bs_prefix").trim();
+  if (prefix) inv.prefix = prefix;
+  inv.pad = Number(v("bs_pad"));
+  inv.fy = !!(document.getElementById("bs_fy") || {}).checked;
+  return { inv, bkPrefix: v("bs_bkPrefix").trim().toUpperCase(), next: v("bs_next").trim() };
+}
+function bsPreview() {
+  const el = document.getElementById("bsPrev"); if (!el) return;
+  const { inv, bkPrefix, next } = bsRead();
+  const n = next ? Number(next) : BS.counter + 1;
+  const seq = inv.pad > 0 ? String(n).padStart(inv.pad, "0") : String(n);
+  const no = [inv.prefix || "INV"].concat(inv.fy ? [bsFY()] : []).concat([seq]).join("/");
+  el.textContent = "Agla bill: " + no + "   ·   Booking ID: " + ((bkPrefix || "BK").replace(/[^A-Z0-9]/g, "") || "BK") + "3K9Q2X";
+}
+async function bsSave() {
+  if (BS.busy) return;
+  const { inv, bkPrefix, next } = bsRead();
+  if (inv.prefix && !/^[A-Za-z0-9-]{1,10}$/.test(inv.prefix)) return bsMsg("❌ Prefix me sirf letters, numbers aur - (max 10).", "bad");
+  if (!([0, 3, 4, 5, 6].includes(inv.pad))) return bsMsg("❌ Digit option galat hai.", "bad");
+  if (inv.gstin && !/^[0-9]{2}[A-Z0-9]{13}$/.test(inv.gstin.toUpperCase())) return bsMsg("❌ GSTIN 15 akshar ka hona chahiye (jaise 09ABCDE1234F1Z5).", "bad");
+  if (inv.gstin) inv.gstin = inv.gstin.toUpperCase();
+  for (const k of ["roomSac", "foodSac"]) if (inv[k] && !/^\d{4,8}$/.test(inv[k])) return bsMsg("❌ HSN/SAC code sirf 4-8 digit ka number.", "bad");
+  if (bkPrefix && !/^[A-Z0-9]{1,6}$/.test(bkPrefix)) return bsMsg("❌ Booking ID ke akshar sirf A-Z / 0-9 (max 6).", "bad");
+  let nextN = null;
+  if (next) {
+    nextN = Math.floor(Number(next));
+    if (!(nextN >= 1 && nextN <= 99999999)) return bsMsg("❌ Agla bill number sahi daalo.", "bad");
+  }
+  BS.busy = true; const btn = document.getElementById("bsSaveBtn"); if (btn) btn.disabled = true;
+  try {
+    if (nextN !== null) {
+      let err = null;
+      await window._db.runTransaction(async tx => {
+        const ref = bsCounterRef();
+        const s = await tx.get(ref);
+        const cur = s.exists ? (Number(s.data().value) || 0) : 0;
+        if (nextN - 1 < cur) { err = "Bill number " + nextN + " se pehle " + cur + " bill ban chuke hain — agla number kam se kam " + (cur + 1) + " ho."; return; }
+        tx.set(ref, { value: nextN - 1 });
+      });
+      if (err) { bsMsg("❌ " + err, "bad"); return; }
+      BS.counter = nextN - 1;
+    }
+    BS.cfg = await acfgSave(cur => {
+      const o = { ...cur, invoice: inv };
+      if (bkPrefix) o.bookingPrefix = bkPrefix; else delete o.bookingPrefix;
+      return o;
+    }, BS.key);
+    bsRender();
+    bsMsg("✅ Save ho gaya — hotel ke agle bill/check-in se lagu hoga.", "ok");
+  } catch (e) {
+    bsMsg("❌ Save nahi hua: " + (e && e.message || e), "bad");
+  } finally { BS.busy = false; const b2 = document.getElementById("bsSaveBtn"); if (b2) b2.disabled = false; }
 }
 
 // ── GENERATE KEY (sanitized inputs) ─────────────────────
