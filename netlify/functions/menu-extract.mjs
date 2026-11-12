@@ -141,7 +141,7 @@ export async function handler(event) {
 
   const hdr = event.headers || {};
   const ip = String(hdr["x-nf-client-connection-ip"] || hdr["client-ip"] || "unknown").slice(0, 64);
-  if (!allow(ip)) return reply(429, { error: "Too many requests — 1 minute baad try karo." });
+  if (!allow(ip)) return reply(429, { error: "Too many requests — please try again in 1 minute." });
 
   const auth = String(hdr.authorization || hdr.Authorization || "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
@@ -157,7 +157,7 @@ export async function handler(event) {
   const mime = typeof body.mime === "string" ? body.mime : "";
   const data = typeof body.data === "string" ? body.data : "";
   if (ALLOWED_MIME.indexOf(mime) < 0) return reply(400, { error: "Sirf JPG, PNG, WEBP photo ya PDF chalega." });
-  if (!data || data.length > MAX_B64) return reply(413, { error: "File bahut badi hai (max ~4 MB)." });
+  if (!data || data.length > MAX_B64) return reply(413, { error: "File is too large (max ~4 MB)." });
   if (!BASE64_RE.test(data)) return reply(400, { error: "Invalid file encoding" });
 
   const errors = [];
@@ -207,12 +207,12 @@ export async function handler(event) {
   }
   if (!text) {
     console.error("menu-extract: all providers failed —", JSON.stringify(errors));
-    return reply(503, { error: "AI service abhi available nahi hai (API key / quota check karo). Excel/CSV upload ab bhi chalega.", code: "AI_UNAVAILABLE" });
+    return reply(503, { error: "AI service is not available right now (check API key / quota). Excel/CSV upload still works.", code: "AI_UNAVAILABLE" });
   }
   const items = parseItems(text);
   if (!items) {
     console.error("menu-extract: unparseable model output —", String(text).slice(0, 200));
-    return reply(502, { error: "Menu padh nahi paaye — saaf, seedhi photo try karo.", code: "UNREADABLE" });
+    return reply(502, { error: "Could not read the menu — please try a clear, straight photo.", code: "UNREADABLE" });
   }
   return reply(200, { items });
 }
