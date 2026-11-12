@@ -988,6 +988,48 @@ function splitCgstSgst(totalGST) {
   return { cgst: half, sgst: totalGST - half };
 }
 
+// ── PER-NIGHT RATE SEGMENTS (extend stay with a different rate) ──────
+// A booking normally has one rate for the whole stay (roomTotal ÷ nights).
+// When a stay is extended at a new rate for the EXTRA days only, the
+// booking stores rateSegments: [{ from, to, rate }] (dates as check-in /
+// check-out style "YYYY-MM-DD", each segment covering nts(from,to)
+// nights). roomTotal is always the sum of the segments.
+function bookingSegments(b) {
+  const segs = Array.isArray(b && b.rateSegments) ? b.rateSegments.filter(x => x && x.from && x.to && x.to > x.from) : [];
+  if (segs.length > 1) return segs.map(x => ({ from: x.from, to: x.to, rate: Number(x.rate) || 0 }));
+  const n = b && b.checkIn && b.checkOut ? nts(b.checkIn, b.checkOut) : 0;
+  return [{ from: b.checkIn, to: b.checkOut, rate: n > 0 ? (Number(b.roomTotal) || 0) / n : 0 }];
+}
+function segmentsTotal(segs) { return segs.reduce((t, x) => t + Math.round((Number(x.rate) || 0) * nts(x.from, x.to)), 0); }
+function mergeSegments(segs) {
+  const out = [];
+  segs.filter(x => x.to > x.from).forEach(x => {
+    const last = out[out.length - 1];
+    if (last && Math.abs(last.rate - x.rate) < 0.005 && last.to === x.from) last.to = x.to;
+    else out.push({ from: x.from, to: x.to, rate: Math.round(Number(x.rate) * 100) / 100 });
+  });
+  return out;
+}
+// New check-out date and (optional) new per-night rate.
+// scope "all": every night at newRate. scope "extra": only the nights
+// after the old check-out date at newRate (earlier nights keep their rate).
+// newRate null/"" = keep the current rate(s) (old behaviour).
+function planStayChange(b, newCheckOut, newRate, scope) {
+  let segs = bookingSegments(b);
+  // shorten: cut every segment at the new check-out date
+  segs = segs.filter(x => x.from < newCheckOut).map(x => ({ ...x, to: x.to > newCheckOut ? newCheckOut : x.to }));
+  const lastRate = segs.length ? segs[segs.length - 1].rate : (Number(newRate) || 0);
+  const hasRate = newRate !== null && newRate !== undefined && newRate !== "" && isFinite(Number(newRate)) && Number(newRate) >= 0;
+  const r = hasRate ? Number(newRate) : null;
+  if (newCheckOut > b.checkOut) {
+    segs.push({ from: b.checkOut, to: newCheckOut, rate: r !== null && scope !== "all" ? r : lastRate });
+  }
+  if (r !== null && scope === "all") segs = [{ from: b.checkIn, to: newCheckOut, rate: r }];
+  const merged = mergeSegments(segs);
+  const roomTotal = segmentsTotal(merged);
+  return { checkOut: newCheckOut, roomTotal, rateSegments: merged.length > 1 ? merged : null };
+}
+
 function calcBillGST(booking, roomObj, allRooms, gstMode) {
   // A COMPLETED (checked-out) booking's bill is a finalized financial
   // record — it must never change just because the hotel later flips its
@@ -1004,6 +1046,7 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
       gstMode: gb.gstMode || "exclusive",
       roomAmt: gb.roomAmt ?? (booking.roomTotal || 0), roomGST: gb.roomGST || 0, roomGSTRate: gb.roomGSTRate || 0,
       roomCGST: gb.roomCGST ?? roomSplit2.cgst, roomSGST: gb.roomSGST ?? roomSplit2.sgst, roomSAC: gb.roomSAC || "9963", roomRuleId: gb.roomRuleId || null,
+      roomSegs: Array.isArray(gb.roomSegs) && gb.roomSegs.length > 1 ? gb.roomSegs : null,
       foodAmt: gb.foodAmt || 0, foodGST: gb.foodGST || 0, foodGSTRate: gb.foodGSTRate || 0,
       foodCGST: gb.foodCGST ?? foodSplit2.cgst, foodSGST: gb.foodSGST ?? foodSplit2.sgst, foodSAC: gb.foodSAC || "996331", foodRuleId: gb.foodRuleId || null,
       // Laundry/transport/extra-bed are frozen the same way. Bookings
@@ -1082,7 +1125,22 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
   const splitExclusive = (amtRaw, rate) => ({ base: amtRaw, gst: Math.round(amtRaw * rate) });
   const split = gstMode === "inclusive" ? splitInclusive : splitExclusive;
 
-  const roomSplit = split(roomAmtRaw, roomRule.rate);
+  let roomSplit = split(roomAmtRaw, roomRule.rate);
+  let roomRuleUsed = roomRule, roomSegs = null;
+  const segList = bookingSegments(booking);
+  if (segList.length > 1) {
+    // each part of the stay is taxed at the slab of ITS OWN per-night rate
+    roomSegs = segList.map(x => {
+      const nn = nts(x.from, x.to);
+      const amt = Math.round(x.rate * nn);
+      const rule = resolveGSTRule("accommodation", { nightlyRate: x.rate, specifiedPremises: specified }, x.from || supplyDate, overrides);
+      const sp = split(amt, rule.rate);
+      return { from: x.from, to: x.to, nights: nn, rate: x.rate, amount: amt, taxable: sp.base, gst: sp.gst, gstRate: rule.rate, sac: rule.sac, ruleId: rule.id };
+    });
+    roomSplit = { base: roomSegs.reduce((t, x) => t + x.taxable, 0), gst: roomSegs.reduce((t, x) => t + x.gst, 0) };
+    const top = roomSegs.slice().sort((a, c) => c.amount - a.amount)[0];
+    roomRuleUsed = { rate: top.gstRate, sac: top.sac, id: top.ruleId };
+  }
   const foodSplit = split(foodAmtRaw, foodRule.rate);
   const laundrySplit = split(laundryAmtRaw, laundryRule.rate);
   const transportSplit = split(transportAmtRaw, transportRule.rate);
@@ -1112,8 +1170,9 @@ function calcBillGST(booking, roomObj, allRooms, gstMode) {
 
   return {
     gstMode,
-    roomAmt: roomSplit.base, roomGST: roomSplit.gst, roomGSTRate: roomRule.rate,
-    roomCGST: roomCgstSgst.cgst, roomSGST: roomCgstSgst.sgst, roomSAC: roomRule.sac, roomRuleId: roomRule.id,
+    roomAmt: roomSplit.base, roomGST: roomSplit.gst, roomGSTRate: roomRuleUsed.rate,
+    roomCGST: roomCgstSgst.cgst, roomSGST: roomCgstSgst.sgst, roomSAC: roomRuleUsed.sac, roomRuleId: roomRuleUsed.id,
+    roomSegs,
     foodAmt: foodSplit.base, foodGST: foodSplit.gst, foodGSTRate: foodRule.rate,
     foodCGST: foodCgstSgst.cgst, foodSGST: foodCgstSgst.sgst, foodSAC: foodRule.sac, foodRuleId: foodRule.id,
     laundryAmt: laundrySplit.base, laundryGST: laundrySplit.gst, laundryGSTRate: laundryRule.rate,
@@ -1169,7 +1228,17 @@ function buildTaxedLineItems(booking, roomObj, allRooms) {
 
   const lines = [];
   const roomLineTotal = booking.roomTotal || 0;
-  if (roomLineTotal > 0) {
+  if (Array.isArray(booking._roomLines)) {
+    booking._roomLines.forEach(l => lines.push(l));
+  } else if (Array.isArray(G.roomSegs) && G.roomSegs.length > 1) {
+    G.roomSegs.forEach(x => {
+      const cs = splitCgstSgst(x.gst);
+      lines.push({
+        date: x.from || "", desc: "Room " + (booking.roomId || "") + (roomObj?.type ? " — " + roomObj.type : "") + " (" + x.nights + "N @ " + inrAmt(x.rate) + ")",
+        sac: AdminCfg.inv("roomSac") || x.sac || G.roomSAC, rate: x.gstRate, taxable: x.taxable, cgst: cs.cgst, sgst: cs.sgst, total: x.taxable + x.gst
+      });
+    });
+  } else if (roomLineTotal > 0) {
     const s = split(roomLineTotal, G.roomGSTRate);
     const cs = splitCgstSgst(s.gst);
     const nights = booking.checkIn && booking.checkOut ? nts(booking.checkIn, booking.checkOut) : 1;
@@ -1210,6 +1279,57 @@ function buildTaxedLineItems(booking, roomObj, allRooms) {
     });
   });
   return { lines, G };
+}
+
+// ── COMBINED GROUP BILL ───────────────────────────────────────────
+// A group booking checked out with "one combined bill" leaves one frozen
+// record per room, all with the same invoiceNo and groupBill:true. For
+// printing/sharing they are merged into ONE bill: a room line per room
+// (and per rate segment), every room's food/services, summed GST/totals,
+// and all advances. Falls back to the single room's bill if the other
+// rooms' records aren't on this device.
+function rackOf(b, roomObj) { return b && b._groupView ? (b._rackTotal || 0) : (roomObj && roomObj.rate || 0); }
+function groupBillView(b) {
+  if (!b || b._groupView || !b.groupBill || !b.groupId || !b.invoiceNo) return b;
+  const mem = [];
+  BOOKING_POOL.forEach(x => { if (x && x.groupBill && x.groupId === b.groupId && x.invoiceNo === b.invoiceNo && x.status === "checkedout") mem.push(x); });
+  if (!mem.some(x => x.id === b.id)) mem.push(b);
+  if (mem.length < 2) return b;
+  mem.sort((x, y) => (x.id === x.groupId ? -1 : 0) - (y.id === y.groupId ? -1 : 0) || String(x.roomId).localeCompare(String(y.roomId), undefined, { numeric: true }));
+  const prim = mem[0];
+  const roomLines = [], charges = [];
+  const gb = {};
+  let sum = k => mem.reduce((t, m) => t + (Number(m[k]) || 0), 0);
+  mem.forEach(m => {
+    const room = (CURRENT_ROOMS || []).find(r => r.id === m.roomId);
+    buildTaxedLineItems({ ...m, charges: [] }, room, CURRENT_ROOMS).lines.forEach(l => roomLines.push(l));
+    (m.charges || []).forEach(c => charges.push({ ...c, name: String(c.name || "") + " (Room " + m.roomId + ")" }));
+    const g = m.gstBreakdown || {};
+    Object.keys(g).forEach(k => {
+      const v = g[k];
+      if (/(Amt|GST|CGST|SGST|IGST)$/.test(k) && typeof v === "number") gb[k] = (gb[k] || 0) + v;
+      else if (gb[k] === undefined || gb[k] === null) gb[k] = v;
+    });
+  });
+  gb.roomSegs = null;
+  const grand = sum("grandTotal");
+  const advances = [].concat(...mem.map(m => Array.isArray(m.advances) && m.advances.length ? m.advances : (Number(m.advance) > 0 ? [{ amount: Number(m.advance), mode: m.advanceMode || "", date: m.checkIn }] : [])));
+  const adv = advances.reduce((t, a) => t + (Number(a.amount) || 0), 0);
+  const minD = k => mem.map(m => m[k]).filter(Boolean).sort()[0] || prim[k];
+  const maxD = k => mem.map(m => m[k]).filter(Boolean).sort().slice(-1)[0] || prim[k];
+  return {
+    ...prim, id: b.groupId, _groupView: true, _groupCount: mem.length,
+    roomId: mem.map(m => m.roomId).join(", "),
+    roomTotal: sum("roomTotal"), rateSegments: null, _roomLines: roomLines, charges,
+    _roomType: [...new Set(mem.map(m => { const r = (CURRENT_ROOMS || []).find(z => z.id === m.roomId); return r ? r.type : ""; }).filter(Boolean))].join(", "),
+    _rackTotal: mem.reduce((t, m) => { const r = (CURRENT_ROOMS || []).find(z => z.id === m.roomId); return t + (Number(r && r.rate) || 0); }, 0),
+    checkIn: minD("checkIn"), checkOut: maxD("checkOut"),
+    adults: String(sum("adults")), children: String(sum("children")),
+    grandTotal: grand, subTotal: sum("subTotal"), gstAmt: sum("gstAmt"),
+    advances, advance: adv, advancePaid: adv,
+    balanceReceived: Math.max(0, grand - adv), refundDue: Math.max(0, adv - grand),
+    gstBreakdown: gb, driverCommission: undefined
+  };
 }
 
 // ── GST INVOICE NUMBERING ────────────────────────────────────────
@@ -2003,6 +2123,14 @@ const AdminCfg = {
     const i = CURRENT_ADMINCFG && CURRENT_ADMINCFG.invoice;
     return !(i && i.fy === false);
   },
+  stampOwnerAllowed() {
+    const st = CURRENT_ADMINCFG && CURRENT_ADMINCFG.stamp;
+    return !!(st && st.ownerUpload);
+  },
+  driverPhotoLimit() {
+    const n = Math.floor(Number(CURRENT_ADMINCFG && CURRENT_ADMINCFG.driverPhotoLimit));
+    return n >= 1 && n <= 180 ? n : 100;
+  },
   floorName(fl) {
     const m = (CURRENT_ADMINCFG && CURRENT_ADMINCFG.floorNames) || {};
     const v = m[String(fl)];
@@ -2013,6 +2141,10 @@ const AdminCfg = {
 // top-level functions like openInvoice) to determine "specified premises"
 // status across the WHOLE hotel's room configuration, not just one room.
 let CURRENT_ROOMS = [];
+// Every booking this device has seen (live list + archive months opened in
+// History) by id — lets a combined group bill find its other rooms.
+const BOOKING_POOL = new Map();
+function rememberBookings(arr) { (Array.isArray(arr) ? arr : []).forEach(x => { if (x && x.id) BOOKING_POOL.set(x.id, x); }); }
 const STAFF = [{
   u: "owner",
   p: "owner123",
@@ -3285,6 +3417,9 @@ function pdfSafe(s) {
 }
 function pdfIsLatin1(s) { return !/[^\x00-\xFF]/.test(s); }
 async function buildInvoiceVectorPDF(b, roomObj) {
+  b = groupBillView(b);
+  if (b._groupView) roomObj = { ...(roomObj || {}), type: b._roomType, rate: b._rackTotal };
+  if (invoiceLayout() === "classic") return buildClassicInvoicePDF(b, roomObj);
   await loadScriptOnce("/jspdf.umd.min.js");
   const { jsPDF } = window.jspdf;
   const n = nts(b.checkIn, b.checkOut);
@@ -3319,12 +3454,14 @@ async function buildInvoiceVectorPDF(b, roomObj) {
   // Title + header
   font("bold", 10, [60, 60, 60]); doc.text(T.title, PW / 2, y + 8, { align: "center" }); y += 16;
   const headTop = y;
-  y += 20; font("bold", 18, NAVY); wrap(T.name, W - 20).forEach(l => { doc.text(l, PW / 2, y, { align: "center" }); y += 20; });
+  const LOGO = invoiceLogo(), hw = LOGO ? W - 180 : W - 20;
+  if (LOGO) pdfLogo(doc, LOGO, M + 10, headTop + 8, 66, 66);
+  y += 20; font("bold", 18, NAVY); wrap(T.name, hw).forEach(l => { doc.text(l, PW / 2, y, { align: "center" }); y += 20; });
   if (T.tagline) { font("italic", 9, [180, 100, 10]); doc.text(T.tagline, PW / 2, y - 4, { align: "center" }); y += 10; }
-  font("normal", 9, [50, 50, 50]); wrap(T.addr, W - 40).forEach(l => { doc.text(l, PW / 2, y, { align: "center" }); y += 11; });
-  if (T.contact) { wrap(T.contact, W - 40).forEach(l => { doc.text(l, PW / 2, y, { align: "center" }); y += 11; }); }
+  font("normal", 9, [50, 50, 50]); wrap(T.addr, LOGO ? hw : W - 40).forEach(l => { doc.text(l, PW / 2, y, { align: "center" }); y += 11; });
+  if (T.contact) { wrap(T.contact, LOGO ? hw : W - 40).forEach(l => { doc.text(l, PW / 2, y, { align: "center" }); y += 11; }); }
   if (T.gstin) { font("bold", 9.5); doc.text("GSTIN: " + T.gstin, PW / 2, y + 1, { align: "center" }); y += 13; }
-  y += 4; doc.setLineWidth(1.2); doc.rect(M, headTop, W, y - headTop);
+  y += 4; if (LOGO) y = Math.max(y, headTop + 82); doc.setLineWidth(1.2); doc.rect(M, headTop, W, y - headTop);
 
   // Customer + bill details
   const infoTop = y, colW = W / 2, pad = 8;
@@ -3342,9 +3479,9 @@ async function buildInvoiceVectorPDF(b, roomObj) {
   kv("Room / Type", (b.roomId || "") + (roomObj && roomObj.type ? " - " + roomObj.type : ""));
   kv("No. of Pax", Number(b.adults || 1) + Number(b.children || 0));
   kv("Arrival", fmtDateTime(b.checkIn, b.checkInTime));
-  kv("Departure", fmtDateTime(b.checkOutActual || b.checkOut, b.checkOutTime));
-  kv("Rack Rate", money(roomObj && roomObj.rate || 0) + "/night");
-  kv("Charge Rate", money(n > 0 ? Math.round((b.roomTotal || 0) / n) : 0) + "/night");
+  kv("Departure", fmtDateTime(b.checkOutActual || b.checkOut, departureTime(b)));
+  kv(b._groupView ? "Rack Rate (" + b._groupCount + " rooms)" : "Rack Rate", money(rackOf(b, roomObj)) + "/night");
+  kv(b._groupView ? "Charge Rate (" + b._groupCount + " rooms)" : "Charge Rate", money(n > 0 ? Math.round((b.roomTotal || 0) / n) : 0) + "/night");
   kv("Nights", n);
   kv("Pay Mode", payMode);
   if (G.placeOfSupply) kv("Place of Supply", G.placeOfSupplyCode || "");
@@ -3426,10 +3563,12 @@ async function buildInvoiceVectorPDF(b, roomObj) {
   }
   // Signatures
   if (y > PH - 110) newPage();
-  const sTop = y; y += 50;
+  const STAMP = invoiceStamp();
+  const sTop = y; y += STAMP ? 66 : 50;
   if (b.signature && /^data:image\/(png|jpe?g)/i.test(b.signature)) {
     try { doc.addImage(b.signature, /png/i.test(b.signature.slice(0, 20)) ? "PNG" : "JPEG", M + pad, sTop + 4, 110, 38); } catch (e) {}
   }
+  if (STAMP) pdfLogo(doc, STAMP, M + W - pad - 150, sTop + 3, 150, 52);
   font("normal", 9); doc.text("Guest Signature", M + pad, y); doc.text(T.signatory, M + W - pad, y, { align: "right" });
   doc.setLineWidth(0.6); doc.line(M + pad, y - 10, M + pad + 140, y - 10); doc.line(M + W - pad - 140, y - 10, M + W - pad, y - 10);
   y += 8; doc.setLineWidth(1.2); doc.rect(M, sTop, W, y - sTop);
@@ -3614,7 +3753,387 @@ function invoiceHeader() {
     signatory: A("signatory") || "Authorized Signatory"
   };
 }
+// ── INVOICE DESIGNS ─────────────────────────────────────────────────
+// "modern"  = the standard AtithiBook invoice (default)
+// "classic" = traditional hotel tax-invoice layout: boxed header with
+//             logo, 3-column guest/stay/bill block, full-width HSN/CGST/
+//             SGST/IGST table, totals box, remark + signature row,
+//             jurisdiction line and address footer.
+// BizzSathi admin picks the design per hotel (Bill Settings → Invoice
+// design). Both use the same numbers (buildTaxedLineItems) — only the
+// look changes.
+function invoiceLayout() {
+  const v = AdminCfg.inv("layout");
+  return v === "classic" ? "classic" : "modern";
+}
+// Indian-format rupee amount for the screen bill: 2363 -> ₹2,363, 56.5 -> ₹56.5
+function inrAmt(v) {
+  return "₹" + (Number(v) || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
+// The hotel's own uploaded logo (Settings → Hotel profile), if any.
+function invoiceLogo() {
+  const l = CURRENT_PROFILE && CURRENT_PROFILE.hotelLogo;
+  return typeof l === "string" && /^data:image\/(png|jpe?g)/i.test(l) ? l : "";
+}
+// Stamp/signature image → small data URL. Keeps PNG (transparent
+// background) when the source is PNG and the result stays small; else JPEG.
+function shrinkStampImage(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\//.test(file.type || "")) return reject(new Error("Please choose an image (PNG or JPG)"));
+    const r = new FileReader();
+    r.onerror = () => reject(new Error("Could not read the image"));
+    r.onload = ev => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Could not read the image"));
+      img.onload = () => {
+        const sc = Math.min(1, 360 / Math.max(img.width, img.height, 1));
+        const cv = document.createElement("canvas");
+        cv.width = Math.max(1, Math.round(img.width * sc)); cv.height = Math.max(1, Math.round(img.height * sc));
+        const g = cv.getContext("2d");
+        const png = /png/i.test(file.type);
+        if (!png) { g.fillStyle = "#fff"; g.fillRect(0, 0, cv.width, cv.height); }
+        g.drawImage(img, 0, 0, cv.width, cv.height);
+        let out = png ? cv.toDataURL("image/png") : "";
+        if (!out || out.length > 160000) {
+          const c2 = document.createElement("canvas"); c2.width = cv.width; c2.height = cv.height;
+          const g2 = c2.getContext("2d"); g2.fillStyle = "#fff"; g2.fillRect(0, 0, c2.width, c2.height); g2.drawImage(cv, 0, 0);
+          out = c2.toDataURL("image/jpeg", 0.8);
+        }
+        resolve(out);
+      };
+      img.src = ev.target.result;
+    };
+    r.readAsDataURL(file);
+  });
+}
+// Draw the logo inside a box (x,y,bw,bh) keeping its own shape, centred.
+function pdfLogo(doc, data, x, y, bw, bh) {
+  try {
+    const fmt = /png/i.test(data.slice(0, 20)) ? "PNG" : "JPEG";
+    const p = doc.getImageProperties(data);
+    const sc = Math.min(bw / (p.width || 1), bh / (p.height || 1));
+    const w = (p.width || 1) * sc, h = (p.height || 1) * sc;
+    doc.addImage(data, fmt, x + (bw - w) / 2, y + (bh - h) / 2, w, h);
+  } catch (e) {}
+}
+// Digital stamp / signature above "Authorised Signatory" (paid add-on
+// "digital_stamp"). BizzSathi admin uploads it in Bill Settings
+// (adminConfig.stamp.img); if admin also ticks "owner may upload", the
+// owner's own stamp from Settings (profile.hotelStamp) is used instead.
+function invoiceStamp() {
+  if (!hasFeature("digital_stamp")) return "";
+  const ok = v => typeof v === "string" && /^data:image\/(png|jpe?g);base64,/i.test(v) && v.length < 400000 ? v : "";
+  const st = (CURRENT_ADMINCFG && CURRENT_ADMINCFG.stamp) || {};
+  const own = st.ownerUpload ? ok(CURRENT_PROFILE && CURRENT_PROFILE.hotelStamp) : "";
+  return own || ok(st.img);
+}
+function departureTime(b) {
+  // settled bill: the real checkout time, not the planned one
+  return b.status === "checkedout" && b.checkOutActual ? (b.checkOutActualTime || b.checkOutTime) : b.checkOutTime;
+}
+// Shared numbers for the classic layout (HTML and PDF).
+function classicInvoiceData(b, roomObj) {
+  const { lines, G } = buildTaxedLineItems(b, roomObj, CURRENT_ROOMS);
+  const RH = invoiceHeader();
+  const n = nts(b.checkIn, b.checkOut);
+  const igst = (G.totalIGST || 0) > 0;
+  const rows = lines.map(l => {
+    const isExtraBed = /extra bed/i.test(l.desc || "");
+    const igstAmt = igst ? Math.round((l.taxable * l.rate - l.cgst - l.sgst) * 100) / 100 : 0;
+    return {
+      date: fmtDate(l.date), sac: l.sac || "", desc: l.desc || "",
+      roomAmt: isExtraBed ? 0 : l.taxable, extraBed: isExtraBed ? l.taxable : 0,
+      cgstP: igst ? 0 : l.rate * 50, cgst: l.cgst, sgstP: igst ? 0 : l.rate * 50, sgst: l.sgst,
+      igstP: igst ? l.rate * 100 : 0, igstAmt, total: l.total
+    };
+  });
+  const sum = k => rows.reduce((t, r) => t + (Number(r[k]) || 0), 0);
+  const lineTotal = Math.round(sum("total") * 100) / 100;
+  const grand = G.grandTotal;
+  const adv = bkAdvance(b);
+  const settled = b.status === "checkedout";
+  const payMode = b.paymentMode || (settled ? "Cash" : "");
+  const received = settled ? Math.max(0, grand - adv) : 0;
+  return {
+    RH, G, rows, n, igst,
+    tot: { roomAmt: sum("roomAmt"), extraBed: sum("extraBed"), cgst: G.totalCGST || sum("cgst"), sgst: G.totalSGST || sum("sgst"), igst: G.totalIGST || sum("igstAmt"), total: lineTotal },
+    total: lineTotal, roundOff: Math.round((grand - lineTotal) * 100) / 100, discount: 0,
+    advance: adv, received, due: settled ? Math.max(0, adv > grand ? 0 : grand - adv - received) : Math.max(0, grand - adv),
+    refund: Math.max(0, adv - grand), grand, payMode, settled,
+    rack: rackOf(b, roomObj), charge: n > 0 ? Math.round((b.roomTotal || 0) / n) : 0,
+    pax: Number(b.adults || 1) + Number(b.children || 0),
+    arrival: fmtDateTime(b.checkIn, b.checkInTime),
+    departure: fmtDateTime(b.checkOutActual || b.checkOut, departureTime(b)),
+    billDate: fmtDate(b.checkOutActual || todayStr()),
+    idLine: (b.docType || "Aadhaar Card") + ": " + ((b.docType && b.docType !== "Aadhaar Card") ? (b.aadhaar || "") : maskAadhaar(b.aadhaar)),
+    hsn: AdminCfg.inv("roomSac") || G.roomSAC || "",
+    planType: AdminCfg.inv("planType"),
+    logo: typeof CURRENT_PROFILE.hotelLogo === "string" && /^data:image\/(png|jpe?g)/i.test(CURRENT_PROFILE.hotelLogo) ? CURRENT_PROFILE.hotelLogo : ""
+  };
+}
+const n2 = v => (Number(v) || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function buildClassicInvoiceHTML(b, roomObj) {
+  const D = classicInvoiceData(b, roomObj);
+  const RH = D.RH;
+  const e = escHtml;
+  const STAMP = invoiceStamp();
+  const blankRows = Math.max(0, 9 - D.rows.length);
+  const shareText = "🏨 *" + (RH.name || "") + "*\nTax Invoice: " + (b.invoiceNo || b.id) + "\n\nGuest: " + b.name +
+    "\nRoom: " + b.roomId + " (" + (roomObj?.type || "") + ")\nCheck-In: " + D.arrival + "\nCheck-Out: " + D.departure + "\nTotal: ₹" + D.grand;
+  const kv = (k, v) => `<tr><td class="k">${e(k)}</td><td class="v">${e(v)}</td></tr>`;
+  const num = (v, show) => show === false || !v ? "" : n2(v);
+  return `<!DOCTYPE html><html><head><meta charset=utf-8><title>Invoice ${e(b.invoiceNo || b.id)}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;color:#111}
+body{background:#e8e8e8;padding:20px}
+.page{max-width:820px;margin:0 auto;background:#fff;padding:14px 16px 18px}
+.actbar{display:flex;gap:10px;margin:-14px -16px 12px;padding:14px;background:#e8e8e8}
+.actbtn{flex:1;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer}
+.btn-print{background:#1e3a5f;color:#fff}.btn-share{background:#25d366;color:#fff}
+.ttl{text-align:center;font-size:11px;font-weight:700;letter-spacing:.5px;margin-bottom:4px}
+.box{border:1.5px solid #222}
+.hd{display:flex;align-items:center;gap:14px;padding:10px 14px;min-height:96px}
+.logo{width:96px;height:80px;object-fit:contain;flex:none}
+.hdtxt{flex:1;text-align:center}
+.hn{font-size:24px;font-weight:700;letter-spacing:.6px}
+.hs{font-size:10.5px;font-style:italic;color:#444;margin-top:2px}
+.ha{font-size:11px;font-weight:700;text-transform:uppercase;margin-top:4px;line-height:1.4}
+.hg{font-size:11px;font-weight:700;margin-top:3px}
+.info{display:grid;grid-template-columns:1.25fr 1fr 1fr;border-top:1.5px solid #222}
+.info>div{padding:6px 8px;font-size:10.5px;line-height:1.5}
+.info>div+div{border-left:1.5px solid #222}
+.cdt{font-weight:700;text-decoration:underline}
+.info table{border-collapse:collapse;width:100%}
+.info td{padding:1px 0;font-size:10.5px;vertical-align:top}
+.info td.k{font-weight:700;width:46%}
+table.it{width:100%;border-collapse:collapse;border-top:1.5px solid #222}
+table.it th{border:1px solid #222;border-top:none;font-size:9.5px;font-weight:700;padding:4px 3px;text-align:center}
+table.it td{border-left:1px solid #222;border-right:1px solid #222;font-size:10.5px;padding:3px 4px;height:20px;vertical-align:top}
+table.it td.r{text-align:right}
+table.it tr.tot td{border:1px solid #222;font-weight:700;height:auto;padding:4px}
+table.it th:first-child,table.it td:first-child{border-left:none}
+table.it th:last-child,table.it td:last-child{border-right:none}
+.bot{display:grid;grid-template-columns:1.6fr 1fr;border-top:1.5px solid #222}
+.bot>div{padding:8px 10px;font-size:11px;line-height:1.6}
+.bot>div+div{border-left:1.5px solid #222}
+.tl{display:flex;justify-content:space-between;font-weight:700}
+.words{border-top:1.5px solid #222;padding:7px 10px;font-size:11.5px}
+.rem{display:grid;grid-template-columns:1fr 1fr;border-top:1.5px solid #222;min-height:84px}
+.rem>div{padding:8px 10px;font-size:11px}
+.rem>div+div{border-left:1.5px solid #222;display:flex;flex-direction:column;justify-content:space-between}
+.sg{display:flex;justify-content:space-between;align-items:flex-end;font-size:10.5px;font-weight:700;gap:8px}
+.sgn{font-size:14px;font-weight:700;color:#1d3a8a}
+.jur{border-top:1.5px solid #222;text-align:center;font-weight:700;font-size:12px;padding:6px}
+.ft{border-top:1.5px solid #222;text-align:center;font-size:10.5px;padding:6px;line-height:1.5}
+@media print{body{padding:0;background:#fff}.actbar{display:none}.page{max-width:100%;padding:0}}
+</style></head><body>
+<div class="page">
+<div class="actbar">
+  <button class="actbtn btn-print" onclick="window.print()">🖨️ Print</button>
+  <button class="actbtn btn-share" onclick="shareInvoice()">📤 Share on WhatsApp</button>
+</div>
+<div class="ttl">${e(RH.title)}</div>
+<div class="box">
+  <div class="hd">
+    ${D.logo ? `<img class="logo" src="${e(D.logo)}" alt="">` : ""}
+    <div class="hdtxt">
+      <div class="hn">${e(String(RH.name || "").toUpperCase())}</div>
+      ${RH.tagline ? `<div class="hs">${e(RH.tagline)}</div>` : ""}
+      <div class="ha">${e(String(RH.addr || "").replace(/\n/g, ", "))}${RH.phone ? " " + e(RH.phone) : ""}</div>
+      ${RH.gstin ? `<div class="hg">GST NO : ${e(RH.gstin)}</div>` : ""}
+    </div>
+    ${D.logo ? `<div class="logo"></div>` : ""}
+  </div>
+  <div class="info">
+    <div>
+      <div class="cdt">Customer Details :</div>
+      <div style="font-weight:700">${e(b.name || "")}</div>
+      ${b.address ? `<div>${e(b.address)}</div>` : ""}
+      ${b.mobile ? `<div>${e(b.mobile)}</div>` : ""}
+      <div>${e(D.idLine)}</div>
+    </div>
+    <div><table>
+      ${kv("Reg. No.", b.id)}${kv("Room Type", roomObj?.type || "")}${kv("Room No", b.roomId || "")}
+      ${D.planType ? kv("Plan Type", D.planType) : ""}${kv("No Of Pax", D.pax)}
+      ${kv("Pay Mode", D.payMode ? (D.settled ? "Received by " + D.payMode.toLowerCase() : D.payMode) : "")}${kv("Status", D.settled ? "Settled" : "In-House")}
+    </table></div>
+    <div><table>
+      ${kv("Bill No.", b.invoiceNo || "")}${kv("Arrival Date", D.arrival)}${kv("Departure Date", D.departure)}
+      ${kv("Bill Date", D.billDate)}${kv("Rack Rate", n2(D.rack))}${kv("Charge Rate", n2(D.charge))}${kv("HSN Code", D.hsn)}
+    </table></div>
+  </div>
+  <table class="it">
+    <thead>
+      <tr><th rowspan="2">DATE</th><th rowspan="2">HSN<br>SAC</th><th rowspan="2" style="width:22%">DESCRIPTION</th><th rowspan="2">ROOM<br>AMT</th><th rowspan="2">EXTRA<br>BED</th>
+        <th colspan="2">CGST</th><th colspan="2">SGST</th><th colspan="2">IGST</th><th rowspan="2">TOTAL<br>AMT</th></tr>
+      <tr><th>%</th><th>AMT</th><th>%</th><th>AMT</th><th>%</th><th>AMT</th></tr>
+    </thead>
+    <tbody>
+      ${D.rows.map(r => `<tr><td>${e(r.date)}</td><td>${e(r.sac)}</td><td>${e(r.desc)}</td><td class="r">${num(r.roomAmt)}</td><td class="r">${num(r.extraBed)}</td>
+        <td class="r">${D.igst ? "" : r.cgstP.toFixed(2)}</td><td class="r">${D.igst ? "" : n2(r.cgst)}</td><td class="r">${D.igst ? "" : r.sgstP.toFixed(2)}</td><td class="r">${D.igst ? "" : n2(r.sgst)}</td>
+        <td class="r">${D.igst ? r.igstP.toFixed(2) : ""}</td><td class="r">${D.igst ? n2(r.igstAmt) : ""}</td><td class="r">${n2(r.total)}</td></tr>`).join("")}
+      ${Array.from({ length: blankRows }, () => `<tr>${"<td></td>".repeat(12)}</tr>`).join("")}
+      <tr class="tot"><td>Total</td><td></td><td></td><td class="r">${n2(D.tot.roomAmt)}</td><td class="r">${D.tot.extraBed ? n2(D.tot.extraBed) : ""}</td><td></td><td class="r">${D.igst ? "" : n2(D.tot.cgst)}</td><td></td><td class="r">${D.igst ? "" : n2(D.tot.sgst)}</td><td></td><td class="r">${D.igst ? n2(D.tot.igst) : ""}</td><td class="r">${n2(D.tot.total)}</td></tr>
+    </tbody>
+  </table>
+  <div class="bot">
+    <div>
+      ${D.settled ? `<div>Received by ${e(D.payMode.toLowerCase())} ${n2(D.received)}${D.refund ? " · Refund due " + n2(D.refund) : ""}</div>` : `<div>Guest in-house — bill not yet settled</div>`}
+      ${RH.footerNote ? `<div style="margin-top:10px;text-align:center">${e(RH.footerNote).replace(/\n/g, "<br>")}</div>` : ""}
+    </div>
+    <div>
+      <div class="tl"><span>TOTAL</span><span>${n2(D.total)}</span></div>
+      <div class="tl"><span>ROUND OFF</span><span>${n2(D.roundOff)}</span></div>
+      <div class="tl"><span>DISCOUNT</span><span>${n2(D.discount)}</span></div>
+      <div class="tl"><span>ADVANCE RECEIVED</span><span>${n2(D.advance)}</span></div>
+      <div class="tl"><span>AMOUNT RECEIVED</span><span>${n2(D.received)}</span></div>
+      <div class="tl"><span>AMOUNT DUE</span><span>${n2(D.due)}</span></div>
+    </div>
+  </div>
+  <div class="words"><b>Amount In Words:</b>&nbsp; ${e(amountInWords(D.grand))}</div>
+  <div class="rem">
+    <div><div style="font-weight:700;text-align:center">REMARK</div>
+      <div style="display:flex;justify-content:space-between;margin-top:26px;font-weight:700"><span>E &amp; O.E</span><span>${e(RH.checkoutNote || "")}</span></div></div>
+    <div>
+      <div class="sgn">${e(RH.name || "")}</div>
+      ${STAMP || (b.signature && b.signature.startsWith("data:image")) ? `<div style="display:flex;justify-content:space-between;align-items:flex-end;gap:8px">${STAMP ? `<img src="${e(STAMP)}" alt="stamp" style="max-height:58px;max-width:130px;object-fit:contain">` : "<span></span>"}${b.signature && b.signature.startsWith("data:image") ? `<img src="${e(b.signature)}" alt="" style="height:38px">` : ""}</div>` : ""}
+      <div class="sg"><span>${e(RH.signatory)}</span><span>Guest Signature</span><span>Checked</span></div>
+    </div>
+  </div>
+  ${RH.jurisdiction ? `<div class="jur">SUBJECT TO ${e(RH.jurisdiction.toUpperCase())} JURISDICTION</div>` : ""}
+  <div class="ft"><b>${e(RH.name || "")}</b><br>${e(String(RH.addr || "").replace(/\n/g, ", "))}${RH.email || RH.website ? "<br>" + [RH.email ? "Email: " + e(RH.email) : "", RH.website ? "Website: " + e(RH.website) : ""].filter(Boolean).join(", ") : ""}</div>
+</div>
+</div>
+<script>
+function shareInvoice(){
+  var text = ${jsonForScript(shareText)};
+  if (navigator.share) { navigator.share({ title: "Invoice " + ${jsonForScript(b.invoiceNo || b.id)}, text: text }).catch(function(){}); }
+  else { window.open("https://wa.me/?text=" + encodeURIComponent(text), "_blank"); }
+}
+<\/script>
+</body></html>`;
+}
+// Classic layout as a real-text PDF (WhatsApp share). null = can't be
+// drawn with the built-in Latin-1 fonts → caller falls back to picture PDF.
+async function buildClassicInvoicePDF(b, roomObj) {
+  await loadScriptOnce("/jspdf.umd.min.js");
+  const { jsPDF } = window.jspdf;
+  const D = classicInvoiceData(b, roomObj);
+  const RH = D.RH;
+  const S = pdfSafe;
+  const T = [RH.name, RH.tagline, RH.addr, RH.phone, RH.gstin, RH.email, RH.website, RH.footerNote, RH.checkoutNote, RH.jurisdiction, RH.signatory, RH.title, b.name, b.address, b.mobile, D.idLine, D.planType].map(x => S(x)).join(" ") + D.rows.map(r => S(r.desc) + S(r.date)).join(" ");
+  if (!pdfIsLatin1(T)) return null;
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const PW = 595.28, M = 24, W = PW - 2 * M;
+  const font = (st, sz, col) => { doc.setFont("helvetica", st); doc.setFontSize(sz); doc.setTextColor(...(col || [17, 17, 17])); };
+  const wrap = (s, w) => doc.splitTextToSize(String(s || ""), w);
+  doc.setDrawColor(34, 34, 34);
+  let y = M;
+  font("bold", 9); doc.text(S(RH.title), PW / 2, y + 7, { align: "center" }); y += 13;
+  const top = y;
+  // header
+  let hy = y + 22;
+  const hasLogo = !!D.logo;
+  if (hasLogo) pdfLogo(doc, D.logo, M + 10, y + 8, 78, 66);
+  const cx = PW / 2, tw = W - (hasLogo ? 200 : 40);
+  font("bold", 18); wrap(S(String(RH.name || "").toUpperCase()), tw).forEach(l => { doc.text(l, cx, hy, { align: "center" }); hy += 19; });
+  if (RH.tagline) { font("italic", 8.5, [70, 70, 70]); doc.text(S(RH.tagline), cx, hy - 5, { align: "center" }); hy += 8; }
+  font("bold", 8.6); wrap(S((String(RH.addr || "").replace(/\n/g, ", ") + (RH.phone ? " " + RH.phone : "")).toUpperCase()), tw).forEach(l => { doc.text(l, cx, hy, { align: "center" }); hy += 10.5; });
+  if (RH.gstin) { font("bold", 8.8); doc.text("GST NO : " + S(RH.gstin), cx, hy + 1, { align: "center" }); hy += 12; }
+  y = Math.max(hy + 4, top + 84);
+  doc.setLineWidth(1.1); doc.line(M, y, M + W, y);
+  // info block (3 columns)
+  const c1 = W * 0.38, c2 = W * 0.31, c3 = W - c1 - c2, x1 = M, x2 = M + c1, x3 = M + c1 + c2;
+  let ly = y + 12, my = y + 12, ry = y + 12;
+  font("bold", 8.6); doc.text("Customer Details :", x1 + 6, ly); doc.setLineWidth(0.5); doc.line(x1 + 6, ly + 1.5, x1 + 6 + doc.getTextWidth("Customer Details :"), ly + 1.5); ly += 11;
+  font("bold", 8.6); wrap(S(b.name), c1 - 12).forEach(l => { doc.text(l, x1 + 6, ly); ly += 10.5; });
+  font("normal", 8.4);
+  [b.address, b.mobile, D.idLine].filter(Boolean).forEach(v => wrap(S(v), c1 - 12).slice(0, 3).forEach(l => { doc.text(l, x1 + 6, ly); ly += 10.5; }));
+  const kv = (x, w, yy, k, v) => { font("bold", 8.4); doc.text(k, x + 6, yy); font("normal", 8.4); doc.text(wrap(S(v), w * 0.5)[0] || "", x + w * 0.47, yy); return yy + 11; };
+  my = kv(x2, c2, my, "Reg. No.", b.id); my = kv(x2, c2, my, "Room Type", roomObj?.type || ""); my = kv(x2, c2, my, "Room No", b.roomId || "");
+  if (D.planType) my = kv(x2, c2, my, "Plan Type", D.planType);
+  my = kv(x2, c2, my, "No Of Pax", String(D.pax)); my = kv(x2, c2, my, "Pay Mode", D.payMode ? (D.settled ? "Received by " + D.payMode.toLowerCase() : D.payMode) : "");
+  my = kv(x2, c2, my, "Status", D.settled ? "Settled" : "In-House");
+  ry = kv(x3, c3, ry, "Bill No.", b.invoiceNo || ""); ry = kv(x3, c3, ry, "Arrival Date", D.arrival); ry = kv(x3, c3, ry, "Departure Date", D.departure);
+  ry = kv(x3, c3, ry, "Bill Date", D.billDate); ry = kv(x3, c3, ry, "Rack Rate", n2(D.rack)); ry = kv(x3, c3, ry, "Charge Rate", n2(D.charge)); ry = kv(x3, c3, ry, "HSN Code", D.hsn);
+  const infoBot = Math.max(ly, my, ry) + 2;
+  doc.setLineWidth(1.1); doc.line(x2, y, x2, infoBot); doc.line(x3, y, x3, infoBot); doc.line(M, infoBot, M + W, infoBot);
+  y = infoBot;
+  // items table
+  const cols = [["DATE", 52], ["HSN\nSAC", 38], ["DESCRIPTION", 0], ["ROOM\nAMT", 52], ["EXTRA\nBED", 38], ["%", 26], ["AMT", 40], ["%", 26], ["AMT", 40], ["%", 26], ["AMT", 40], ["TOTAL\nAMT", 56]];
+  cols[2][1] = W - cols.reduce((t, c) => t + c[1], 0);
+  const xs = []; cols.reduce((x, c) => { xs.push(x); return x + c[1]; }, M);
+  const hTop = y, hMid = y + 14, hBot = y + 30;
+  doc.setLineWidth(0.7);
+  font("bold", 7.6);
+  [[5, 6, "CGST"], [7, 8, "SGST"], [9, 10, "IGST"]].forEach(([a, bI, t]) => { doc.text(t, (xs[a] + xs[bI] + cols[bI][1]) / 2, hTop + 10, { align: "center" }); doc.line(xs[a], hMid, xs[bI] + cols[bI][1], hMid); });
+  cols.forEach((c, i) => {
+    const isSub = i >= 5 && i <= 10;
+    const lines = c[0].split("\n");
+    const cyy = isSub ? hMid + 11 : hTop + (lines.length > 1 ? 12 : 18);
+    lines.forEach((l, k) => doc.text(l, xs[i] + c[1] / 2, cyy + k * 9, { align: "center" }));
+  });
+  doc.line(M, hBot, M + W, hBot);
+  const cell = (txt, i, yy, al, bold) => { font(bold ? "bold" : "normal", 8.2); const x = al === "r" ? xs[i] + cols[i][1] - 3 : xs[i] + 3; doc.text(String(txt), x, yy, { align: al === "r" ? "right" : "left" }); };
+  y = hBot;
+  const bodyTop = y;
+  D.rows.forEach(r => {
+    const dl = wrap(S(r.desc), cols[2][1] - 6);
+    cell(S(r.date), 0, y + 11); cell(S(r.sac), 1, y + 11);
+    font("normal", 8.2); dl.forEach((l, k) => doc.text(l, xs[2] + 3, y + 11 + k * 9.5));
+    if (r.roomAmt) cell(n2(r.roomAmt), 3, y + 11, "r"); if (r.extraBed) cell(n2(r.extraBed), 4, y + 11, "r");
+    if (!D.igst) { cell(r.cgstP.toFixed(2), 5, y + 11, "r"); cell(n2(r.cgst), 6, y + 11, "r"); cell(r.sgstP.toFixed(2), 7, y + 11, "r"); cell(n2(r.sgst), 8, y + 11, "r"); }
+    else { cell(r.igstP.toFixed(2), 9, y + 11, "r"); cell(n2(r.igstAmt), 10, y + 11, "r"); }
+    cell(n2(r.total), 11, y + 11, "r");
+    y += Math.max(15, 5 + dl.length * 9.5);
+  });
+  y = Math.max(y, bodyTop + 190);
+  // column rules from header top to table bottom
+  xs.slice(1).forEach((x, i) => { const j = i + 1; const from = (j >= 6 && j <= 10 && j !== 7 && j !== 9) ? hMid : hTop; doc.line(x, j === 6 || j === 8 || j === 10 ? hMid : hTop, x, y + 16); });
+  doc.line(M, y, M + W, y);
+  cell("Total", 0, y + 11, "l", true); cell(n2(D.tot.roomAmt), 3, y + 11, "r", true); if (D.tot.extraBed) cell(n2(D.tot.extraBed), 4, y + 11, "r", true);
+  if (!D.igst) { cell(n2(D.tot.cgst), 6, y + 11, "r", true); cell(n2(D.tot.sgst), 8, y + 11, "r", true); } else cell(n2(D.tot.igst), 10, y + 11, "r", true);
+  cell(n2(D.tot.total), 11, y + 11, "r", true);
+  y += 16; doc.setLineWidth(1.1); doc.line(M, y, M + W, y);
+  // payment + totals
+  const bTop = y, lw = W * 0.6;
+  let py = y + 14;
+  font("normal", 8.8);
+  doc.text(D.settled ? "Received by " + S(D.payMode.toLowerCase()) + " " + n2(D.received) + (D.refund ? "  |  Refund due " + n2(D.refund) : "") : "Guest in-house - bill not yet settled", M + 8, py); py += 14;
+  if (RH.footerNote) { String(RH.footerNote).split("\n").map(S).forEach(p => wrap(p, lw - 16).forEach(l => { doc.text(l, M + lw / 2, py, { align: "center" }); py += 10.5; })); }
+  let ty = y + 13;
+  const tl = (k, v) => { font("bold", 8.8); doc.text(k, M + lw + 8, ty); doc.text(v, M + W - 8, ty, { align: "right" }); ty += 12.5; };
+  tl("TOTAL", n2(D.total)); tl("ROUND OFF", n2(D.roundOff)); tl("DISCOUNT", n2(D.discount)); tl("ADVANCE RECEIVED", n2(D.advance)); tl("AMOUNT RECEIVED", n2(D.received)); tl("AMOUNT DUE", n2(D.due));
+  y = Math.max(py, ty) + 2;
+  doc.line(M + lw, bTop, M + lw, y); doc.line(M, y, M + W, y);
+  // words
+  font("bold", 9); doc.text("Amount In Words:", M + 8, y + 13); font("normal", 9);
+  wrap(S(amountInWords(D.grand)), W - 110).forEach((l, k) => doc.text(l, M + 92, y + 13 + k * 11));
+  y += 20; doc.line(M, y, M + W, y);
+  // remark + signature
+  const rTop = y, half = W / 2;
+  font("bold", 9); doc.text("REMARK", M + half / 2, y + 13, { align: "center" });
+  doc.text("E & O.E", M + 8, y + 50); if (RH.checkoutNote) doc.text(S(RH.checkoutNote), M + half - 8, y + 50, { align: "right" });
+  const STAMP = invoiceStamp(), sh = STAMP ? 22 : 0;
+  font("bold", 11, [29, 58, 138]); doc.text(S(RH.name), M + half + 10, y + 18);
+  if (STAMP) pdfLogo(doc, STAMP, M + half + 10, y + 22, 110, 26 + sh);
+  if (b.signature && /^data:image\/(png|jpe?g)/i.test(b.signature)) { try { doc.addImage(b.signature, /png/i.test(b.signature.slice(0, 20)) ? "PNG" : "JPEG", M + W - 130, y + 22 + sh, 90, 26); } catch (e) {} }
+  font("bold", 8.4); doc.text(S(RH.signatory), M + half + 10, y + 56 + sh); doc.text("Guest Signature", M + half + half * 0.56, y + 56 + sh, { align: "center" }); doc.text("Checked", M + W - 8, y + 56 + sh, { align: "right" });
+  y += 64 + sh; doc.line(M + half, rTop, M + half, y); doc.line(M, y, M + W, y);
+  if (RH.jurisdiction) { font("bold", 10); doc.text("SUBJECT TO " + S(RH.jurisdiction.toUpperCase()) + " JURISDICTION", PW / 2, y + 14, { align: "center" }); y += 21; doc.line(M, y, M + W, y); }
+  font("bold", 9); doc.text(S(RH.name), PW / 2, y + 12, { align: "center" }); y += 12;
+  font("normal", 8.5); wrap(S(String(RH.addr || "").replace(/\n/g, ", ")), W - 20).forEach(l => { y += 10.5; doc.text(l, PW / 2, y, { align: "center" }); });
+  const ew = [RH.email ? "Email: " + RH.email : "", RH.website ? "Website: " + RH.website : ""].filter(Boolean).join(", ");
+  if (ew) { y += 10.5; doc.text(S(ew), PW / 2, y, { align: "center" }); }
+  y += 7;
+  doc.setLineWidth(1.1); doc.rect(M, top, W, y - top);
+  doc.setProperties({ title: (b.invoiceNo ? "Invoice " + b.invoiceNo : "Invoice " + b.id), creator: "AtithiBook" });
+  return doc.output("blob");
+}
 const buildInvoiceHTML = (b, roomObj) => {
+  b = groupBillView(b);
+  if (b._groupView) roomObj = { ...(roomObj || {}), type: b._roomType, rate: b._rackTotal };
+  if (invoiceLayout() === "classic") return buildClassicInvoiceHTML(b, roomObj);
   const n = nts(b.checkIn, b.checkOut);
   const { lines: taxedLines, G } = buildTaxedLineItems(b, roomObj, CURRENT_ROOMS);
   const sub = G.subtotal;
@@ -3625,12 +4144,14 @@ const buildInvoiceHTML = (b, roomObj) => {
   // over the HOTEL demo constant — every customer must see their real
   // name/address/GSTIN on invoices, not the shared placeholder data.
   const RH = invoiceHeader();
+  const LOGO = invoiceLogo();
+  const STAMP = invoiceStamp();
   const shareText = "🏨 *" + (RH.name || "") + "*\nTax Invoice: " + (b.invoiceNo || b.id) +
     "\n\nGuest: " + b.name +
     "\nRoom: " + b.roomId + " (" + (roomObj?.type || "") + ")" +
     "\nCheck-In: " + fmtDateTime(b.checkIn, b.checkInTime) +
-    "\nCheck-Out: " + fmtDateTime(b.checkOut, b.checkOutTime) +
-    "\nTotal: ₹" + grand +
+    "\nCheck-Out: " + fmtDateTime(b.checkOutActual || b.checkOut, departureTime(b)) +
+    "\nTotal: " + inrAmt(grand) +
     "\n\n_Print/Save as PDF from the Print button and attach here._";
   const payMode = b.paymentMode || (b.status === "checkedout" ? "Cash" : "—");
   const advV = bkAdvance(b);
@@ -3641,10 +4162,10 @@ const buildInvoiceHTML = (b, roomObj) => {
     <td>${escHtml(fmtDate ? fmtDate(l.date) : l.date)}</td>
     <td>${escHtml(l.desc)}</td>
     <td class="center">${escHtml(l.sac)}</td>
-    <td class="num">${igstTotal > 0 ? "—" : (l.rate * 50).toFixed(1)}</td><td class="num">₹${l.cgst}</td>
-    <td class="num">${igstTotal > 0 ? "—" : (l.rate * 50).toFixed(1)}</td><td class="num">₹${l.sgst}</td>
-    <td class="num">${igstTotal > 0 ? (l.rate*100).toFixed(1) : "—"}</td><td class="num">${igstTotal > 0 ? "₹"+((l.taxable*l.rate)-l.cgst-l.sgst) : "—"}</td>
-    <td class="num">₹${l.total}</td>
+    <td class="num">${igstTotal > 0 ? "—" : (l.rate * 50).toFixed(1)}</td><td class="num">${inrAmt(l.cgst)}</td>
+    <td class="num">${igstTotal > 0 ? "—" : (l.rate * 50).toFixed(1)}</td><td class="num">${inrAmt(l.sgst)}</td>
+    <td class="num">${igstTotal > 0 ? (l.rate*100).toFixed(1) : "—"}</td><td class="num">${igstTotal > 0 ? inrAmt((l.taxable*l.rate)-l.cgst-l.sgst) : "—"}</td>
+    <td class="num">${inrAmt(l.total)}</td>
   </tr>`).join("");
 
   const html = `<!DOCTYPE html><html><head><meta charset=utf-8><title>Invoice ${escHtml(b.invoiceNo || b.id)}</title>
@@ -3657,7 +4178,9 @@ body{background:#e8e8e8;padding:20px}
 .actbtn{flex:1;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Roboto',Arial,sans-serif}
 .btn-print{background:#1e3a5f;color:#fff}.btn-share{background:#25d366;color:#fff}
 .topbar{display:flex;justify-content:space-between;padding:6px 14px;font-size:11px;border-bottom:1px solid #000}
-.head{text-align:center;padding:12px 14px;border-bottom:2px solid #000}
+.head{text-align:center;padding:12px 14px;border-bottom:2px solid #000;position:relative}
+.head.haslogo{padding-left:116px;padding-right:116px}
+.hlogo{position:absolute;left:14px;top:50%;transform:translateY(-50%);width:96px;height:76px;object-fit:contain}
 .hotelname{font-size:26px;font-weight:700;letter-spacing:.5px;color:#1e3a5f}
 .subline{font-size:9px;color:#d97706;font-style:italic;margin-top:2px;font-weight:400}
 .addr{font-size:11px;color:#444;margin-top:4px}
@@ -3691,6 +4214,8 @@ table.items td.center,table.items th.center{text-align:center}
 .sigimg{text-align:right}
 .sigimg img{height:60px}
 .sigline{border-top:1.5px solid #333;width:180px;margin-top:2px}
+.stampbox{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:2px}
+.stampbox img{max-height:70px;max-width:170px;object-fit:contain}
 .footer{padding:10px 14px;font-size:10px;color:#555;border-top:1px solid #000;line-height:1.7}
 .thanks{font-size:14px;font-weight:700;color:#1e3a5f;text-align:center;padding:8px 14px 4px}
 @media print{body{padding:0;background:#fff}.actbar{display:none}.sheet{border:none;max-width:100%}}
@@ -3703,7 +4228,8 @@ table.items td.center,table.items th.center{text-align:center}
   <button class="actbtn btn-share" onclick="shareInvoice()">📤 Share on WhatsApp</button>
 </div>
 <div class="topbar"><span>${RH.gstin ? "GSTIN: " + escHtml(RH.gstin) : ""}</span><span>${RH.phone ? "Ph: " + escHtml(RH.phone) : ""}</span></div>
-<div class="head">
+<div class="head${LOGO ? " haslogo" : ""}">
+  ${LOGO ? `<img class="hlogo" src="${escHtml(LOGO)}" alt=""/>` : ""}
   <div class="hotelname">${escHtml(RH.name)}</div>
   ${RH.tagline ? `<div class="subline">${escHtml(RH.tagline)}</div>` : ""}
   <div class="addr">${escHtml((RH.addr || "").replace(/\n/g, ", "))}</div>
@@ -3731,12 +4257,12 @@ table.items td.center,table.items th.center{text-align:center}
     <div class="metarow"><span>No. Of Pax</span><b>${escHtml(Number(b.adults || 1) + Number(b.children || 0))}</b></div>
     <div class="metarow"><span>Pay Mode</span><b>${escHtml(payMode)}</b></div>
     <div class="metarow"><span>Arrival</span><b>${escHtml(fmtDateTime(b.checkIn, b.checkInTime))}</b></div>
-    <div class="metarow"><span>Departure</span><b>${escHtml(fmtDateTime(b.checkOutActual || b.checkOut, b.checkOutTime))}</b></div>
+    <div class="metarow"><span>Departure</span><b>${escHtml(fmtDateTime(b.checkOutActual || b.checkOut, departureTime(b)))}</b></div>
   </div>
   <div class="metacol">
-    <div class="metarow"><span>Rack Rate</span><b>₹${escHtml(roomObj?.rate || 0)}/night</b></div>
-    <div class="metarow"><span>Charge Rate</span><b>₹${n > 0 ? Math.round((b.roomTotal || 0) / n) : 0}/night</b></div>
-    ${discAmt > 0 ? `<div class="metarow"><span>Discount</span><b>₹${discAmt} (${discPct.toFixed(1)}%)</b></div>` : ""}
+    <div class="metarow"><span>Rack Rate${b._groupView ? " (" + b._groupCount + " rooms)" : ""}</span><b>${inrAmt(rackOf(b, roomObj))}/night</b></div>
+    <div class="metarow"><span>Charge Rate${b._groupView ? " (" + b._groupCount + " rooms)" : ""}</span><b>${inrAmt(n > 0 ? Math.round((b.roomTotal || 0) / n) : 0)}/night</b></div>
+    ${discAmt > 0 ? `<div class="metarow"><span>Discount</span><b>${inrAmt(discAmt)} (${discPct.toFixed(1)}%)</b></div>` : ""}
     <div class="metarow"><span>Nights</span><b>${n}</b></div>
     ${G.placeOfSupply ? `<div class="metarow"><span>Place of Supply</span><b>${escHtml(G.placeOfSupplyCode || "")}</b></div>` : ""}
   </div>
@@ -3754,29 +4280,32 @@ ${b.family.map((m, i) => `${i + 1}. ${escHtml(m.name || "—")}${m.relation ? " 
 ${itemRows}
 <tr class="totrow">
   <td colspan="3">Total</td>
-  <td class="num"></td><td class="num">₹${G.totalCGST}</td>
-  <td class="num"></td><td class="num">₹${G.totalSGST}</td>
-  <td class="num"></td><td class="num">${igstTotal > 0 ? "₹"+igstTotal : "—"}</td>
-  <td class="num">₹${grand}</td>
+  <td class="num"></td><td class="num">${inrAmt(G.totalCGST)}</td>
+  <td class="num"></td><td class="num">${inrAmt(G.totalSGST)}</td>
+  <td class="num"></td><td class="num">${igstTotal > 0 ? inrAmt(igstTotal) : "—"}</td>
+  <td class="num">${inrAmt(grand)}</td>
 </tr>
 </table>
 <div class="bottomgrid">
   <div class="bcol">
     <div class="metatitle">Payment</div>
-    ${advV > 0 ? `<div class="totline"><span>Advance received (earlier)</span><b>₹${advV}</b></div>
-    <div class="totline"><span>${advV > grand ? "Refund due to guest" : "Balance received by " + escHtml(payMode)}</span><b>₹${Math.abs(grand - advV)}</b></div>
-    <div class="totline"><span>Invoice total</span><b>₹${grand}</b></div>` : `<div class="totline"><span>Received by ${escHtml(payMode)}</span></div>
-    <div class="totline"><b>₹${grand}</b></div>`}
+    ${advV > 0 ? `<div class="totline"><span>Advance received (earlier)</span><b>${inrAmt(advV)}</b></div>
+    <div class="totline"><span>${advV > grand ? "Refund due to guest" : "Balance received by " + escHtml(payMode)}</span><b>${inrAmt(Math.abs(grand - advV))}</b></div>
+    <div class="totline"><span>Invoice total</span><b>${inrAmt(grand)}</b></div>` : `<div class="totline"><span>Received by ${escHtml(payMode)}</span></div>
+    <div class="totline"><b>${inrAmt(grand)}</b></div>`}
   </div>
   <div class="bcol">
-    <div class="totline"><span>Subtotal</span><b>₹${sub}</b></div>
-    <div class="totline"><span>Total GST</span><b>₹${gst}</b></div>
+    <div class="totline"><span>Subtotal</span><b>${inrAmt(sub)}</b></div>
+    <div class="totline"><span>Total GST</span><b>${inrAmt(gst)}</b></div>
     <div class="totline"><span>Round Off</span><b>₹0.00</b></div>
-    <div class="grandline"><span>Net Amount</span><span>₹${grand}</span></div>
+    <div class="grandline"><span>Net Amount</span><span>${inrAmt(grand)}</span></div>
   </div>
 </div>
 <div class="words">Amount In Words: <b>${escHtml(amountInWords(grand))}</b></div>
-${b.signature && b.signature.startsWith("data:image") ? `<div class="signbox">
+${STAMP ? `<div class="signbox" style="align-items:flex-end">
+  ${b.signature && b.signature.startsWith("data:image") ? `<div class="sigimg" style="text-align:left"><img src="${escHtml(b.signature)}"/><div class="sigline"></div><div style="font-size:10px;color:#888">Guest Signature · ${escHtml(b.name)}</div></div>` : `<span>Guest Signature: ______________________</span>`}
+  <div class="stampbox"><img src="${escHtml(STAMP)}" alt="stamp"/><span>${escHtml(RH.signatory)}</span></div>
+</div>` : b.signature && b.signature.startsWith("data:image") ? `<div class="signbox">
   <span>Guest Signature</span>
   <div class="sigimg"><img src="${escHtml(b.signature)}"/><div class="sigline"></div><div style="font-size:10px;color:#888">${escHtml(b.name)}</div></div>
 </div>` : `<div class="signbox">
@@ -3787,7 +4316,7 @@ ${RH.checkoutNote || RH.footerNote ? `<div class="footer" style="color:#222;font
 ${RH.jurisdiction ? `<div class="footer" style="text-align:center;font-weight:700;color:#222;font-size:11.5px">SUBJECT TO ${escHtml(RH.jurisdiction.toUpperCase())} JURISDICTION</div>` : ""}
 <div class="thanks">🙏 Thank You For Staying With ${escHtml(RH.footerName)}!</div>
 <div class="footer">
-GST as per rates effective 22 Sept 2025 (56th GST Council). Room slab based on ₹${roomObj?.rate || 0}/night tariff. ${G.gstMode === "inclusive" ? "Displayed rate is inclusive of GST." : "GST charged in addition to displayed rate."} ${b.status === "checkedout" ? "This bill is final — GST locked at the rate/mode active at checkout." : "Guest still checked in — amounts use current pricing and lock at checkout."}<br>
+GST as per rates effective 22 Sept 2025 (56th GST Council). Room slab based on ${inrAmt(roomObj?.rate || 0)}/night tariff. ${G.gstMode === "inclusive" ? "Displayed rate is inclusive of GST." : "GST charged in addition to displayed rate."} ${b.status === "checkedout" ? "This bill is final — GST locked at the rate/mode active at checkout." : "Guest still checked in — amounts use current pricing and lock at checkout."}<br>
 Computer-generated invoice, no signature required. ${escHtml(RH.phone)} ${RH.email ? "| " + escHtml(RH.email) : ""}
 </div>
 </div>
@@ -6508,6 +7037,10 @@ function CheckInView({
   const [advAmt, setAdvAmt] = useState("");
   const [advMode, setAdvMode] = useState("Cash");
   const tempId = useRef(uid()).current;
+  // Group / bulk booking (paid add-on "bulk_booking"): more rooms for the
+  // SAME guest under the same booking ID. [{ roomId, rate, adults }]
+  const [extraRooms, setExtraRooms] = useState([]);
+  const canBulk = hasFeature("bulk_booking") && !prefill;
   const [form, setForm] = useState({
     roomId: prefill?.roomId || checkInRoom?.id || empty[0]?.id || "",
     name: prefill?.name || "",
@@ -7460,6 +7993,16 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     }
     const extraAdv = Number(advAmt) || 0;
     if (extraAdv < 0) return alert("Advance amount is invalid");
+    const extras = canBulk ? extraRooms : [];
+    const seenRooms = new Set([form.roomId]);
+    for (const x of extras) {
+      if (!x.roomId) return alert("Please choose a room for every extra room row (or remove the empty row)");
+      if (seenRooms.has(x.roomId)) return alert("Room " + x.roomId + " is selected twice");
+      seenRooms.add(x.roomId);
+      if (!(Number(x.rate) >= 0) || x.rate === "") return alert("Please enter the rate for room " + x.roomId);
+      const c2 = roomConflict(x.roomId, form.checkIn, form.checkOut, reservations, bookings, null);
+      if (c2) return alert("Room " + x.roomId + " is already booked for these dates" + (c2.r ? " (" + c2.r.name + ")" : ""));
+    }
     let driverInfo = null;
     if (hasFeature("driver_commission") && driverPick && driverPick.sel) {
       let known = [];
@@ -7499,7 +8042,8 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       advances: advancesAll,
       advance: advancesAll.reduce((t, a) => t + (Number(a.amount) || 0), 0),
       ...(driverInfo ? { driver: driverInfo } : {}),
-      _resId: prefill?.id || null
+      _resId: prefill?.id || null,
+      _extraRooms: extras.map(x => ({ roomId: x.roomId, roomTotal: Math.round(Number(x.rate) * n), adults: String(Math.max(1, parseInt(x.adults, 10) || 1)) }))
     });
     setDone(true);
     setTimeout(() => {
@@ -7532,7 +8076,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       color: "var(--muted)",
       fontSize: 14
     }
-  }, "Room ", form.roomId, " · ", form.name));
+  }, "Room ", [form.roomId, ...(canBulk ? extraRooms.map(x => x.roomId) : [])].filter(Boolean).join(", "), " · ", form.name));
   return /*#__PURE__*/React.createElement("div", {
     className: "scrollable hs",
     style: {
@@ -7672,7 +8216,25 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     style: {
       color: "var(--gold2)"
     }
-  }, "Room: ", fmtMoney(rt))))), _h("div", { className: "card", "data-t": "advance-card", style: { padding: "14px 16px" } },
+  }, "Room: ", fmtMoney(rt))), canBulk && sel && _h("div", { "data-t": "bulk-rooms", style: { background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10, padding: 12 } },
+    _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--navy)", marginBottom: 6 } }, "🏨 MORE ROOMS FOR THIS GUEST (same booking ID)"),
+    extraRooms.map((x, i) => {
+      const taken = new Set([form.roomId, ...extraRooms.filter((_, j) => j !== i).map(y => y.roomId)]);
+      const setX = patch => setExtraRooms(extraRooms.map((y, j) => j === i ? { ...y, ...patch } : y));
+      return _h("div", { key: i, "data-t": "bulk-row", style: { display: "grid", gridTemplateColumns: "1.6fr 1fr .7fr auto", gap: 6, marginBottom: 6, alignItems: "center" } },
+        _h("select", { "aria-label": "Extra room " + (i + 1), "data-t": "bulk-room", value: x.roomId, onChange: e => { const r = rooms.find(z => z.id === e.target.value); setX({ roomId: e.target.value, rate: r ? String(r.rate) : "" }); } },
+          _h("option", { value: "" }, "-- Room --"),
+          empty.filter(r => !taken.has(r.id)).map(r => _h("option", { key: r.id, value: r.id }, r.id + " · " + r.type))),
+        _h("input", { "aria-label": "Rate per night", "data-t": "bulk-rate", type: "number", min: 0, inputMode: "numeric", placeholder: "₹/night", value: x.rate, onChange: e => setX({ rate: e.target.value }) }),
+        _h("input", { "aria-label": "Adults", "data-t": "bulk-adults", type: "number", min: 1, value: x.adults, onChange: e => setX({ adults: e.target.value }) }),
+        _h("button", { type: "button", "aria-label": "Remove room", onClick: () => setExtraRooms(extraRooms.filter((_, j) => j !== i)), style: { width: 40, height: 40, border: "1px solid var(--border)", borderRadius: 8, background: "#fff", cursor: "pointer" } }, "✕"));
+    }),
+    extraRooms.length > 0 && _h("div", { style: { fontSize: 10.5, color: "var(--muted)", margin: "0 0 6px" } }, "Room · rate per night · adults"),
+    _h("button", { type: "button", className: "btn-o", "data-t": "bulk-add", onClick: () => setExtraRooms([...extraRooms, { roomId: "", rate: "", adults: "1" }]), disabled: empty.filter(r => r.id !== form.roomId).length <= extraRooms.length, style: { width: "100%" } }, "➕ Add another room"),
+    extraRooms.length > 0 && n > 0 && _h("div", { "data-t": "bulk-total", style: { display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, marginTop: 8, color: "var(--navy)" } },
+      _h("span", null, (extraRooms.length + 1) + " rooms · " + n + " night" + (n > 1 ? "s" : "")),
+      _h("span", null, "Total room rent: " + fmtMoney(rt + extraRooms.reduce((t, x) => t + Math.round((Number(x.rate) || 0) * n), 0)))),
+    _h("div", { style: { fontSize: 10.5, color: "var(--muted)", marginTop: 6 } }, "ID photos are saved once, with the main room. At checkout you can make one combined bill or a separate bill per room.")))), _h("div", { className: "card", "data-t": "advance-card", style: { padding: "14px 16px" } },
     _h("div", { className: "st" }, "💵 ADVANCE / DEPOSIT"),
     preAdv > 0 ? _h("div", { style: { fontSize: 12.5, background: "#dcfce7", color: "#166534", borderRadius: 8, padding: "8px 10px", marginBottom: 8, fontWeight: 600 } }, "Advance received at booking: ₹" + preAdv.toLocaleString("en-IN") + " — will be adjusted in the final bill") : null,
     _h("input", { type: "number", inputMode: "numeric", "data-t": "ci-adv", value: advAmt, onChange: e => setAdvAmt(e.target.value), placeholder: preAdv > 0 ? "Additional advance received now? (optional)" : "Advance amount ₹ (optional)" }),
@@ -8596,6 +9158,8 @@ function ProfileEditModal({
     (!user || user.role === "Owner") ? (profile.ownerName || "") : (user.name || ""));
   const [tagline, setTagline] = useState(profile.hotelTagline || "");
   const [logo, setLogo] = useState(profile.hotelLogo || null);
+  const [stamp, setStamp] = useState(profile.hotelStamp || null);
+  const canStamp = isOwner && hasFeature("digital_stamp") && AdminCfg.stampOwnerAllowed();
   const [banner, setBanner] = useState(profile.hotelBanner || null);
   const [hotelName, setHotelName] = useState(profile.hotelName || "");
   const [hotelAddr, setHotelAddr] = useState(profile.hotelAddr || "");
@@ -8637,6 +9201,7 @@ function ProfileEditModal({
       _selfName: isOwner ? undefined : name.trim(),
       hotelTagline: tagline.trim(),
       hotelLogo: logo,
+      hotelStamp: stamp || null,
       hotelBanner: banner,
       hotelName: hotelName.trim(),
       hotelAddr: hotelAddr.trim(),
@@ -8711,7 +9276,7 @@ function ProfileEditModal({
       fontSize: 12,
       color: "#78350f"
     }
-  }, "📋 These details are printed on every guest invoice — enter your actual hotel name, address and GSTIN."), CURRENT_ADMINCFG && CURRENT_ADMINCFG.invoice && Object.keys(CURRENT_ADMINCFG.invoice).some(k => AdminCfg.locked(k)) && /*#__PURE__*/React.createElement("div", {
+  }, "📋 These details are printed on every guest invoice — enter your actual hotel name, address and GSTIN."), ["address", "phone", "email", "gstin", "thanksName"].some(k => AdminCfg.locked(k)) && /*#__PURE__*/React.createElement("div", {
     "data-t": "inv-locked-note",
     style: { background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8, padding: "10px 12px", fontSize: 12, color: "#1e3a8a" }
   }, "🔒 Some bill details have been set by BizzSathi (locked fields). To change them, please contact BizzSathi support."), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
@@ -8929,7 +9494,15 @@ function ProfileEditModal({
     type: "file",
     accept: "image/*",
     onChange: e => onImg(e, "logo")
-  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+  })), canStamp && /*#__PURE__*/React.createElement("div", { "data-t": "owner-stamp" }, /*#__PURE__*/React.createElement("label", {
+    style: { fontSize: 12, fontWeight: 600, color: "var(--muted)", display: "block", marginBottom: 5 }
+  }, "STAMP / SIGNATURE ON BILL (above Authorised Signatory)"), stamp && /*#__PURE__*/React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 6 } },
+    /*#__PURE__*/React.createElement("img", { src: stamp, alt: "stamp", style: { maxHeight: 60, maxWidth: 160, objectFit: "contain", border: "1px solid var(--border)", borderRadius: 8, background: "#fff", padding: 4 } }),
+    /*#__PURE__*/React.createElement("button", { type: "button", className: "btn-s", onClick: () => setStamp(null), style: { minHeight: 36 } }, "Remove")),
+  /*#__PURE__*/React.createElement("input", {
+    type: "file", accept: "image/png,image/jpeg", "data-t": "owner-stamp-file",
+    onChange: e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return; shrinkStampImage(f).then(setStamp).catch(err => alert(err.message)); }
+  }), /*#__PURE__*/React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 4 } }, "PNG with a transparent background looks best. Prints on every bill and WhatsApp PDF.")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     style: {
       fontSize: 12,
       fontWeight: 600,
@@ -9574,6 +10147,8 @@ function BookingModal({
   canEditMenu,
   user,
   onCheckOut,
+  onGroupCheckOut,
+  groupMembers,
   onExtendStay,
   onAddAdvance,
   onOwnerEdit,
@@ -9588,12 +10163,25 @@ function BookingModal({
   const [payMode, setPayMode] = useState("Cash");
   const [showExtend, setShowExtend] = useState(false);
   const [newCheckOut, setNewCheckOut] = useState(b.checkOut);
+  const curSegs = bookingSegments(b);
+  const curRate = Math.round((curSegs[curSegs.length - 1] || {}).rate || 0);
+  const [extRate, setExtRate] = useState("");
+  const grpAll = Array.isArray(groupMembers) ? groupMembers : [];
+  const grpActive = grpAll.filter(x => x.status === "active");
+  const isGroup = !!b.groupId && grpAll.length > 1;
+  const canCombine = b.status === "active" && grpActive.length > 1 && !!onGroupCheckOut;
+  const [billScope, setBillScope] = useState("one"); // "one" = this room only, "all" = combined bill
+  const [extScope, setExtScope] = useState("extra");
   const charges = b.charges || [];
   const G = calcBillGST(b, room, CURRENT_ROOMS);
   const sub = G.subtotal;
   const gst = G.totalGST;
   const grand = G.grandTotal;
   const adv = bkAdvance(b);
+  let grpGrand = 0, grpAdv = 0;
+  if (canCombine) grpActive.forEach(m => { const r = (CURRENT_ROOMS || []).find(z => z.id === m.roomId); grpGrand += calcBillGST(m, r, CURRENT_ROOMS).grandTotal; grpAdv += bkAdvance(m); });
+  const payGrand = canCombine && billScope === "all" ? grpGrand : grand;
+  const payAdv = canCombine && billScope === "all" ? grpAdv : adv;
   const advRows = adv > 0 ? /*#__PURE__*/React.createElement("div", { "data-t": "bm-adv" }, /*#__PURE__*/React.createElement("div", {
     style: { display: "flex", justifyContent: "space-between", fontSize: 13, color: "#166534", marginTop: 6 }
   }, /*#__PURE__*/React.createElement("span", null, "💵 Advance received"), /*#__PURE__*/React.createElement("span", null, "− ", fmtMoney(adv))), /*#__PURE__*/React.createElement("div", {
@@ -9614,10 +10202,15 @@ function BookingModal({
     onClick: async () => { const a = Number(advAmt); if (!(a > 0)) { alert("Please enter the advance amount"); return; } await onAddAdvance(b.id, a, advMode); setAdvOpen(false); setAdvAmt(""); }
   }, "💾 Save")));
   const n = nts(b.checkIn, b.checkOut);
-  const extendNights = newCheckOut > b.checkOut ? nts(b.checkIn, newCheckOut) : n;
+  const extendNights = newCheckOut > b.checkIn ? nts(b.checkIn, newCheckOut) : n;
+  const isLonger = newCheckOut > b.checkOut;
+  const rateChanged = extRate !== "" && Number(extRate) >= 0 && Math.round(Number(extRate)) !== curRate;
+  const scopeNow = isLonger ? extScope : "all";
+  const extPlan = newCheckOut > b.checkIn ? planStayChange(b, newCheckOut, rateChanged ? Number(extRate) : null, scopeNow) : null;
   const confirmExtend = () => {
     if (newCheckOut <= b.checkIn) { alert("Check-out date must be after the check-in date"); return; }
-    onExtendStay(b.id, newCheckOut);
+    if (extRate !== "" && !(Number(extRate) >= 0)) { alert("Please enter a valid rate"); return; }
+    onExtendStay(b.id, newCheckOut, rateChanged ? { rate: Number(extRate), scope: scopeNow } : undefined);
     setShowExtend(false);
   };
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
@@ -9790,7 +10383,9 @@ function BookingModal({
       color: "var(--navy)",
       marginTop: 6
     }
-  }, /*#__PURE__*/React.createElement("span", null, "TOTAL"), /*#__PURE__*/React.createElement("span", null, fmtMoney(grand))), advRows), showExtend && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "TOTAL"), /*#__PURE__*/React.createElement("span", null, fmtMoney(grand))), advRows), isGroup && /*#__PURE__*/React.createElement("div", {
+    "data-t": "group-banner", style: { background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 12, padding: "10px 12px", fontSize: 12.5, color: "var(--navy)" }
+  }, /*#__PURE__*/React.createElement("b", null, "👥 Group booking " + b.groupId), " · Rooms: ", grpAll.map(m => m.roomId + (m.status === "active" ? "" : " (checked out)")).join(", ")), showExtend && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#eff6ff",
       border: "1px solid #bfdbfe",
@@ -9803,13 +10398,24 @@ function BookingModal({
   }, /*#__PURE__*/React.createElement("div", {
     style: { fontSize: 12, fontWeight: 700, color: "var(--navy)" }
   }, "📅 New Check-Out Date"), /*#__PURE__*/React.createElement("input", {
-    type: "date",
+    type: "date", "data-t": "ext-date",
     value: newCheckOut,
     min: b.checkIn,
     onChange: e => setNewCheckOut(e.target.value)
-  }), /*#__PURE__*/React.createElement("div", {
-    style: { fontSize: 12, color: "var(--muted)" }
-  }, extendNights, " night", extendNights > 1 ? "s" : "", " total (", extendNights > n ? "+" + (extendNights - n) + " extra" : extendNights < n ? (n - extendNights) + " kam" : "no change", ") · Room amount will update to ₹", (room?.rate || 0) * extendNights), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--navy)", marginTop: 4 } }, "💰 Rate per night"),
+  /*#__PURE__*/React.createElement("input", {
+    type: "number", inputMode: "numeric", min: 0, "data-t": "ext-rate", value: extRate, placeholder: "Current: ₹" + curRate + " (leave blank to keep)",
+    onChange: e => setExtRate(e.target.value)
+  }), rateChanged && isLonger && /*#__PURE__*/React.createElement("div", { "data-t": "ext-scope", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 } },
+    [["all", "All days", "Whole stay at ₹" + Math.round(Number(extRate))], ["extra", "Only extra days", "Old nights stay at ₹" + curRate]].map(([v, l, d]) => /*#__PURE__*/React.createElement("button", {
+      key: v, type: "button", "data-t": "ext-scope-" + v, "aria-pressed": extScope === v, onClick: () => setExtScope(v),
+      style: { padding: "8px 6px", borderRadius: 10, cursor: "pointer", textAlign: "left", border: "1.5px solid " + (extScope === v ? "var(--navy)" : "var(--border)"), background: extScope === v ? "#dbeafe" : "#fff" }
+    }, /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, fontWeight: 700, color: "var(--navy)" } }, (extScope === v ? "● " : "○ ") + l), /*#__PURE__*/React.createElement("div", { style: { fontSize: 10.5, color: "var(--muted)" } }, d)))),
+  rateChanged && !isLonger && /*#__PURE__*/React.createElement("div", { style: { fontSize: 11, color: "var(--muted)" } }, "The new rate applies to all nights of the stay."),
+  /*#__PURE__*/React.createElement("div", {
+    "data-t": "ext-preview", style: { fontSize: 12, color: "var(--muted)" }
+  }, extendNights, " night", extendNights > 1 ? "s" : "", " total (", extendNights > n ? "+" + (extendNights - n) + " extra" : extendNights < n ? (n - extendNights) + " fewer" : "no change", ")", extPlan ? " · Room amount will be " + inrAmt(extPlan.roomTotal) + ((CURRENT_PROFILE && CURRENT_PROFILE.gstMode) === "inclusive" ? " (incl. GST)" : " + GST") : "",
+    extPlan && extPlan.rateSegments ? " (" + extPlan.rateSegments.map(x => nts(x.from, x.to) + "N × " + inrAmt(x.rate)).join(" + ") + ")" : ""), /*#__PURE__*/React.createElement("div", {
     style: { display: "flex", gap: 8 }
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn-o",
@@ -9827,7 +10433,7 @@ function BookingModal({
     }
   }, !showExtend && hasFeature("extend_stay") && /*#__PURE__*/React.createElement("button", {
     className: "btn-o",
-    onClick: () => { setNewCheckOut(b.checkOut); setShowExtend(true); },
+    onClick: () => { setNewCheckOut(b.checkOut); setExtRate(""); setExtScope("extra"); setShowExtend(true); },
     style: {
       width: "100%",
       display: "flex",
@@ -9857,7 +10463,11 @@ function BookingModal({
     style: { background: "#fff1f2", borderRadius: 12, padding: 12, marginTop: 4 }
   }, /*#__PURE__*/React.createElement("div", {
     style: { fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 8 }
-  }, "💳 Payment — " + (adv > 0 ? "Total " + fmtMoney(grand) + " − Advance " + fmtMoney(adv) + " = " + (adv > grand ? "Refund " : "Balance ") + fmtMoney(Math.abs(grand - adv)) : "Total: " + fmtMoney(grand))), /*#__PURE__*/React.createElement("div", {
+  }, "💳 Payment — " + (payAdv > 0 ? "Total " + fmtMoney(payGrand) + " − Advance " + fmtMoney(payAdv) + " = " + (payAdv > payGrand ? "Refund " : "Balance ") + fmtMoney(Math.abs(payGrand - payAdv)) : "Total: " + fmtMoney(payGrand))), canCombine && /*#__PURE__*/React.createElement("div", { "data-t": "bill-scope", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 } },
+    [["one", "Only Room " + b.roomId, "Separate bill · " + fmtMoney(grand)], ["all", "All " + grpActive.length + " rooms", "One combined bill · " + fmtMoney(grpGrand)]].map(([v, l, d]) => /*#__PURE__*/React.createElement("button", {
+      key: v, type: "button", "data-t": "bill-scope-" + v, "aria-pressed": billScope === v, onClick: () => setBillScope(v),
+      style: { padding: "8px 6px", borderRadius: 10, cursor: "pointer", textAlign: "left", border: "1.5px solid " + (billScope === v ? "#dc2626" : "var(--border)"), background: billScope === v ? "#fef2f2" : "#fff" }
+    }, /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, fontWeight: 700, color: billScope === v ? "#dc2626" : "#333" } }, (billScope === v ? "● " : "○ ") + l), /*#__PURE__*/React.createElement("div", { style: { fontSize: 10.5, color: "var(--muted)" } }, d)))), /*#__PURE__*/React.createElement("div", {
     style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }
   }, ["Cash", "Card", "UPI", "Bank Transfer", "Online (OTA)", "Other"].map(m => /*#__PURE__*/React.createElement("button", {
     key: m,
@@ -9875,7 +10485,8 @@ function BookingModal({
     style: { flex: 1, padding: "10px", borderRadius: 8, border: "1px solid var(--border)", background: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
-      if (window.confirm(`Check out ${b.name}?\nTotal: ${fmtMoney(grand)} (incl. GST)` + (adv > 0 ? `\nAdvance: ${fmtMoney(adv)}\n${adv > grand ? "Refund due" : "Balance due"}: ${fmtMoney(Math.abs(grand - adv))}` : "") + `\nPayment: ${payMode}`)) onCheckOut(b.id, payMode);
+      const all = canCombine && billScope === "all";
+      if (window.confirm(`Check out ${b.name}${all ? " — all " + grpActive.length + " rooms (" + grpActive.map(m => m.roomId).join(", ") + "), one combined bill" : ""}?\nTotal: ${fmtMoney(payGrand)} (incl. GST)` + (payAdv > 0 ? `\nAdvance: ${fmtMoney(payAdv)}\n${payAdv > payGrand ? "Refund due" : "Balance due"}: ${fmtMoney(Math.abs(payGrand - payAdv))}` : "") + `\nPayment: ${payMode}`)) { if (all) onGroupCheckOut(b.groupId, payMode); else onCheckOut(b.id, payMode); }
     },
     style: { flex: 1.5, padding: "10px", borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "✅ Confirm Check Out"))))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
@@ -9926,7 +10537,10 @@ function BookingEditModal({ b, rooms, onClose, onSave }) {
   const [busy, setBusy] = useState(false);
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
   const nights = f.checkIn && f.checkOut && f.checkOut > f.checkIn ? nts(f.checkIn, f.checkOut) : 0;
-  const roomTotal = Math.round((Number(f.rate) || 0) * nights);
+  // A stay priced at two rates (extended at a new rate for extra days)
+  // keeps that split unless the rate or dates are changed here.
+  const keepSegs = Array.isArray(b.rateSegments) && b.rateSegments.length > 1 && f.checkIn === b.checkIn && f.checkOut === b.checkOut && f.rate === String(Math.round((b.roomTotal || 0) / n0));
+  const roomTotal = keepSegs ? (b.roomTotal || 0) : Math.round((Number(f.rate) || 0) * nights);
   const roomChoices = (rooms || []).filter(r => r.id === b.roomId || !isActive || r.status !== "occupied");
   const lab = { fontSize: 11.5, fontWeight: 700, color: "var(--muted)", display: "block", marginBottom: 4 };
   const field = (k, label, props) => _h("div", null, _h("label", { htmlFor: "be-" + k, style: lab }, label), _h("input", Object.assign({ id: "be-" + k, value: f[k], onChange: e => set(k, e.target.value) }, props || {})));
@@ -9943,6 +10557,7 @@ function BookingEditModal({ b, rooms, onClose, onSave }) {
         docType: f.docType, aadhaar: f.aadhaar.trim().slice(0, 30),
         adults: String(Math.max(1, parseInt(f.adults, 10) || 1)), children: String(Math.max(0, parseInt(f.children, 10) || 0)),
         roomId: f.roomId, checkIn: f.checkIn, checkOut: f.checkOut, roomTotal,
+        ...(Array.isArray(b.rateSegments) ? { rateSegments: keepSegs ? b.rateSegments : null } : {}),
         ...(isActive ? {} : { paymentMode: f.paymentMode })
       }, reason.trim().slice(0, 120));
     } finally { setBusy(false); }
@@ -10001,6 +10616,7 @@ function rebuildSettledBill(b, room, allRooms) {
    "laundryAmt","laundryGST","laundryGSTRate","laundryCGST","laundrySGST","laundrySAC","laundryRuleId","transportAmt","transportGST","transportGSTRate","transportCGST","transportSGST","transportSAC","transportRuleId",
    "extraBedAmt","extraBedGST","extraBedGSTRate","extraBedCGST","extraBedSGST","extraBedSAC","extraBedRuleId","otherAmt","otherGST","otherGSTRate","otherCGST","otherSGST","otherRuleId",
    "otherMiscAmt","otherMiscGST","otherMiscSAC","totalCGST","totalSGST","totalIGST","placeOfSupply","placeOfSupplyCode","gstMode"].forEach(k => { gb[k] = G[k]; });
+  gb.roomSegs = G.roomSegs || null;
   return {
     G,
     fields: {
@@ -11807,6 +12423,151 @@ const DriverComm = {
       : { ...x, status: "due", paidAt: null, paidMode: null, updatedAt: now })));
   }
 };
+// ── Driver photos (identification) ─────────────────────────────────
+// Always-free design: the FULL photo stays on the device that took it
+// (IndexedDB). Only a tiny thumbnail (≤ 5 KB) goes to the cloud, all of a
+// hotel's thumbnails in ONE document "driverPhotos" ([{id, t, at}]) — one
+// read per screen, and at most AdminCfg.driverPhotoLimit() (default 100,
+// admin can raise to 180 so the document stays far below 1 MiB). Above the
+// limit the photo is still kept on this device, just not synced.
+const DriverPhotos = {
+  KEY: "driverPhotos",
+  MAX_THUMB: 5120,
+  _img(file) {
+    return new Promise((resolve, reject) => {
+      if (!file || !/^image\//.test(file.type || "")) return reject(new Error("Please choose a photo"));
+      const r = new FileReader();
+      r.onerror = () => reject(new Error("Could not read the photo"));
+      r.onload = ev => { const im = new Image(); im.onerror = () => reject(new Error("Could not read the photo")); im.onload = () => resolve(im); im.src = ev.target.result; };
+      r.readAsDataURL(file);
+    });
+  },
+  _jpeg(im, max, q, square) {
+    const cv = document.createElement("canvas");
+    let sx = 0, sy = 0, sw = im.width, sh = im.height;
+    if (square) { const m = Math.min(sw, sh); sx = (sw - m) / 2; sy = (sh - m) / 2; sw = sh = m; }
+    const sc = Math.min(1, max / Math.max(sw, sh, 1));
+    cv.width = Math.max(1, Math.round(sw * sc)); cv.height = Math.max(1, Math.round(sh * sc));
+    const g = cv.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, cv.width, cv.height);
+    g.drawImage(im, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+    return cv.toDataURL("image/jpeg", q);
+  },
+  async makeImages(file) {
+    const im = await this._img(file);
+    const full = this._jpeg(im, 800, 0.72, false);
+    let thumb = "";
+    outer: for (const size of [120, 100, 84, 72, 60]) {
+      for (const q of [0.62, 0.5, 0.4, 0.3]) {
+        thumb = this._jpeg(im, size, q, true);
+        if (thumb.length <= this.MAX_THUMB) break outer;
+      }
+    }
+    if (thumb.length > this.MAX_THUMB) throw new Error("Could not make the photo small enough — please try another photo");
+    return { full, thumb };
+  },
+  async _local() { try { const v = await ImgDB.get("drv_thumbs_local"); return v ? JSON.parse(v) : {}; } catch (e) { return {}; } },
+  async _setLocal(m) { try { await ImgDB.put("drv_thumbs_local", JSON.stringify(m)); } catch (e) {} },
+  async _cloudCache() { try { const v = await ImgDB.get("drv_thumbs_cloud"); return v ? JSON.parse(v) : {}; } catch (e) { return {}; } },
+  async _setCloudCache(m) { try { await ImgDB.put("drv_thumbs_cloud", JSON.stringify(m)); } catch (e) {} },
+  toMap(arr) { const m = {}; (Array.isArray(arr) ? arr : []).forEach(x => { if (x && x.id && typeof x.t === "string" && /^data:image\/jpeg;base64,/.test(x.t)) m[x.id] = x.t; }); return m; },
+  // returns { cloud: "ok" | "limit" | "offline", thumb }
+  async save(id, file) {
+    const { full, thumb } = await this.makeImages(file);
+    await ImgDB.put("drv_full_" + id, full);
+    const limit = AdminCfg.driverPhotoLimit();
+    let cloud = "offline", written = null;
+    const ref = WS._ref(this.KEY);
+    if (ref && window._db && typeof window._db.runTransaction === "function") {
+      try {
+        await Promise.race([window._db.runTransaction(async t => {
+          const snap = await t.get(ref);
+          const cur = snap && snap.exists && Array.isArray(snap.data().value) ? snap.data().value : [];
+          const has = cur.some(x => x && x.id === id);
+          if (!has && cur.length >= limit) { cloud = "limit"; return; }
+          const rec = { id, t: thumb, at: new Date().toISOString() };
+          const next = has ? cur.map(x => x && x.id === id ? rec : x) : [...cur, rec];
+          t.set(ref, { value: next, ts: Date.now() });
+          cloud = "ok"; written = next;
+        }), new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000))]);
+      } catch (e) { cloud = "offline"; }
+    }
+    if (cloud === "ok" && written) await this._setCloudCache(this.toMap(written));
+    const loc = await this._local();
+    if (cloud === "ok") delete loc[id]; else loc[id] = thumb;
+    await this._setLocal(loc);
+    DriverPhotos._notify();
+    return { cloud, thumb };
+  },
+  async remove(id) {
+    try { await ImgDB.del("drv_full_" + id); } catch (e) {}
+    const loc = await this._local(); delete loc[id]; await this._setLocal(loc);
+    const ref = WS._ref(this.KEY);
+    if (ref && window._db && typeof window._db.runTransaction === "function") {
+      try {
+        await window._db.runTransaction(async t => {
+          const snap = await t.get(ref);
+          const cur = snap && snap.exists && Array.isArray(snap.data().value) ? snap.data().value : [];
+          if (!cur.some(x => x && x.id === id)) return;
+          t.set(ref, { value: cur.filter(x => x && x.id !== id), ts: Date.now() });
+        });
+      } catch (e) {}
+      const m = await this._cloudCache(); delete m[id]; await this._setCloudCache(m);
+    }
+    DriverPhotos._notify();
+  },
+  async full(id) { try { return (await ImgDB.get("drv_full_" + id)) || ""; } catch (e) { return ""; } },
+  _subs: new Set(),
+  _notify() { this._subs.forEach(f => { try { f(); } catch (e) {} }); }
+};
+// id → thumbnail for every driver (cloud copy + this device's own extras)
+function useDriverThumbs(enabled) {
+  const [map, setMap] = useState({});
+  useEffect(() => {
+    if (!enabled) { setMap({}); return; }
+    let alive = true;
+    const load = async () => {
+      const [c, l] = await Promise.all([DriverPhotos._cloudCache(), DriverPhotos._local()]);
+      if (alive) setMap({ ...c, ...l });
+    };
+    load();
+    DriverPhotos._subs.add(load);
+    let un = null;
+    try {
+      const ref = WS._ref(DriverPhotos.KEY);
+      if (ref) un = ref.onSnapshot(snap => {
+        if (!snap || !snap.exists) { load(); return; }
+        DriverPhotos._setCloudCache(DriverPhotos.toMap(snap.data().value)).then(load);
+      }, () => {});
+    } catch (e) {}
+    return () => { alive = false; DriverPhotos._subs.delete(load); try { un && un(); } catch (e) {} };
+  }, [enabled]);
+  return map;
+}
+function DriverAvatar({ src, size, onClick, name }) {
+  const _h = React.createElement;
+  const s = size || 44;
+  return src
+    ? _h("img", { src, alt: name ? "Photo of " + name : "Driver photo", onClick, "data-t": "drv-thumb", style: { width: s, height: s, borderRadius: "50%", objectFit: "cover", border: "2px solid var(--border)", cursor: onClick ? "zoom-in" : "default", flex: "0 0 auto", background: "#fff" } })
+    : _h("div", { "aria-hidden": "true", style: { width: s, height: s, borderRadius: "50%", background: "#f1ebde", display: "flex", alignItems: "center", justifyContent: "center", fontSize: s * 0.45, flex: "0 0 auto" } }, "🛺");
+}
+// Full-size view: this device's original if it has one, else the thumbnail.
+function DriverPhotoViewer({ id, thumb, name, onClose }) {
+  const _h = React.createElement;
+  const [src, setSrc] = useState(thumb || "");
+  useEffect(() => { DriverPhotos.full(id).then(f => { if (f) setSrc(f); }); }, [id]);
+  return _h("div", { onClick: onClose, "data-t": "drv-viewer", style: { position: "fixed", inset: 0, background: "rgba(0,0,0,.8)", zIndex: 90, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 16, gap: 10 } },
+    src && _h("img", { src, alt: name || "", style: { maxWidth: "100%", maxHeight: "75vh", borderRadius: 12, background: "#fff" } }),
+    _h("div", { style: { color: "#fff", fontWeight: 700 } }, name || ""),
+    _h("button", { className: "btn-s", onClick: onClose }, "Close"));
+}
+// Commission is on ROOM RENT only (food/services never count):
+//  • GST-inclusive hotels: on the room amount as charged, GST included
+//  • GST-extra hotels:     on the room amount without the GST added on top
+function driverCommissionBase(G) {
+  const room = Number(G && G.roomAmt) || 0;
+  const gst = G && G.gstMode === "inclusive" ? Number(G.roomGST) || 0 : 0;
+  return Math.max(0, Math.round(room + gst));
+}
 // Live list from one of the two documents above (cached copy first).
 function useDriverDoc(k) {
   const [list, setList] = useState(() => {
@@ -11825,6 +12586,8 @@ function useDriverDoc(k) {
 function DriverPicker({ value, onChange }) {
   const _h = React.createElement;
   const [drivers] = useDriverDoc("drivers");
+  const photoOn = hasFeature("driver_photo");
+  const thumbs = useDriverThumbs(photoOn);
   const active = drivers.filter(d => d.active !== false).sort((a, b) => String(a.name).localeCompare(String(b.name)));
   const v = value || { sel: "", name: "", phone: "", pct: "" };
   const set = patch => onChange({ ...v, ...patch });
@@ -11839,11 +12602,14 @@ function DriverPicker({ value, onChange }) {
       _h("option", { value: "" }, "No — guest came directly"),
       active.map(d => _h("option", { key: d.id, value: d.id }, d.name + (d.phone ? " · " + d.phone : "") + " · " + d.pct + "%")),
       _h("option", { value: "new" }, "+ Add new driver")),
+    photoOn && v.sel && v.sel !== "new" && _h("div", { "data-t": "drv-pick-photo", style: { display: "flex", alignItems: "center", gap: 10, marginTop: 8 } },
+      _h(DriverAvatar, { src: thumbs[v.sel], size: 52, name: (active.find(x => x.id === v.sel) || {}).name }),
+      _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, thumbs[v.sel] ? "Match the driver with this photo" : "No photo yet — add one in Drivers → Drivers tab")),
     v.sel === "new" && _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 } },
       _h("input", { "aria-label": "Driver name", placeholder: "Driver name *", maxLength: 40, value: v.name, onChange: e => set({ name: e.target.value }) }),
       _h("input", { "aria-label": "Driver mobile", placeholder: "Mobile", inputMode: "numeric", maxLength: 10, value: v.phone, onChange: e => set({ phone: e.target.value.replace(/\D/g, "") }) })),
     v.sel && _h("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 8 } },
-      _h("label", { htmlFor: "ab-drv-pct", style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Commission % (on room rent, excluding GST)"),
+      _h("label", { htmlFor: "ab-drv-pct", style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Commission % (on room rent)"),
       _h("input", { id: "ab-drv-pct", type: "number", min: 0, max: 100, step: "0.5", value: v.pct, onChange: e => set({ pct: e.target.value }), style: { width: 90 } })),
     v.sel && _h("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 6 } }, "The guest's bill and GST do not change. A commission record is created automatically at checkout."));
 }
@@ -11879,6 +12645,19 @@ function DriversView({ user }) {
   const [busy, setBusy] = useState(false);
   const [nd, setNd] = useState({ name: "", phone: "", pct: "10" });
   const [edit, setEdit] = useState(null); // { id, name, phone, pct }
+  // Driver photo is its own paid add-on ("driver_photo"), on top of driver_commission
+  const photoOn = hasFeature("driver_photo");
+  const thumbs = useDriverThumbs(photoOn);
+  const [viewPhoto, setViewPhoto] = useState(null); // { id, name }
+  const takePhoto = (d, file) => run(async () => {
+    try {
+      const r = await DriverPhotos.save(d.id, file);
+      AuditLog.add("DRIVER_PHOTO", d.id + " " + d.name + " " + r.cloud);
+      if (r.cloud === "limit") alert("Photo saved on this device. The cloud photo limit (" + AdminCfg.driverPhotoLimit() + " drivers) is full, so other devices will not see it. Ask BizzSathi support to raise the limit.");
+      else if (r.cloud === "offline") alert("Photo saved on this device. It will not show on other devices because the internet is not connected — take it again when online.");
+    } catch (e) { alert(e.message || "Could not save the photo"); }
+  });
+  const dropPhoto = d => { if (!confirm("Remove " + d.name + "'s photo?")) return; run(() => DriverPhotos.remove(d.id)); };
   const inRange = r => { const d = String(r.checkOut || r.createdAt || "").slice(0, 10); return (!from || d >= from) && (!to || d <= to); };
   const rows = recs.filter(r => inRange(r) && (!fDrv || r.driverId === fDrv) && (!fSt || r.status === fSt))
     .sort((a, b) => String(b.checkOut || "").localeCompare(String(a.checkOut || "")) || String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
@@ -11933,7 +12712,7 @@ function DriversView({ user }) {
   const tabBtn = (id, label) => _h("button", { onClick: () => setTab(id), "aria-pressed": tab === id, style: { flex: 1, minHeight: 42, border: "none", borderRadius: 9, background: tab === id ? "#fff" : "transparent", color: tab === id ? "var(--navy)" : "var(--muted)", fontWeight: 700, fontSize: 13, cursor: "pointer", boxShadow: tab === id ? "0 1px 4px rgba(0,0,0,.08)" : "none" } }, label);
   return _h("div", { className: "scrollable hs", "data-t": "drivers-view", style: { height: "100%", padding: "16px 14px 24px" } },
     _h("div", { style: { fontFamily: "'Josefin Sans',sans-serif", fontSize: 20, fontWeight: 700, color: "var(--navy)" } }, "🛺 Driver Commission"),
-    _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 12px" } }, "Auto/taxi driver's share, on room rent (excluding GST). The guest's bill does not change."),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 12px" } }, "Auto/taxi driver's share, on room rent — GST included if your prices include GST, without GST if GST is added on top. Food/services don't count. The guest's bill does not change."),
     _h("div", { style: { display: "flex", gap: 4, background: "#f1ebde", padding: 4, borderRadius: 12, marginBottom: 12 } }, tabBtn("comm", "Commission"), tabBtn("drivers", "Drivers (" + drivers.length + ")")),
     tab === "comm" ? _h(React.Fragment, null,
       _h("div", { className: "card", style: { padding: "12px 14px", display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: 10, marginBottom: 12 } },
@@ -11990,12 +12769,18 @@ function DriversView({ user }) {
                   _h("button", { className: "btn-p", onClick: saveEdit, disabled: busy, style: { flex: 1 } }, "Save"),
                   _h("button", { className: "btn-s", onClick: () => setEdit(null), style: { flex: 1 } }, "Cancel")))
             : _h("div", { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
+                photoOn && _h(DriverAvatar, { src: thumbs[d.id], name: d.name, onClick: thumbs[d.id] ? () => setViewPhoto({ id: d.id, name: d.name }) : null }),
                 _h("div", { style: { flex: "1 1 160px", minWidth: 0 } },
                   _h("div", { style: { fontWeight: 700, color: "var(--navy)" } }, d.name, d.active === false ? " (band)" : ""),
                   _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, d.phone || "—", " · ", d.pct, "% commission")),
+                photoOn && _h("label", { className: "btn-s", "data-t": "drv-photo-btn", style: { minHeight: 38, display: "inline-flex", alignItems: "center", cursor: "pointer" } }, thumbs[d.id] ? "📷 Change photo" : "📷 Photo",
+                  _h("input", { type: "file", accept: "image/*", capture: "environment", "data-t": "drv-photo-file", disabled: busy, style: { display: "none" }, onChange: e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f) takePhoto(d, f); } })),
+                photoOn && thumbs[d.id] && _h("button", { className: "btn-s", onClick: () => dropPhoto(d), disabled: busy, "aria-label": "Remove photo", style: { minHeight: 38 } }, "🗑️"),
                 _h("button", { className: "btn-s", onClick: () => setEdit({ id: d.id, name: d.name, phone: d.phone || "", pct: String(d.pct) }), style: { minHeight: 38 } }, "✏️ Edit"),
                 _h("button", { className: "btn-s", onClick: () => run(() => DriverComm.updateDriver(d.id, { active: d.active === false })), disabled: busy, style: { minHeight: 38 } }, d.active === false ? "Activate" : "Close")))),
-      _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 6 } }, "Changing the % affects only future bookings. Existing records stay unchanged.")));
+      _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 6 } }, "Changing the % affects only future bookings. Existing records stay unchanged."),
+      photoOn && _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 4 } }, "📷 Photos: the full photo stays on the phone that took it; a small copy shows on all devices.")),
+    viewPhoto && _h(DriverPhotoViewer, { id: viewPhoto.id, name: viewPhoto.name, thumb: thumbs[viewPhoto.id], onClose: () => setViewPhoto(null) }));
 }
 
 // ── GUEST HISTORY — searchable across ALL bookings (checked-out too) ──
@@ -12048,6 +12833,7 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
       if (toFetch.length === 0) {
         // Fully cached already — just re-merge from cache, no network needed.
         const merged = monthKeys.flatMap(k => archiveCacheRef.current[k] || []);
+        rememberBookings(merged);
         if (!cancelled) setArchivedExtra(merged);
         return;
       }
@@ -12056,6 +12842,7 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
         const results = await Promise.all(toFetch.map(k => WS.getArchiveMonth(k).catch(() => null)));
         toFetch.forEach((k, i) => { archiveCacheRef.current[k] = Array.isArray(results[i]) ? results[i] : []; });
         const merged = monthKeys.flatMap(k => archiveCacheRef.current[k] || []);
+        rememberBookings(merged);
         if (!cancelled) setArchivedExtra(merged);
       } finally {
         if (!cancelled) setArchiveLoading(false);
@@ -13016,6 +13803,9 @@ function App() {
   useEffect(() => {
     CURRENT_ROOMS = rooms;
   }, [rooms]);
+  useEffect(() => {
+    rememberBookings(bookings);
+  }, [bookings]);
   const saveProfile = async p => {
     setProfile(p);
     try {
@@ -13597,8 +14387,10 @@ function App() {
   // Change ONE room's status without overwriting the rest of the list from
   // this device's possibly-stale copy (another device may have just
   // checked a guest into a different room).
-  const patchRoom = async (roomId, patch) => {
-    const apply = arr => arr.map(r => r.id === roomId ? { ...r, ...patch } : r);
+  const patchRoom = async (roomId, patch) => patchRoomsMany([[roomId, patch]]);
+  // several rooms in ONE write (group check-in / combined checkout)
+  const patchRoomsMany = async (pairs) => {
+    const apply = arr => arr.map(r => { const p = pairs.find(x => x[0] === r.id); return p ? { ...r, ...p[1] } : r; });
     setSyncing(true);
     const res = await WS.txArray("rooms", srv => apply(srv.length ? srv : rooms));
     if (res === null) { await saveRooms(apply(rooms)); return; }
@@ -13776,6 +14568,8 @@ function App() {
           alert("This room was just booked from another device. Please select another room.");
           return;
         }
+        const busyX = (form._extraRooms || []).find(x => { const fr = freshRooms.find(r => r.id === x.roomId); return fr && fr.status === "occupied"; });
+        if (busyX) { alert("Room " + busyX.roomId + " was just booked from another device. Please select another room."); return false; }
       }
     } catch (e) { /* offline or read failed — proceed on local state */ }
     const id = form._tempId || uid();
@@ -13785,6 +14579,7 @@ function App() {
       _photoF,
       _photoB,
       _resId,
+      _extraRooms,
       ...clean
     } = form;
     const nb = {
@@ -13794,6 +14589,23 @@ function App() {
       charges: [],
       createdAt: new Date().toISOString()
     };
+    // Group booking: every extra room is its own booking record (so rooms,
+    // registers, reports and checkout keep working per room) sharing the
+    // main booking's ID as groupId. Guest details are copied; ID photos,
+    // signature, family members and advance stay on the main room only.
+    const extras = Array.isArray(_extraRooms) ? _extraRooms.filter(x => x && x.roomId && x.roomId !== form.roomId) : [];
+    const members = [];
+    if (extras.length) {
+      const groupRooms = [form.roomId, ...extras.map(x => x.roomId)];
+      nb.groupId = id; nb.groupRooms = groupRooms;
+      extras.forEach(x => {
+        members.push({
+          ...clean, id: id + "-" + String(x.roomId).replace(/[^A-Za-z0-9]/g, ""), status: "active", charges: [], createdAt: nb.createdAt,
+          roomId: x.roomId, roomTotal: Number(x.roomTotal) || 0, adults: x.adults || "1", children: "0",
+          family: [], advances: [], advance: 0, groupId: id, groupRooms
+        });
+      });
+    }
     // Embed photos directly in booking object (most reliable storage)
     if (_signature) nb.signature = _signature;
     if (_photoF) nb.photoFront = _photoF;
@@ -13822,9 +14634,10 @@ function App() {
         console.warn("PhotoB vault:", e);
       }
     }
-    await patchRoom(form.roomId, { status: "occupied", bookingId: id });
+    await patchRoomsMany([[form.roomId, { status: "occupied", bookingId: id }], ...members.map(m => [m.roomId, { status: "occupied", bookingId: m.id }])]);
     if (_resId) nb.reservationId = _resId;
-    await saveBk([...bookings, nb]);
+    await saveBk([...bookings, nb, ...members]);
+    if (members.length) AuditLog.add("GROUP_CHECKIN", id + " rooms " + nb.groupRooms.join(","));
     if (_resId) {
       await patchRes(_resId, { status: "checkedin", bookingId: id, checkedInAt: new Date().toISOString() });
       AuditLog.add("RESERVATION_CHECKIN", _resId + " -> " + id);
@@ -13984,7 +14797,7 @@ function App() {
     AuditLog.add("CHARGE_VOIDED", "Room " + b.roomId + " · " + c.name + " x" + c.qty + " · " + reason);
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: nb.find(x => x.id === bid) }));
   };
-  const handleExtendStay = async (bid, newCheckOut) => {
+  const handleExtendStay = async (bid, newCheckOut, opts) => {
     const b = bookings.find(x => x.id === bid);
     if (!b) return;
     const room = rooms.find(r => r.id === b.roomId);
@@ -13996,14 +14809,13 @@ function App() {
     // via room.rate instead (as this used to do) silently discarded any
     // negotiated/custom rate and re-priced the WHOLE stay — original nights
     // included — at the room's default rate the moment anyone extended it.
-    const oldNights = nts(b.checkIn, b.checkOut);
-    const effectivePerNightRate = oldNights > 0 ? (b.roomTotal || 0) / oldNights : (room?.rate || 0);
-    const newNights = nts(b.checkIn, newCheckOut);
-    const newRoomTotal = Math.round(effectivePerNightRate * newNights);
-    const updated = { ...b, checkOut: newCheckOut, roomTotal: newRoomTotal };
+    // With opts.rate the owner/staff chose a new per-night rate for ALL
+    // nights or only the EXTRA nights (planStayChange).
+    const plan = planStayChange(b, newCheckOut, opts && opts.rate, opts && opts.scope);
+    const updated = { ...b, checkOut: plan.checkOut, roomTotal: plan.roomTotal, rateSegments: plan.rateSegments };
     const nb = bookings.map(x => x.id === bid ? updated : x);
     await saveBk(nb);
-    AuditLog.add('EXTEND_STAY', b.name + ' -> ' + newCheckOut);
+    AuditLog.add('EXTEND_STAY', b.name + ' -> ' + newCheckOut + (opts && opts.rate !== undefined && opts.rate !== "" ? ' @ ' + opts.rate + ' (' + (opts.scope === "all" ? "all days" : "extra days") + ')' : ''));
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: updated }));
   };
   // ── Owner: fix / delete a wrong entry (see BookingOwnerActions) ──
@@ -14040,7 +14852,7 @@ function App() {
     await saveBk(bookings.map(x => x.id === bid ? ub : x));
     // a settled bill's driver commission (if still unpaid) follows the new room rent
     if (!isActive && G2 && hasFeature("driver_commission") && b.driver && Number(b.driver.pct) > 0) {
-      const base = Math.max(0, Math.round(Number(G2.roomAmt) || 0));
+      const base = driverCommissionBase(G2);
       DriverComm._write("commissions", cur => cur.map(r => r.bookingId === bid && r.status !== "paid" ? { ...r, base, amount: DriverComm.amount(base, r.pct), guest: ub.name, roomId: ub.roomId, updatedAt: nowIso } : r)).catch(() => {});
     }
     AuditLog.add(isActive ? "OWNER_EDIT_CHECKIN" : "OWNER_EDIT_BILL", bid + (b.invoiceNo ? " " + b.invoiceNo : "") + " — " + (reason || "no reason"));
@@ -14109,13 +14921,53 @@ function App() {
   };
   const handleCheckOut = async (bid, paymentMode) => {
     const b = bookings.find(x => x.id === bid);
+    const now = new Date();
+    const invoiceNo = await generateInvoiceNumber();
+    const { ub, dcRec, room } = settleBooking(b, invoiceNo, paymentMode, now);
+    await patchRoom(b.roomId, { status: "empty", bookingId: null });
+    await saveBk(bookings.map(x => x.id === bid ? ub : x));
+    if (dcRec) {
+      try { await DriverComm.addRecord(dcRec); AuditLog.add("DRIVER_COMMISSION", dcRec.id + " " + dcRec.driverName + " " + dcRec.amount); }
+      catch (e) { console.warn("driver commission:", e && e.message); }
+    }
+    rememberBookings([ub]);
+    openInvoice(ub, room);
+    setModal(null);
+  };
+  // Group booking → ONE combined bill: every still-active room of the
+  // group is settled at once under ONE invoice number. Each room keeps its
+  // own frozen record (so revenue/GST reports stay per room); the invoice
+  // view merges them (groupBillView).
+  const handleGroupCheckOut = async (groupId, paymentMode) => {
+    const members = bookings.filter(x => x.groupId === groupId && x.status === "active");
+    if (members.length < 2) { if (members[0]) return handleCheckOut(members[0].id, paymentMode); return; }
+    const now = new Date();
+    const invoiceNo = await generateInvoiceNumber();
+    const roomsList = members.map(m => m.roomId);
+    const done = members.map(m => settleBooking(m, invoiceNo, paymentMode, now));
+    done.forEach(d => { d.ub.groupBill = true; d.ub.groupBillRooms = roomsList; });
+    await patchRoomsMany(members.map(m => [m.roomId, { status: "empty", bookingId: null }]));
+    const byId = new Map(done.map(d => [d.ub.id, d.ub]));
+    await saveBk(bookings.map(x => byId.get(x.id) || x));
+    for (const d of done) {
+      if (!d.dcRec) continue;
+      try { await DriverComm.addRecord(d.dcRec); AuditLog.add("DRIVER_COMMISSION", d.dcRec.id + " " + d.dcRec.driverName + " " + d.dcRec.amount); }
+      catch (e) { console.warn("driver commission:", e && e.message); }
+    }
+    AuditLog.add("GROUP_CHECKOUT", groupId + " " + invoiceNo + " rooms " + roomsList.join(","));
+    const all = done.map(d => d.ub);
+    rememberBookings(all);
+    const main = all.find(x => x.id === groupId) || all[0];
+    openInvoice(main, done.find(d => d.ub === main).room);
+    setModal(null);
+  };
+  // Freezes one booking's bill at checkout (shared by single + group checkout).
+  const settleBooking = (b, invoiceNo, paymentMode, now) => {
     const room = rooms.find(r => r.id === b.roomId);
     const G = calcBillGST(b, room, rooms);
     const sub = G.subtotal;
     const gst = G.totalGST;
     const grand = G.grandTotal;
-    const now = new Date();
-    const invoiceNo = await generateInvoiceNumber();
     const ub = {
       ...b,
       status: "checkedout",
@@ -14136,6 +14988,7 @@ function App() {
       gstBreakdown: {
         roomAmt: G.roomAmt, roomGST: G.roomGST, roomGSTRate: G.roomGSTRate,
         roomCGST: G.roomCGST, roomSGST: G.roomSGST, roomSAC: G.roomSAC, roomRuleId: G.roomRuleId,
+        roomSegs: G.roomSegs || null,
         foodAmt: G.foodAmt, foodGST: G.foodGST, foodGSTRate: G.foodGSTRate,
         foodCGST: G.foodCGST, foodSGST: G.foodSGST, foodSAC: G.foodSAC, foodRuleId: G.foodRuleId,
         laundryAmt: G.laundryAmt, laundryGST: G.laundryGST, laundryGSTRate: G.laundryGSTRate,
@@ -14156,7 +15009,7 @@ function App() {
     // Hotel's own expense — the guest's bill above is not touched.
     let dcRec = null;
     if (hasFeature("driver_commission") && b.driver && b.driver.id && Number(b.driver.pct) > 0) {
-      const base = Math.max(0, Math.round(Number(G.roomAmt) || 0));
+      const base = driverCommissionBase(G);
       const amount = DriverComm.amount(base, b.driver.pct);
       const nowIso = now.toISOString();
       ub.driverCommission = { base, pct: Number(b.driver.pct), amount };
@@ -14168,14 +15021,7 @@ function App() {
         paidAt: null, paidMode: null, createdAt: nowIso, updatedAt: nowIso
       };
     }
-    await patchRoom(b.roomId, { status: "empty", bookingId: null });
-    await saveBk(bookings.map(x => x.id === bid ? ub : x));
-    if (dcRec) {
-      try { await DriverComm.addRecord(dcRec); AuditLog.add("DRIVER_COMMISSION", dcRec.id + " " + dcRec.driverName + " " + dcRec.amount); }
-      catch (e) { console.warn("driver commission:", e && e.message); }
-    }
-    openInvoice(ub, room);
-    setModal(null);
+    return { ub, dcRec, room };
   };
   const handleLogin = async s => {
     const { p: _pwHash, ...safe } = s || {};
@@ -14551,6 +15397,8 @@ function App() {
     onVoidCharge: handleVoidCharge,
     onAddCharge: handleAddCharge,
     onCheckOut: handleCheckOut,
+    onGroupCheckOut: handleGroupCheckOut,
+    groupMembers: liveB.groupId ? bookings.filter(x => x.groupId === liveB.groupId && x.status !== "deleted") : [],
     onExtendStay: handleExtendStay,
     onAddAdvance: handleBookingAdvance,
     onOwnerEdit: handleOwnerEdit,

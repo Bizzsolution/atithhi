@@ -1356,7 +1356,10 @@ const ADDON_CATALOG = [
   { id: "ota_import", label: "OTA Booking Import", desc: "Quick-entry bookings from Agoda/MakeMyTrip/Goibibo etc, blocks the room like a normal check-in" },
   { id: "direct_booking", label: "Direct Booking Link", desc: "Public shareable link (for Facebook/Instagram/WhatsApp) where guests request a room; hotel confirms from the app" },
   { id: "restaurant", label: "Restaurant & Room Service", desc: "Restaurant counter (orders straight to the room bill), walk-in GST bills, KOT kitchen slips, separate Restaurant staff login" },
-  { id: "driver_commission", label: "Auto/Driver Commission", desc: "Auto/taxi driver ka % commission room rent (bina GST) par — guest ka bill nahi badalta; Diya/Baaki record, driver-wise report, CSV" }
+  { id: "driver_commission", label: "Auto/Driver Commission", desc: "Auto/taxi driver ka % commission room rent par (GST inclusive hotel: GST sahit, GST extra: bina GST) — guest ka bill nahi badalta; Diya/Baaki record, driver-wise report, CSV" },
+  { id: "driver_photo", label: "Driver Photo", desc: "Driver ki pehchaan ke liye photo (Auto/Driver Commission ke saath hi chalega) — full photo phone me, 5 KB copy cloud me" },
+  { id: "digital_stamp", label: "Digital Stamp on Bill", desc: "Authorised Signatory ke upar hotel ka stamp/sign — Bill Settings me upload karo (owner ko bhi allow kar sakte ho)" },
+  { id: "bulk_booking", label: "Bulk / Group Booking", desc: "Ek guest ke naam par ek booking ID me multiple rooms; checkout par combined bill ya har room ka alag bill" }
 ];
 const PLAN_DEFAULT_FEATURES = {
   TRIAL: [],
@@ -1767,7 +1770,7 @@ async function acfgSave(mutate, key) {
 }
 
 // ── BILL SETTINGS (per hotel) ───────────────────────────────────────
-const BS = { key: null, hotel: "", cfg: {}, counter: 0, busy: false };
+const BS = { key: null, hotel: "", cfg: {}, counter: 0, busy: false, stamp: null };
 const BS_FIELDS = [
   ["title", "Bill ka title", "TAX INVOICE", 30],
   ["hotelName", "Hotel naam (bill par)", "e.g. HOTEL SHASHI RESIDENCY", 60],
@@ -1783,7 +1786,8 @@ const BS_FIELDS = [
   ["checkoutNote", "Remark (check-out time etc.)", "e.g. Check out time 12 noon", 80],
   ["jurisdiction", "Jurisdiction (city)", "e.g. Mathura", 40],
   ["signatory", "Signature ke neeche", "Authorised Signatory", 40],
-  ["thanksName", "\"Thank you for staying with ___\"", "hotel ka naam", 60]
+  ["thanksName", "\"Thank you for staying with ___\"", "hotel ka naam", 60],
+  ["planType", "Plan type (Classic design)", "e.g. EP / CP / MAP", 10]
 ];
 function bsFY(d) { const dt = d || new Date(); const y = dt.getFullYear(); const s = (dt.getMonth() + 1) >= 4 ? y : y - 1; return String(s).slice(-2) + "-" + String(s + 1).slice(-2); }
 function bsCounterRef() { return window._db.collection("hotels").doc(BS.key).collection("data").doc("invCounter_" + bsFY()); }
@@ -1818,6 +1822,7 @@ async function openBillSettings(i) {
   document.getElementById("bsModal").style.display = "flex";
   try {
     BS.cfg = await acfgLoad(key);
+    BS.stamp = BS.cfg.stamp && typeof BS.cfg.stamp.img === "string" ? BS.cfg.stamp.img : null;
     const c = await bsCounterRef().get();
     BS.counter = c.exists ? (Number(c.data().value) || 0) : 0;
     bsMsg("");
@@ -1835,7 +1840,14 @@ function bsRender() {
   const F = k => BS_FIELDS.find(f => f[0] === k);
   const fx = k => { const f = F(k); return inp(f[0], f[1], f[2], f[3], f[4]); };
   const pad = inv.pad === 0 || inv.pad ? inv.pad : 6;
+  const layout = inv.layout === "classic" ? "classic" : "modern";
   document.getElementById("bsBody").innerHTML =
+    sec("🎨 INVOICE DESIGN", `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+      ${[["modern", "Modern", "AtithiBook ka standard bill"], ["classic", "Classic", "Purana hotel format — logo, HSN/CGST/SGST/IGST table, Round off, Remark, Checked"]].map(([v, l, d]) => `<label style="display:flex;gap:10px;align-items:flex-start;padding:10px;border-radius:8px;cursor:pointer;background:${layout === v ? "#052e16" : "#0f172a"};border:1px solid ${layout === v ? "#22c55e" : "#334155"}">
+        <input type="radio" name="bs_layout" value="${v}" ${layout === v ? "checked" : ""} style="width:auto;margin-top:2px">
+        <span><b style="font-size:13px">${l}</b><br><span style="font-size:11px;color:#94a3b8">${d}</span></span></label>`).join("")}
+    </div><div style="margin-top:10px">${fx("planType")}</div>
+    <div style="font-size:11.5px;color:#94a3b8;margin-top:6px">Screen/print bill aur WhatsApp PDF dono isi design me banenge. Purane bills bhi dobara kholne par naye design me dikhenge (amount wahi rehta hai).</div>`) +
     sec("🏨 HEADER", grid(["title", "hotelName", "tagline", "phone", "email", "website", "gstin"].map(fx).join("")) + `<div style="margin-top:10px">${fx("address")}</div>`) +
     sec("🔢 BILL NUMBER SERIES", grid(
       `<label style="font-size:11px;color:#94a3b8;display:block">Prefix<input id="bs_prefix" maxlength="10" value="${escHtml(inv.prefix || "")}" placeholder="INV" style="margin-top:4px"></label>` +
@@ -1846,12 +1858,68 @@ function bsRender() {
       `<div id="bsPrev" style="margin-top:8px;font-size:12.5px;color:#4ade80"></div>`) +
     sec("🧾 HSN / SAC", grid(["roomSac", "foodSac"].map(fx).join(""))) +
     sec("📝 FOOTER", grid(["checkoutNote", "jurisdiction", "signatory", "thanksName"].map(fx).join("")) + `<div style="margin-top:10px">${fx("footerNote")}</div>`) +
+    sec("🖋️ DIGITAL STAMP / SIGNATURE (Authorised Signatory ke upar)",
+      `<div style="font-size:11.5px;color:#94a3b8;margin-bottom:8px">Bill par tabhi dikhega jab is hotel ke Features me <b>Digital Stamp on Bill</b> ON ho.</div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <div id="bsStampPrev" style="width:170px;height:76px;border:1px dashed #475569;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden">${BS.stamp ? `<img src="${escHtml(BS.stamp)}" alt="stamp" style="max-width:160px;max-height:70px;object-fit:contain">` : `<span style="color:#64748b;font-size:11px">Koi stamp nahi</span>`}</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <input id="bs_stampFile" type="file" accept="image/png,image/jpeg" onchange="bsStampPick(this)" style="font-size:12px">
+          ${BS.stamp ? `<button class="btn" type="button" onclick="bsStampRemove()" style="background:#450a0a;color:#fca5a5;width:auto">🗑️ Stamp hatao</button>` : ""}
+        </div>
+      </div>
+      <label style="font-size:12px;color:#cbd5e1;display:flex;align-items:center;gap:8px;margin-top:10px"><input id="bs_stampOwner" type="checkbox" ${BS.cfg.stamp && BS.cfg.stamp.ownerUpload ? "checked" : ""} style="width:auto"> Hotel owner bhi apna stamp upload kar sake (app Settings me). Owner ka stamp ho to wahi chalega, warna yahan wala.</label>
+      <div style="font-size:11px;color:#94a3b8;margin-top:6px">Transparent background wala PNG sabse accha lagta hai. Max 360px tak chhota ho jaata hai.</div>`) +
+    sec("🛺 DRIVER PHOTO (cloud limit)", grid(`<label style="font-size:11px;color:#94a3b8;display:block">Kitne drivers ki photo cloud me (1-180)<input id="bs_drvLimit" type="number" min="1" max="180" value="${escHtml(String(BS.cfg.driverPhotoLimit || 100))}" style="margin-top:4px"></label>`) +
+      `<div style="font-size:11.5px;color:#94a3b8;margin-top:8px">Har photo ka cloud copy max 5 KB. Limit ke baad bhi photo us phone me save hoti hai, sirf baaki devices par nahi dikhti.</div>`) +
     sec("🆔 BOOKING ID", grid(`<label style="font-size:11px;color:#94a3b8;display:block">Booking ID ke shuru ke akshar (1-6)<input id="bs_bkPrefix" maxlength="6" value="${escHtml(BS.cfg.bookingPrefix || "")}" placeholder="BK" style="margin-top:4px;text-transform:uppercase"></label>`) +
       `<div style="font-size:11.5px;color:#94a3b8;margin-top:8px">Sirf naye check-in par lagega. Purane booking ID nahi badlenge.</div>`) +
     `<button id="bsSaveBtn" class="btn btn-success" onclick="bsSave()" style="width:100%;padding:12px;font-size:14px">💾 Save karo</button>`;
   ["bs_prefix", "bs_pad", "bs_fy", "bs_next", "bs_bkPrefix"].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener("input", bsPreview); if (el) el.addEventListener("change", bsPreview); });
   bsPreview();
 }
+function bsShrinkStamp(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\/(png|jpeg)$/.test(file.type || "")) return reject(new Error("Sirf PNG ya JPG image"));
+    const r = new FileReader();
+    r.onerror = () => reject(new Error("Image padh nahi paaye"));
+    r.onload = ev => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Image padh nahi paaye"));
+      img.onload = () => {
+        const sc = Math.min(1, 360 / Math.max(img.width, img.height, 1));
+        const cv = document.createElement("canvas");
+        cv.width = Math.max(1, Math.round(img.width * sc)); cv.height = Math.max(1, Math.round(img.height * sc));
+        const g = cv.getContext("2d"); const png = file.type === "image/png";
+        if (!png) { g.fillStyle = "#fff"; g.fillRect(0, 0, cv.width, cv.height); }
+        g.drawImage(img, 0, 0, cv.width, cv.height);
+        let out = png ? cv.toDataURL("image/png") : "";
+        if (!out || out.length > 160000) {
+          const c2 = document.createElement("canvas"); c2.width = cv.width; c2.height = cv.height;
+          const g2 = c2.getContext("2d"); g2.fillStyle = "#fff"; g2.fillRect(0, 0, c2.width, c2.height); g2.drawImage(cv, 0, 0);
+          out = c2.toDataURL("image/jpeg", 0.8);
+        }
+        resolve(out);
+      };
+      img.src = ev.target.result;
+    };
+    r.readAsDataURL(file);
+  });
+}
+function bsKeepForm(fn) {
+  // re-render without losing what was typed in the other fields
+  const vals = {}; document.querySelectorAll("#bsBody input, #bsBody textarea, #bsBody select").forEach(el => { if (el.id && el.type !== "file") vals[el.id] = el.type === "checkbox" ? el.checked : el.value; });
+  const lay = document.querySelector('input[name="bs_layout"]:checked');
+  fn(); bsRender();
+  Object.entries(vals).forEach(([id, v]) => { const el = document.getElementById(id); if (el) { if (el.type === "checkbox") el.checked = v; else el.value = v; } });
+  if (lay) { const r = document.querySelector('input[name="bs_layout"][value="' + lay.value + '"]'); if (r) r.checked = true; }
+  bsPreview();
+}
+async function bsStampPick(inp) {
+  const f = inp.files && inp.files[0]; if (!f) return;
+  try { const d = await bsShrinkStamp(f); bsKeepForm(() => { BS.stamp = d; }); bsMsg("Stamp lag gaya — Save karo.", "inf"); }
+  catch (e) { bsMsg("❌ " + e.message, "bad"); }
+}
+function bsStampRemove() { bsKeepForm(() => { BS.stamp = null; }); bsMsg("Stamp hata diya — Save karo.", "inf"); }
 function bsRead() {
   const v = id => (document.getElementById(id) || {}).value || "";
   const inv = {};
@@ -1859,8 +1927,10 @@ function bsRead() {
   const prefix = v("bs_prefix").trim();
   if (prefix) inv.prefix = prefix;
   inv.pad = Number(v("bs_pad"));
+  const lay = document.querySelector('input[name="bs_layout"]:checked');
+  inv.layout = lay && lay.value === "classic" ? "classic" : "modern";
   inv.fy = !!(document.getElementById("bs_fy") || {}).checked;
-  return { inv, bkPrefix: v("bs_bkPrefix").trim().toUpperCase(), next: v("bs_next").trim() };
+  return { inv, bkPrefix: v("bs_bkPrefix").trim().toUpperCase(), next: v("bs_next").trim(), stampOwner: !!(document.getElementById("bs_stampOwner") || {}).checked, drvLimit: v("bs_drvLimit").trim() };
 }
 function bsPreview() {
   const el = document.getElementById("bsPrev"); if (!el) return;
@@ -1872,7 +1942,9 @@ function bsPreview() {
 }
 async function bsSave() {
   if (BS.busy) return;
-  const { inv, bkPrefix, next } = bsRead();
+  const { inv, bkPrefix, next, stampOwner, drvLimit } = bsRead();
+  const drvN = drvLimit === "" ? 100 : Math.floor(Number(drvLimit));
+  if (!(drvN >= 1 && drvN <= 180)) return bsMsg("❌ Driver photo limit 1 se 180 ke beech.", "bad");
   if (inv.prefix && !/^[A-Za-z0-9-]{1,10}$/.test(inv.prefix)) return bsMsg("❌ Prefix me sirf letters, numbers aur - (max 10).", "bad");
   if (!([0, 3, 4, 5, 6].includes(inv.pad))) return bsMsg("❌ Digit option galat hai.", "bad");
   if (inv.gstin && !/^[0-9]{2}[A-Z0-9]{13}$/.test(inv.gstin.toUpperCase())) return bsMsg("❌ GSTIN 15 akshar ka hona chahiye (jaise 09ABCDE1234F1Z5).", "bad");
@@ -1901,6 +1973,8 @@ async function bsSave() {
     BS.cfg = await acfgSave(cur => {
       const o = { ...cur, invoice: inv };
       if (bkPrefix) o.bookingPrefix = bkPrefix; else delete o.bookingPrefix;
+      if (BS.stamp || stampOwner) o.stamp = { img: BS.stamp || null, ownerUpload: stampOwner }; else delete o.stamp;
+      if (drvN !== 100) o.driverPhotoLimit = drvN; else delete o.driverPhotoLimit;
       return o;
     }, BS.key);
     bsRender();
