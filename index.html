@@ -12436,9 +12436,20 @@ const DriverComm = {
   updateDriver(id, patch) {
     return this._write("drivers", cur => cur.map(x => x.id === id ? { ...x, ...patch, updatedAt: new Date().toISOString() } : x));
   },
-  // One record per booking — a second checkout attempt never doubles it.
-  addRecord(rec) {
-    return this._write("commissions", cur => cur.some(x => x.id === rec.id) ? cur : [...cur, rec]);
+  // One record per booking ("DC-" + booking id), created at CHECK-IN as
+  // Due. Later calls (rate change, checkout) refresh an UNPAID record's
+  // amount; a record already marked Paid keeps its amount and only gets
+  // the bill number / checkout date filled in.
+  addRecord(rec) { return this.upsertRecord(rec); },
+  upsertRecord(rec) {
+    return this._write("commissions", cur => {
+      const ex = cur.find(x => x.id === rec.id);
+      if (!ex) return [...cur, rec];
+      const info = { invoiceNo: rec.invoiceNo || ex.invoiceNo || null, checkOut: rec.checkOut || ex.checkOut || null, guest: rec.guest || ex.guest, roomId: rec.roomId || ex.roomId, updatedAt: rec.updatedAt || new Date().toISOString() };
+      if (ex.status === "paid") return cur.map(x => x.id === rec.id ? { ...x, ...info } : x);
+      const pct = Number(ex.pct) >= 0 ? Number(ex.pct) : Number(rec.pct);
+      return cur.map(x => x.id === rec.id ? { ...x, ...info, checkIn: rec.checkIn || ex.checkIn, base: rec.base, pct, amount: this.amount(rec.base, pct) } : x);
+    });
   },
   setStatus(id, status, paidMode) {
     const now = new Date().toISOString();
@@ -12584,13 +12595,14 @@ function DriverPhotoViewer({ id, thumb, name, onClose }) {
     _h("div", { style: { color: "#fff", fontWeight: 700 } }, name || ""),
     _h("button", { className: "btn-s", onClick: onClose }, "Close"));
 }
-// Commission is on ROOM RENT only (food/services never count):
-//  • GST-inclusive hotels: on the room amount as charged, GST included
-//  • GST-extra hotels:     on the room amount without the GST added on top
-function driverCommissionBase(G) {
-  const room = Number(G && G.roomAmt) || 0;
-  const gst = G && G.gstMode === "inclusive" ? Number(G.roomGST) || 0 : 0;
-  return Math.max(0, Math.round(room + gst));
+// Commission is on the FIRST NIGHT's room rent only (food/services and
+// the other nights never count), so it is known — and payable — at
+// check-in. The rate is taken as charged:
+//  • GST-inclusive hotels: the first night's room price, GST included
+//  • GST-extra hotels:     the first night's room price, without the GST added on top
+function driverCommissionBase(b) {
+  const first = bookingSegments(b || {})[0];
+  return Math.max(0, Math.round(Number(first && first.rate) || 0));
 }
 // Live list from one of the two documents above (cached copy first).
 function useDriverDoc(k) {
@@ -12633,7 +12645,7 @@ function DriverPicker({ value, onChange }) {
       _h("input", { "aria-label": "Driver name", placeholder: "Driver name *", maxLength: 40, value: v.name, onChange: e => set({ name: e.target.value }) }),
       _h("input", { "aria-label": "Driver mobile", placeholder: "Mobile", inputMode: "numeric", maxLength: 10, value: v.phone, onChange: e => set({ phone: e.target.value.replace(/\D/g, "") }) })),
     v.sel && _h("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 8 } },
-      _h("label", { htmlFor: "ab-drv-pct", style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Commission % (on room rent)"),
+      _h("label", { htmlFor: "ab-drv-pct", style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Commission % (on first night's room rent)"),
       _h("input", { id: "ab-drv-pct", type: "number", min: 0, max: 100, step: "0.5", value: v.pct, onChange: e => set({ pct: e.target.value }), style: { width: 90 } })),
     v.sel && _h("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 6 } }, "The guest's bill and GST do not change. A commission record is created automatically at checkout."));
 }
@@ -12682,7 +12694,7 @@ function DriversView({ user }) {
     } catch (e) { alert(e.message || "Could not save the photo"); }
   });
   const dropPhoto = d => { if (!confirm("Remove " + d.name + "'s photo?")) return; run(() => DriverPhotos.remove(d.id)); };
-  const inRange = r => { const d = String(r.checkOut || r.createdAt || "").slice(0, 10); return (!from || d >= from) && (!to || d <= to); };
+  const inRange = r => { const d = String(r.checkOut || r.checkIn || r.createdAt || "").slice(0, 10); return (!from || d >= from) && (!to || d <= to); };
   const rows = recs.filter(r => inRange(r) && (!fDrv || r.driverId === fDrv) && (!fSt || r.status === fSt))
     .sort((a, b) => String(b.checkOut || "").localeCompare(String(a.checkOut || "")) || String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
   const sum = (arr, f) => arr.reduce((t, r) => t + (Number(f(r)) || 0), 0);
@@ -12709,7 +12721,7 @@ function DriversView({ user }) {
   const exportCsv = () => {
     const esc = v => { const s = String(v == null ? "" : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
     const head = ["Checkout date", "Invoice", "Guest", "Room", "Driver", "Driver mobile", "Room rent (excl. GST)", "Commission %", "Commission ₹", "Status", "Paid date", "Mode"];
-    const body = rows.map(r => [r.checkOut, r.invoiceNo, r.guest, r.roomId, r.driverName, r.driverPhone, r.base, r.pct, r.amount, r.status === "paid" ? "Paid" : "Due", r.paidAt ? String(r.paidAt).slice(0, 10) : "", r.paidMode || ""].map(esc).join(","));
+    const body = rows.map(r => [r.checkOut || ("In house since " + (r.checkIn || "")) + (r.bookingCancelled ? " (check-in cancelled)" : ""), r.invoiceNo, r.guest, r.roomId, r.driverName, r.driverPhone, r.base, r.pct, r.amount, r.status === "paid" ? "Paid" : "Due", r.paidAt ? String(r.paidAt).slice(0, 10) : "", r.paidMode || ""].map(esc).join(","));
     const sumHead = ["", "", "", "", "Driver", "Mobile", "Room rent", "Trips", "Commission ₹", "Paid ₹", "Due ₹"];
     const sumBody = byDriver.map(d => ["", "", "", "", d.name, d.phone, d.base, d.trips, d.amount, d.paid, d.due].map(esc).join(","));
     downloadCSV([head.join(","), ...body, "", "DRIVER-WISE SUMMARY", sumHead.join(","), ...sumBody].join("\n"), "AtithiBook_DriverCommission_" + (from || "start") + "_to_" + (to || todayStr()) + ".csv");
@@ -12736,7 +12748,7 @@ function DriversView({ user }) {
   const tabBtn = (id, label) => _h("button", { onClick: () => setTab(id), "aria-pressed": tab === id, style: { flex: 1, minHeight: 42, border: "none", borderRadius: 9, background: tab === id ? "#fff" : "transparent", color: tab === id ? "var(--navy)" : "var(--muted)", fontWeight: 700, fontSize: 13, cursor: "pointer", boxShadow: tab === id ? "0 1px 4px rgba(0,0,0,.08)" : "none" } }, label);
   return _h("div", { className: "scrollable hs", "data-t": "drivers-view", style: { height: "100%", padding: "16px 14px 24px" } },
     _h("div", { style: { fontFamily: "'Josefin Sans',sans-serif", fontSize: 20, fontWeight: 700, color: "var(--navy)" } }, "🛺 Driver Commission"),
-    _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 12px" } }, "Auto/taxi driver's share, on room rent — GST included if your prices include GST, without GST if GST is added on top. Food/services don't count. The guest's bill does not change."),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 12px" } }, "Auto/taxi driver's share, on the FIRST NIGHT's room rent only — GST included if your prices include GST, without GST if GST is added on top. Food/services and other nights don't count. Shows as Due from check-in. The guest's bill does not change."),
     _h("div", { style: { display: "flex", gap: 4, background: "#f1ebde", padding: 4, borderRadius: 12, marginBottom: 12 } }, tabBtn("comm", "Commission"), tabBtn("drivers", "Drivers (" + drivers.length + ")")),
     tab === "comm" ? _h(React.Fragment, null,
       _h("div", { className: "card", style: { padding: "12px 14px", display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: 10, marginBottom: 12 } },
@@ -12768,7 +12780,7 @@ function DriversView({ user }) {
           : rows.map(r => _h("div", { key: r.id, "data-t": "dc-row", style: { display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderTop: "1px solid var(--border)", flexWrap: "wrap" } },
             _h("div", { style: { flex: "1 1 180px", minWidth: 0 } },
               _h("div", { style: { fontWeight: 700, fontSize: 13.5, color: "var(--navy)" } }, r.driverName, " · ", fmtMoney(r.amount)),
-              _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 2 } }, fmtDate(r.checkOut), " · Room ", r.roomId, " · ", r.guest, " · ", r.pct, "% of ", fmtMoney(r.base), r.invoiceNo ? " · " + r.invoiceNo : "")),
+              _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 2 } }, r.bookingCancelled ? _h("b", { "data-t": "dc-cancelled", style: { color: "#b91c1c" } }, "⚠️ Check-in cancelled · ") : null, r.checkOut ? fmtDate(r.checkOut) : _h("span", { "data-t": "dc-inhouse", style: { color: "#1d4ed8", fontWeight: 700 } }, "🛏️ In house since " + fmtDate(r.checkIn)), " · Room ", r.roomId, " · ", r.guest, " · ", r.pct, "% of ", fmtMoney(r.base), r.invoiceNo ? " · " + r.invoiceNo : "")),
             r.status === "paid"
               ? _h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
                   _h("span", { className: "badge bg" }, "✓ Paid", r.paidMode ? " · " + r.paidMode : ""),
@@ -14661,6 +14673,7 @@ function App() {
     await patchRoomsMany([[form.roomId, { status: "occupied", bookingId: id }], ...members.map(m => [m.roomId, { status: "occupied", bookingId: m.id }])]);
     if (_resId) nb.reservationId = _resId;
     await saveBk([...bookings, nb, ...members]);
+    for (const bk of [nb, ...members]) await syncDriverDue(bk);
     if (members.length) AuditLog.add("GROUP_CHECKIN", id + " rooms " + nb.groupRooms.join(","));
     if (_resId) {
       await patchRes(_resId, { status: "checkedin", bookingId: id, checkedInAt: new Date().toISOString() });
@@ -14821,6 +14834,20 @@ function App() {
     AuditLog.add("CHARGE_VOIDED", "Room " + b.roomId + " · " + c.name + " x" + c.qty + " · " + reason);
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: nb.find(x => x.id === bid) }));
   };
+  // Driver commission shows as DUE from check-in (first night's rent).
+  const syncDriverDue = async (bk) => {
+    if (!hasFeature("driver_commission") || !bk || !bk.driver || !bk.driver.id || !(Number(bk.driver.pct) > 0)) return;
+    const base = driverCommissionBase(bk), pct = Number(bk.driver.pct), nowIso = new Date().toISOString();
+    try {
+      await DriverComm.upsertRecord({
+        id: "DC-" + bk.id, bookingId: bk.id, invoiceNo: null, driverId: bk.driver.id,
+        driverName: bk.driver.name, driverPhone: bk.driver.phone || "",
+        guest: bk.name, roomId: bk.roomId, checkIn: bk.checkIn, checkOut: null,
+        base, pct, amount: DriverComm.amount(base, pct), status: "due",
+        paidAt: null, paidMode: null, createdAt: nowIso, updatedAt: nowIso
+      });
+    } catch (e) { console.warn("driver commission:", e && e.message); }
+  };
   const handleExtendStay = async (bid, newCheckOut, opts) => {
     const b = bookings.find(x => x.id === bid);
     if (!b) return;
@@ -14839,6 +14866,7 @@ function App() {
     const updated = { ...b, checkOut: plan.checkOut, roomTotal: plan.roomTotal, rateSegments: plan.rateSegments };
     const nb = bookings.map(x => x.id === bid ? updated : x);
     await saveBk(nb);
+    await syncDriverDue(updated);
     AuditLog.add('EXTEND_STAY', b.name + ' -> ' + newCheckOut + (opts && opts.rate !== undefined && opts.rate !== "" ? ' @ ' + opts.rate + ' (' + (opts.scope === "all" ? "all days" : "extra days") + ')' : ''));
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: updated }));
   };
@@ -14874,9 +14902,10 @@ function App() {
       await patchRoom(changes.roomId, { status: "occupied", bookingId: bid });
     }
     await saveBk(bookings.map(x => x.id === bid ? ub : x));
-    // a settled bill's driver commission (if still unpaid) follows the new room rent
-    if (!isActive && G2 && hasFeature("driver_commission") && b.driver && Number(b.driver.pct) > 0) {
-      const base = driverCommissionBase(G2);
+    // the driver's commission (if still unpaid) follows the new first-night rent
+    if (isActive) await syncDriverDue(ub);
+    else if (hasFeature("driver_commission") && b.driver && Number(b.driver.pct) > 0 && G2) {
+      const base = driverCommissionBase(ub);
       DriverComm._write("commissions", cur => cur.map(r => r.bookingId === bid && r.status !== "paid" ? { ...r, base, amount: DriverComm.amount(base, r.pct), guest: ub.name, roomId: ub.roomId, updatedAt: nowIso } : r)).catch(() => {});
     }
     AuditLog.add(isActive ? "OWNER_EDIT_CHECKIN" : "OWNER_EDIT_BILL", bid + (b.invoiceNo ? " " + b.invoiceNo : "") + " — " + (reason || "no reason"));
@@ -14904,7 +14933,9 @@ function App() {
     }
     await saveBk(bookings.map(x => x.id === bid ? stub : x));
     for (const k of [`img_front_${bid}`, `img_back_${bid}`, `sig_${bid}`]) { try { await ImgDB.del(k); } catch (e) {} try { localStorage.removeItem(`ab_img_${k}`); } catch (e) {} }
-    if (hasFeature("driver_commission")) DriverComm._write("commissions", cur => cur.filter(r => !(r.bookingId === bid && r.status !== "paid"))).catch(() => {});
+    // unpaid commission goes away with the entry; a PAID one stays (money
+    // already handed over) but is flagged so the owner can recover it
+    if (hasFeature("driver_commission")) DriverComm._write("commissions", cur => cur.filter(r => !(r.bookingId === bid && r.status !== "paid")).map(r => r.bookingId === bid ? { ...r, bookingCancelled: true, updatedAt: nowIso } : r)).catch(() => {});
     AuditLog.add(b.status === "active" ? "OWNER_DELETE_CHECKIN" : "OWNER_DELETE_BILL", bid + (b.invoiceNo ? " " + b.invoiceNo : "") + " — " + (reason || ""));
     if (modal?.b?.id === bid) setModal(null);
     alert(b.status === "active" ? "✅ Check-in cancelled — room " + b.roomId + " is now free" : "✅ Bill deleted");
@@ -15029,11 +15060,11 @@ function App() {
         gstMode: G.gstMode
       }
     };
-    // Auto/driver commission (paid add-on): % of ROOM RENT without GST.
-    // Hotel's own expense — the guest's bill above is not touched.
+    // Auto/driver commission (paid add-on): % of the FIRST NIGHT's room
+    // rent. Hotel's own expense — the guest's bill above is not touched.
     let dcRec = null;
     if (hasFeature("driver_commission") && b.driver && b.driver.id && Number(b.driver.pct) > 0) {
-      const base = driverCommissionBase(G);
+      const base = driverCommissionBase(b);
       const amount = DriverComm.amount(base, b.driver.pct);
       const nowIso = now.toISOString();
       ub.driverCommission = { base, pct: Number(b.driver.pct), amount };
