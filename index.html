@@ -7043,6 +7043,10 @@ function CheckInView({
   // SAME guest under the same booking ID. [{ roomId, rate, adults }]
   const [extraRooms, setExtraRooms] = useState([]);
   const canBulk = hasFeature("bulk_booking") && !prefill;
+  // With the group add-on the user first picks Single or Group booking.
+  const [ciMode, setCiMode] = useState(""); // "" (not chosen yet) | "single" | "group"
+  const isGroup = canBulk && ciMode === "group";
+  const pickMode = m => { setCiMode(m); setExtraRooms(m === "group" ? [{ roomId: "", rate: "", adults: "1" }] : []); };
   const [form, setForm] = useState({
     roomId: prefill?.roomId || checkInRoom?.id || empty[0]?.id || "",
     name: prefill?.name || "",
@@ -7995,7 +7999,8 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     }
     const extraAdv = Number(advAmt) || 0;
     if (extraAdv < 0) return alert("Advance amount is invalid");
-    const extras = canBulk ? extraRooms : [];
+    const extras = isGroup ? extraRooms : [];
+    if (isGroup && extras.length === 0) return alert("Group booking needs at least one more room. Add a room, or switch to Single booking.");
     const seenRooms = new Set([form.roomId]);
     for (const x of extras) {
       if (!x.roomId) return alert("Please choose a room for every extra room row (or remove the empty row)");
@@ -8078,7 +8083,22 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       color: "var(--muted)",
       fontSize: 14
     }
-  }, "Room ", [form.roomId, ...(canBulk ? extraRooms.map(x => x.roomId) : [])].filter(Boolean).join(", "), " · ", form.name));
+  }, "Room ", [form.roomId, ...(isGroup ? extraRooms.map(x => x.roomId) : [])].filter(Boolean).join(", "), " · ", form.name));
+  if (canBulk && !ciMode) {
+    const opt = (m, icon, title, sub) => /*#__PURE__*/React.createElement("button", {
+      type: "button", "data-t": "ci-mode-" + m, onClick: () => pickMode(m),
+      style: { display: "flex", alignItems: "center", gap: 14, width: "100%", padding: "18px 16px", borderRadius: 14, border: "1.5px solid var(--border)", background: "#fff", cursor: "pointer", textAlign: "left", boxShadow: "0 1px 3px rgba(0,0,0,.06)" }
+    }, /*#__PURE__*/React.createElement("span", { style: { fontSize: 34 }, "aria-hidden": "true" }, icon),
+      /*#__PURE__*/React.createElement("span", null,
+        /*#__PURE__*/React.createElement("div", { style: { fontSize: 16, fontWeight: 700, color: "var(--navy)" } }, title),
+        /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "var(--muted)", marginTop: 3 } }, sub)));
+    return /*#__PURE__*/React.createElement("div", { className: "scrollable hs", "data-t": "ci-mode", style: { height: "100%", paddingBottom: 24 } },
+      /*#__PURE__*/React.createElement("div", { style: { padding: "16px 14px 10px" } }, /*#__PURE__*/React.createElement("h2", { style: { fontSize: 20 } }, "Guest Check-In"),
+        /*#__PURE__*/React.createElement("div", { style: { fontSize: 13, color: "var(--muted)", marginTop: 4 } }, "Choose the type of booking to continue")),
+      /*#__PURE__*/React.createElement("div", { style: { padding: "0 14px", display: "flex", flexDirection: "column", gap: 12, maxWidth: 560 } },
+        opt("single", "🛏️", "Single booking", "One guest, one room"),
+        opt("group", "🏨", "Group booking", "One guest, multiple rooms under one booking ID")));
+  }
   return /*#__PURE__*/React.createElement("div", {
     className: "scrollable hs",
     style: {
@@ -8093,7 +8113,9 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     style: {
       fontSize: 20
     }
-  }, "Guest Check-In")), /*#__PURE__*/React.createElement("div", {
+  }, "Guest Check-In"), canBulk && /*#__PURE__*/React.createElement("div", { "data-t": "ci-mode-strip", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: 13 } },
+    /*#__PURE__*/React.createElement("span", { style: { background: isGroup ? "#dbeafe" : "#f1ebde", color: "var(--navy)", fontWeight: 700, borderRadius: 20, padding: "3px 10px" } }, isGroup ? "🏨 Group booking" : "🛏️ Single booking"),
+    /*#__PURE__*/React.createElement("button", { type: "button", "data-t": "ci-mode-change", onClick: () => pickMode(isGroup ? "single" : "group"), style: { background: "none", border: "none", color: "var(--navy)", textDecoration: "underline", cursor: "pointer", fontSize: 12.5, padding: 4 } }, isGroup ? "Switch to single" : "Switch to group"))), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "0 14px",
       display: "flex",
@@ -8218,7 +8240,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     style: {
       color: "var(--gold2)"
     }
-  }, "Room: ", fmtMoney(rt))), canBulk && sel && _h("div", { "data-t": "bulk-rooms", style: { background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10, padding: 12 } },
+  }, "Room: ", fmtMoney(rt))), isGroup && sel && _h("div", { "data-t": "bulk-rooms", style: { background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10, padding: 12 } },
     _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--navy)", marginBottom: 6 } }, "🏨 MORE ROOMS FOR THIS GUEST (same booking ID)"),
     extraRooms.map((x, i) => {
       const taken = new Set([form.roomId, ...extraRooms.filter((_, j) => j !== i).map(y => y.roomId)]);
