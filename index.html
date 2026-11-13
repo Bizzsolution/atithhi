@@ -12343,6 +12343,26 @@ function StorageSettingsView({
 
 /* ── BOTTOM NAV ───────────────────────────────────────────────── */
 // ── CSV EXPORT — sales data + guest history, Excel-openable ────────
+// Booking source split (Direct / Agoda / Goibibo / …) for reports.
+// Revenue = bill total incl. GST, same as "Total Revenue".
+function bookingSourceOf(b) { const v = String((b && b.bookingSource) || "").trim(); return v || "Direct"; }
+function sourceBreakdown(bookings, rooms) {
+  const m = new Map();
+  (bookings || []).forEach(b => {
+    if (!b || b.status === "deleted") return;
+    const k = bookingSourceOf(b);
+    const room = (rooms || []).find(r => r.id === b.roomId);
+    const row = m.get(k) || { source: k, bookings: 0, nights: 0, revenue: 0 };
+    row.bookings += 1;
+    row.nights += b.checkIn && b.checkOut ? nts(b.checkIn, b.checkOut) : 0;
+    row.revenue += calcBillGST(b, room, rooms).grandTotal || 0;
+    m.set(k, row);
+  });
+  const rows = [...m.values()].sort((a, c) => c.revenue - a.revenue || c.bookings - a.bookings);
+  const total = rows.reduce((t, r) => t + r.revenue, 0);
+  rows.forEach(r => { r.share = total > 0 ? Math.round(r.revenue * 1000 / total) / 10 : 0; });
+  return rows;
+}
 function bookingsToCSV(bookings, rooms) {
   const roomMap = {};
   rooms.forEach(r => { roomMap[r.id] = r; });
@@ -12350,7 +12370,8 @@ function bookingsToCSV(bookings, rooms) {
     "Booking ID", "Guest Name", "Mobile", "Aadhaar (Masked)", "Room No", "Room Type",
     "Check-In", "Check-Out", "Nights", "Room Amount", "Extra Charges", "GST",
     "Total Amount", "Payment Status", "Status", "Address",
-    "Total Occupants", "Family Members (Name : Relation : Masked ID)"
+    "Total Occupants", "Family Members (Name : Relation : Masked ID)",
+    "Booking Source", "OTA Booking No."
   ];
   const esc = (v) => {
     const s = csvSafeText(v);
@@ -12378,10 +12399,13 @@ function bookingsToCSV(bookings, rooms) {
       b.id, b.name, b.mobile, maskedAadhaar, b.roomId, room ? room.type : "",
       fmtDate(b.checkIn), fmtDate(b.checkOut), n, b.roomTotal || 0, cSum, gst,
       grand, b.status === "checkedout" ? "Paid" : "Pending", b.status, (b.address || "").slice(0, 100),
-      totalOccupants, familySummary
+      totalOccupants, familySummary,
+      bookingSourceOf(b), b.otaReference || ""
     ].map(esc).join(",");
   });
-  return [headers.map(esc).join(","), ...rows].join("\n");
+  const src = sourceBreakdown(bookings, rooms);
+  const srcRows = src.map(r => [r.source, r.bookings, r.nights, r.revenue, r.share + "%"].map(esc).join(","));
+  return [headers.map(esc).join(","), ...rows, "", "BOOKING SOURCE SUMMARY", ["Source", "Bookings", "Nights", "Revenue (incl. GST)", "Share"].join(","), ...srcRows].join("\n");
 }
 
 function downloadCSV(csv, filename) {
@@ -12937,6 +12961,7 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
     }, 0);
   }, [filtered, rooms]);
 
+  const bySource = useMemo(() => sourceBreakdown(filtered, rooms), [filtered, rooms]);
   const exportAll = () => {
     const csv = bookingsToCSV(filtered, rooms);
     const dateStamp = new Date().toISOString().slice(0, 10);
@@ -12979,6 +13004,18 @@ function GuestHistoryView({ bookings, rooms, profile, user }) {
         React.createElement("div", { style: { fontSize: 18, fontWeight: 800, color: "var(--navy)" } }, "\u20B9" + totalRevenue.toLocaleString("en-IN"))
       )
     ),
+    bySource.length > 0 && (hasFeature("ota_import") || bySource.some(r => r.source !== "Direct")) && React.createElement("div", { "data-t": "src-breakdown", style: { margin: "0 14px 14px", background: "#fff", border: "1px solid #e2e8f0", borderRadius: 12, padding: "10px 12px" } },
+      React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", fontWeight: 700, marginBottom: 6 } }, "BY BOOKING SOURCE"),
+      React.createElement("div", { style: { overflowX: "auto" } },
+        React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12.5 } },
+          React.createElement("thead", null, React.createElement("tr", { style: { textAlign: "left", color: "var(--muted)" } },
+            ["Source", "Bookings", "Nights", "Revenue", "Share"].map((h, i) => React.createElement("th", { key: h, style: { padding: "4px 6px", borderBottom: "1px solid #e2e8f0", textAlign: i ? "right" : "left", whiteSpace: "nowrap" } }, h)))),
+          React.createElement("tbody", null, bySource.map(r => React.createElement("tr", { key: r.source, "data-t": "src-row" },
+            React.createElement("td", { style: { padding: "6px", fontWeight: 700, color: "var(--navy)" } }, (r.source === "Direct" ? "🏨 " : "🌐 ") + r.source),
+            React.createElement("td", { style: { padding: "6px", textAlign: "right" } }, r.bookings),
+            React.createElement("td", { style: { padding: "6px", textAlign: "right" } }, r.nights),
+            React.createElement("td", { style: { padding: "6px", textAlign: "right", fontWeight: 700 } }, "\u20B9" + r.revenue.toLocaleString("en-IN")),
+            React.createElement("td", { style: { padding: "6px", textAlign: "right", color: "var(--muted)" } }, r.share + "%"))))))),
     hasFeature("csv_export") && React.createElement("div", { style: { padding: "0 14px", marginBottom: 14 } },
       React.createElement("button", {
         onClick: exportAll,

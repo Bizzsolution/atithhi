@@ -23,7 +23,7 @@
 //    the React <script> tags. An opaque (no-cors) cached copy cannot be
 //    used for a CORS/SRI request.
 
-const CACHE = 'atithibook-v5.27.0';
+const CACHE = 'atithibook-v5.27.1';
 const OFFLINE_URLS = [
   '/',
   '/index.html',
