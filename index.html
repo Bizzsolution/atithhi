@@ -7046,7 +7046,8 @@ function CheckInView({
   // With the group add-on the user first picks Single or Group booking.
   const [ciMode, setCiMode] = useState(""); // "" (not chosen yet) | "single" | "group"
   const isGroup = canBulk && ciMode === "group";
-  const pickMode = m => { setCiMode(m); setExtraRooms(m === "group" ? [{ roomId: "", rate: "", adults: "1" }] : []); };
+  const pickMode = m => { setCiMode(m); setExtraRooms([]); setRateMode("same"); };
+  const [rateMode, setRateMode] = useState("same"); // group: "same" = every room at the main room's rate, "diff" = rate per room
   const [form, setForm] = useState({
     roomId: prefill?.roomId || checkInRoom?.id || empty[0]?.id || "",
     name: prefill?.name || "",
@@ -7976,6 +7977,8 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
   const n = nts(form.checkIn, form.checkOut);
   const effectiveRate = useCustomRate && customRate ? Number(customRate) : (sel?.rate || 0);
   const rt = sel ? effectiveRate * n : 0;
+  const extras_ = extraRooms.filter(x => x.roomId && x.roomId !== form.roomId);
+  const rateOfExtra = x => rateMode === "same" ? effectiveRate : x.rate;
   useEffect(() => {
     setUseCustomRate(false);
     setCustomRate("");
@@ -7999,11 +8002,11 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     }
     const extraAdv = Number(advAmt) || 0;
     if (extraAdv < 0) return alert("Advance amount is invalid");
-    const extras = isGroup ? extraRooms : [];
-    if (isGroup && extras.length === 0) return alert("Group booking needs at least one more room. Add a room, or switch to Single booking.");
+    const extras = isGroup ? extras_.map(x => ({ ...x, rate: String(rateOfExtra(x)) })) : [];
+    if (isGroup && extras.length === 0) return alert("Group booking needs at least one more room. Tick a room, or switch to Single booking.");
     const seenRooms = new Set([form.roomId]);
     for (const x of extras) {
-      if (!x.roomId) return alert("Please choose a room for every extra room row (or remove the empty row)");
+      if (!x.roomId) return alert("Please choose a room");
       if (seenRooms.has(x.roomId)) return alert("Room " + x.roomId + " is selected twice");
       seenRooms.add(x.roomId);
       if (!(Number(x.rate) >= 0) || x.rate === "") return alert("Please enter the rate for room " + x.roomId);
@@ -8241,23 +8244,43 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       color: "var(--gold2)"
     }
   }, "Room: ", fmtMoney(rt))), isGroup && sel && _h("div", { "data-t": "bulk-rooms", style: { background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10, padding: 12 } },
-    _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--navy)", marginBottom: 6 } }, "🏨 MORE ROOMS FOR THIS GUEST (same booking ID)"),
-    extraRooms.map((x, i) => {
-      const taken = new Set([form.roomId, ...extraRooms.filter((_, j) => j !== i).map(y => y.roomId)]);
-      const setX = patch => setExtraRooms(extraRooms.map((y, j) => j === i ? { ...y, ...patch } : y));
-      return _h("div", { key: i, "data-t": "bulk-row", style: { display: "grid", gridTemplateColumns: "1.6fr 1fr .7fr auto", gap: 6, marginBottom: 6, alignItems: "center" } },
-        _h("select", { "aria-label": "Extra room " + (i + 1), "data-t": "bulk-room", value: x.roomId, onChange: e => { const r = rooms.find(z => z.id === e.target.value); setX({ roomId: e.target.value, rate: r ? String(r.rate) : "" }); } },
-          _h("option", { value: "" }, "-- Room --"),
-          empty.filter(r => !taken.has(r.id)).map(r => _h("option", { key: r.id, value: r.id }, r.id + " · " + r.type))),
-        _h("input", { "aria-label": "Rate per night", "data-t": "bulk-rate", type: "number", min: 0, inputMode: "numeric", placeholder: "₹/night", value: x.rate, onChange: e => setX({ rate: e.target.value }) }),
-        _h("input", { "aria-label": "Adults", "data-t": "bulk-adults", type: "number", min: 1, value: x.adults, onChange: e => setX({ adults: e.target.value }) }),
-        _h("button", { type: "button", "aria-label": "Remove room", onClick: () => setExtraRooms(extraRooms.filter((_, j) => j !== i)), style: { width: 40, height: 40, border: "1px solid var(--border)", borderRadius: 8, background: "#fff", cursor: "pointer" } }, "✕"));
-    }),
-    extraRooms.length > 0 && _h("div", { style: { fontSize: 10.5, color: "var(--muted)", margin: "0 0 6px" } }, "Room · rate per night · adults"),
-    _h("button", { type: "button", className: "btn-o", "data-t": "bulk-add", onClick: () => setExtraRooms([...extraRooms, { roomId: "", rate: "", adults: "1" }]), disabled: empty.filter(r => r.id !== form.roomId).length <= extraRooms.length, style: { width: "100%" } }, "➕ Add another room"),
-    extraRooms.length > 0 && n > 0 && _h("div", { "data-t": "bulk-total", style: { display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, marginTop: 8, color: "var(--navy)" } },
-      _h("span", null, (extraRooms.length + 1) + " rooms · " + n + " night" + (n > 1 ? "s" : "")),
-      _h("span", null, "Total room rent: " + fmtMoney(rt + extraRooms.reduce((t, x) => t + Math.round((Number(x.rate) || 0) * n), 0)))),
+    _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--navy)" } }, "🏨 MORE ROOMS FOR THIS GUEST (same booking ID)"),
+    _h("div", { style: { fontSize: 11.5, color: "var(--muted)", margin: "2px 0 8px" } }, "Tick every extra room this guest is taking. Room " + form.roomId + " above is the main room."),
+    (() => {
+      const avail = empty.filter(r => r.id !== form.roomId);
+      if (!avail.length) return _h("div", { style: { fontSize: 12, color: "#b91c1c" } }, "No other empty room is available.");
+      const ticked = new Set(extras_.map(x => x.roomId));
+      const toggle = r => setExtraRooms(ticked.has(r.id) ? extraRooms.filter(x => x.roomId !== r.id) : [...extraRooms.filter(x => x.roomId !== form.roomId), { roomId: r.id, rate: String(r.rate || ""), adults: "1" }]);
+      return _h("div", { "data-t": "bulk-pick", role: "group", "aria-label": "Select rooms", style: { display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(96px,1fr))", gap: 6 } },
+        avail.map(r => _h("label", { key: r.id, "data-t": "bulk-pick-" + r.id, style: { display: "flex", alignItems: "center", gap: 6, padding: "8px 8px", borderRadius: 10, cursor: "pointer", border: "1.5px solid " + (ticked.has(r.id) ? "var(--navy)" : "var(--border)"), background: ticked.has(r.id) ? "#dbeafe" : "#fff" } },
+          _h("input", { type: "checkbox", checked: ticked.has(r.id), onChange: () => toggle(r), style: { width: 18, height: 18, flex: "0 0 auto" } }),
+          _h("span", { style: { lineHeight: 1.15 } }, _h("b", { style: { fontSize: 13, color: "var(--navy)" } }, r.id), _h("br"), _h("span", { style: { fontSize: 10.5, color: "var(--muted)" } }, r.type + " · ₹" + r.rate)))));
+    })(),
+    extras_.length > 0 && _h("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 6 } },
+      _h("button", { type: "button", className: "btn-s", "data-t": "bulk-all", onClick: () => setExtraRooms(empty.filter(r => r.id !== form.roomId).map(r => extraRooms.find(x => x.roomId === r.id) || { roomId: r.id, rate: String(r.rate || ""), adults: "1" })), style: { minHeight: 34, fontSize: 12 } }, "Select all"),
+      _h("button", { type: "button", className: "btn-s", "data-t": "bulk-none", onClick: () => setExtraRooms([]), style: { minHeight: 34, fontSize: 12 } }, "Clear")),
+    extras_.length > 0 && _h("div", { style: { marginTop: 10 } },
+      _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--navy)", marginBottom: 6 } }, "💰 Room rate for the selected rooms"),
+      _h("div", { "data-t": "bulk-ratemode", role: "radiogroup", "aria-label": "Room rate", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 } },
+        [["same", "Same rate for all rooms", "Every room at " + fmtMoney(effectiveRate) + "/night, like the main room"], ["diff", "Different rate per room", "Enter a rate for each room below"]].map(([v, l, d]) => _h("button", {
+          key: v, type: "button", role: "radio", "aria-checked": rateMode === v, "data-t": "bulk-rate-" + v, onClick: () => setRateMode(v),
+          style: { padding: "8px 8px", borderRadius: 10, cursor: "pointer", textAlign: "left", border: "1.5px solid " + (rateMode === v ? "var(--navy)" : "var(--border)"), background: rateMode === v ? "#dbeafe" : "#fff" }
+        }, _h("div", { style: { fontSize: 12.5, fontWeight: 700, color: "var(--navy)" } }, (rateMode === v ? "● " : "○ ") + l), _h("div", { style: { fontSize: 10.5, color: "var(--muted)" } }, d)))),
+      rateMode === "same" && _h("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 6 } }, "To change this rate, change the main room's rate above."),
+      _h("div", { style: { marginTop: 8 } },
+        _h("div", { style: { display: "grid", gridTemplateColumns: rateMode === "diff" ? "1.2fr 1fr .8fr" : "1.6fr .8fr", gap: 6, fontSize: 10.5, color: "var(--muted)", fontWeight: 700, marginBottom: 4 } },
+          _h("span", null, "ROOM"), rateMode === "diff" && _h("span", null, "RATE / NIGHT (₹)"), _h("span", null, "ADULTS")),
+        extras_.map(x => {
+          const r = rooms.find(z => z.id === x.roomId) || {};
+          const setX = patch => setExtraRooms(extraRooms.map(y => y.roomId === x.roomId ? { ...y, ...patch } : y));
+          return _h("div", { key: x.roomId, "data-t": "bulk-row", style: { display: "grid", gridTemplateColumns: rateMode === "diff" ? "1.2fr 1fr .8fr" : "1.6fr .8fr", gap: 6, marginBottom: 6, alignItems: "center" } },
+            _h("div", { style: { fontSize: 13 } }, _h("b", { style: { color: "var(--navy)" } }, x.roomId), " · ", r.type || "", rateMode === "same" ? _h("span", { style: { color: "var(--muted)", fontSize: 11.5 } }, " · " + fmtMoney(effectiveRate)) : null),
+            rateMode === "diff" && _h("input", { "aria-label": "Rate per night for room " + x.roomId, "data-t": "bulk-rate", type: "number", min: 0, inputMode: "numeric", placeholder: "₹/night", value: x.rate, onChange: e => setX({ rate: e.target.value }) }),
+            _h("input", { "aria-label": "Adults in room " + x.roomId, "data-t": "bulk-adults", type: "number", min: 1, value: x.adults, onChange: e => setX({ adults: e.target.value }) }));
+        }))),
+    extras_.length > 0 && n > 0 && _h("div", { "data-t": "bulk-total", style: { display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, marginTop: 8, color: "var(--navy)" } },
+      _h("span", null, (extras_.length + 1) + " rooms · " + n + " night" + (n > 1 ? "s" : "")),
+      _h("span", null, "Total room rent: " + fmtMoney(rt + extras_.reduce((t, x) => t + Math.round((Number(rateOfExtra(x)) || 0) * n), 0)))),
     _h("div", { style: { fontSize: 10.5, color: "var(--muted)", marginTop: 6 } }, "ID photos are saved once, with the main room. At checkout you can make one combined bill or a separate bill per room.")))), _h("div", { className: "card", "data-t": "advance-card", style: { padding: "14px 16px" } },
     _h("div", { className: "st" }, "💵 ADVANCE / DEPOSIT"),
     preAdv > 0 ? _h("div", { style: { fontSize: 12.5, background: "#dcfce7", color: "#166534", borderRadius: 8, padding: "8px 10px", marginBottom: 8, fontWeight: 600 } }, "Advance received at booking: ₹" + preAdv.toLocaleString("en-IN") + " — will be adjusted in the final bill") : null,
@@ -12439,6 +12462,15 @@ const DriverComm = {
     return prefix + Date.now().toString(36).toUpperCase().slice(-6) + Math.random().toString(36).slice(2, 4).toUpperCase();
   },
   pctOk(p) { const n = Number(p); return isFinite(n) && n >= 0 && n <= 100; },
+  // Every change to a driver is kept on the driver as log[] (newest last,
+  // max 50): { at, by, role, action, changes: { field: [old, new] }, reason }.
+  // Staff must give a reason for an edit/delete; the Owner sees the log.
+  logEntry(user, action, changes, reason) {
+    return { at: new Date().toISOString(), by: String((user && (user.name || user.u)) || "").slice(0, 40), role: (user && user.role) || "Owner", action, changes: changes || null, reason: String(reason || "").trim().slice(0, 200) };
+  },
+  updateDriverLogged(id, patch, entry) {
+    return this._write("drivers", cur => cur.map(x => x.id === id ? { ...x, ...patch, updatedAt: entry.at, log: [...(Array.isArray(x.log) ? x.log : []), entry].slice(-50) } : x));
+  },
   amount(base, pct) { return Math.round((Number(base) || 0) * (Number(pct) || 0) / 100); },
   async _write(k, mutate) {
     const res = await WS.txArray(k, cur => mutate(Array.isArray(cur) ? cur : []));
@@ -12704,7 +12736,12 @@ function DriversView({ user }) {
   const [fSt, setFSt] = useState("");
   const [busy, setBusy] = useState(false);
   const [nd, setNd] = useState({ name: "", phone: "", pct: "10" });
-  const [edit, setEdit] = useState(null); // { id, name, phone, pct }
+  const [edit, setEdit] = useState(null); // { id, name, phone, pct, reason }
+  const [del, setDel] = useState(null); // { id, reason }
+  const [logFor, setLogFor] = useState(null); // driver id whose change log is open (Owner)
+  const isOwnerU = !user || user.role === "Owner";
+  const liveDrivers = drivers.filter(d => !d.deleted);
+  const deletedDrivers = drivers.filter(d => d.deleted);
   // Driver photo is its own paid add-on ("driver_photo"), on top of driver_commission
   const photoOn = hasFeature("driver_photo");
   const thumbs = useDriverThumbs(photoOn);
@@ -12744,7 +12781,7 @@ function DriversView({ user }) {
   };
   const exportCsv = () => {
     const esc = v => { const s = String(v == null ? "" : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
-    const head = ["Checkout date", "Invoice", "Guest", "Room", "Driver", "Driver mobile", "Room rent (excl. GST)", "Commission %", "Commission ₹", "Status", "Paid date", "Mode"];
+    const head = ["Checkout date", "Invoice", "Guest", "Room", "Driver", "Driver mobile", "First-night room rent", "Commission %", "Commission ₹", "Status", "Paid date", "Mode"];
     const body = rows.map(r => [r.checkOut || ("In house since " + (r.checkIn || "")) + (r.bookingCancelled ? " (check-in cancelled)" : ""), r.invoiceNo, r.guest, r.roomId, r.driverName, r.driverPhone, r.base, r.pct, r.amount, r.status === "paid" ? "Paid" : "Due", r.paidAt ? String(r.paidAt).slice(0, 10) : "", r.paidMode || ""].map(esc).join(","));
     const sumHead = ["", "", "", "", "Driver", "Mobile", "Room rent", "Trips", "Commission ₹", "Paid ₹", "Due ₹"];
     const sumBody = byDriver.map(d => ["", "", "", "", d.name, d.phone, d.base, d.trips, d.amount, d.paid, d.due].map(esc).join(","));
@@ -12755,16 +12792,42 @@ function DriversView({ user }) {
     if (!name) return alert("Please enter the driver's name");
     if (nd.pct === "" || !DriverComm.pctOk(nd.pct)) return alert("Commission % must be between 0 and 100");
     const now = new Date().toISOString();
-    await DriverComm.addDriver({ id: DriverComm.newId("DR"), name, phone: nd.phone.replace(/\D/g, "").slice(0, 10), pct: Math.round(Number(nd.pct) * 100) / 100, active: true, createdAt: now, updatedAt: now });
+    const pct = Math.round(Number(nd.pct) * 100) / 100, phone = nd.phone.replace(/\D/g, "").slice(0, 10);
+    await DriverComm.addDriver({ id: DriverComm.newId("DR"), name, phone, pct, active: true, createdAt: now, updatedAt: now, log: [DriverComm.logEntry(user, "added", { name: ["", name], phone: ["", phone], pct: ["", pct] }, "")] });
     setNd({ name: "", phone: "", pct: "10" });
   });
   const saveEdit = () => run(async () => {
     const name = String(edit.name || "").trim().slice(0, 40);
     if (!name) return alert("Please enter the driver's name");
     if (edit.pct === "" || !DriverComm.pctOk(edit.pct)) return alert("Commission % must be between 0 and 100");
-    await DriverComm.updateDriver(edit.id, { name, phone: String(edit.phone || "").replace(/\D/g, "").slice(0, 10), pct: Math.round(Number(edit.pct) * 100) / 100 });
+    const d0 = drivers.find(x => x.id === edit.id) || {};
+    const next = { name, phone: String(edit.phone || "").replace(/\D/g, "").slice(0, 10), pct: Math.round(Number(edit.pct) * 100) / 100 };
+    const changes = {};
+    ["name", "phone", "pct"].forEach(k => { if (String(d0[k] == null ? "" : d0[k]) !== String(next[k])) changes[k] = [d0[k] == null ? "" : d0[k], next[k]]; });
+    if (!Object.keys(changes).length) { setEdit(null); return; }
+    const reason = String(edit.reason || "").trim();
+    if (!isOwnerU && reason.length < 3) return alert("Please write the reason for this change (it is shown to the owner)");
+    await DriverComm.updateDriverLogged(edit.id, next, DriverComm.logEntry(user, "edited", changes, reason));
+    AuditLog.add("DRIVER_EDIT", edit.id + " " + Object.keys(changes).join(",") + (reason ? " — " + reason : ""));
     setEdit(null);
   });
+  const doDelete = () => run(async () => {
+    const d0 = drivers.find(x => x.id === del.id); if (!d0) return setDel(null);
+    const reason = String(del.reason || "").trim();
+    if (!isOwnerU && reason.length < 3) return alert("Please write the reason for deleting this driver (it is shown to the owner)");
+    await DriverComm.updateDriverLogged(del.id, { deleted: true, active: false, deletedAt: new Date().toISOString() }, DriverComm.logEntry(user, "deleted", null, reason));
+    AuditLog.add("DRIVER_DELETE", del.id + " " + d0.name + (reason ? " — " + reason : ""));
+    setDel(null);
+  });
+  const toggleActive = d => run(() => DriverComm.updateDriverLogged(d.id, { active: d.active === false }, DriverComm.logEntry(user, d.active === false ? "activated" : "closed", null, "")));
+  const ACT = { added: "Added", edited: "Edited", deleted: "Deleted", closed: "Closed", activated: "Activated" };
+  const FLD = { name: "Name", phone: "Mobile", pct: "Commission %" };
+  const logView = d => _h("div", { "data-t": "drv-log", style: { marginTop: 10, borderTop: "1px dashed var(--border)", paddingTop: 8 } },
+    (Array.isArray(d.log) && d.log.length ? d.log.slice().reverse() : []).map((e, i) => _h("div", { key: i, "data-t": "drv-log-row", style: { fontSize: 12, padding: "6px 0", borderBottom: "1px solid #f1f5f9" } },
+      _h("div", null, _h("b", { style: { color: e.action === "deleted" ? "#b91c1c" : "var(--navy)" } }, ACT[e.action] || e.action), " · ", new Date(e.at).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }), " · by ", e.by || "—", " (", e.role || "—", ")"),
+      e.changes && e.action !== "added" ? _h("div", { style: { color: "#334155" } }, Object.keys(e.changes).map(k => (FLD[k] || k) + ": " + (e.changes[k][0] === "" ? "—" : e.changes[k][0]) + " → " + e.changes[k][1]).join(" · ")) : null,
+      e.reason ? _h("div", { style: { color: "#92400e" } }, "Reason: " + e.reason) : null)),
+    !(Array.isArray(d.log) && d.log.length) && _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, "No changes recorded yet (log starts from this version)."));
   const lab = { fontSize: 11, fontWeight: 700, color: "var(--muted)", display: "block", marginBottom: 4 };
   const stat = (label, value, color) => _h("div", { className: "card", style: { padding: "12px 14px" } },
     _h("div", { style: { fontSize: 11, fontWeight: 700, color: "var(--muted)", letterSpacing: .5 } }, label),
@@ -12773,7 +12836,7 @@ function DriversView({ user }) {
   return _h("div", { className: "scrollable hs", "data-t": "drivers-view", style: { height: "100%", padding: "16px 14px 24px" } },
     _h("div", { style: { fontFamily: "'Josefin Sans',sans-serif", fontSize: 20, fontWeight: 700, color: "var(--navy)" } }, "🛺 Driver Commission"),
     _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 12px" } }, "Auto/taxi driver's share, on the FIRST NIGHT's room rent only — GST included if your prices include GST, without GST if GST is added on top. Food/services and other nights don't count. Shows as Due from check-in. The guest's bill does not change."),
-    _h("div", { style: { display: "flex", gap: 4, background: "#f1ebde", padding: 4, borderRadius: 12, marginBottom: 12 } }, tabBtn("comm", "Commission"), tabBtn("drivers", "Drivers (" + drivers.length + ")")),
+    _h("div", { style: { display: "flex", gap: 4, background: "#f1ebde", padding: 4, borderRadius: 12, marginBottom: 12 } }, tabBtn("comm", "Commission"), tabBtn("drivers", "Drivers (" + liveDrivers.length + ")")),
     tab === "comm" ? _h(React.Fragment, null,
       _h("div", { className: "card", style: { padding: "12px 14px", display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: 10, marginBottom: 12 } },
         _h("div", null, _h("label", { htmlFor: "ab-dc-from", style: lab }, "FROM"), _h("input", { id: "ab-dc-from", type: "date", value: from, onChange: e => setFrom(e.target.value) })),
@@ -12818,13 +12881,14 @@ function DriversView({ user }) {
           _h("input", { "aria-label": "Driver mobile", placeholder: "Mobile", inputMode: "numeric", maxLength: 10, value: nd.phone, onChange: e => setNd({ ...nd, phone: e.target.value.replace(/\D/g, "") }) }),
           _h("input", { "aria-label": "Commission %", type: "number", min: 0, max: 100, step: "0.5", placeholder: "%", value: nd.pct, onChange: e => setNd({ ...nd, pct: e.target.value }) })),
         _h("button", { className: "btn-p", onClick: addDriver, disabled: busy, "data-t": "dc-add-driver", style: { marginTop: 10, width: "100%" } }, "Save driver")),
-      drivers.length === 0 ? _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No drivers yet.")
-        : drivers.slice().sort((a, b) => String(a.name).localeCompare(String(b.name))).map(d => _h("div", { key: d.id, className: "card", style: { padding: "12px 14px", marginBottom: 8, opacity: d.active === false ? .55 : 1 } },
+      liveDrivers.length === 0 ? _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No drivers yet.")
+        : liveDrivers.slice().sort((a, b) => String(a.name).localeCompare(String(b.name))).map(d => _h("div", { key: d.id, className: "card", style: { padding: "12px 14px", marginBottom: 8, opacity: d.active === false ? .55 : 1 } },
           edit && edit.id === d.id
             ? _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 8 } },
                 _h("input", { "aria-label": "Naam", value: edit.name, maxLength: 40, onChange: e => setEdit({ ...edit, name: e.target.value }) }),
                 _h("input", { "aria-label": "Mobile", value: edit.phone, inputMode: "numeric", maxLength: 10, onChange: e => setEdit({ ...edit, phone: e.target.value.replace(/\D/g, "") }) }),
                 _h("input", { "aria-label": "Commission %", type: "number", min: 0, max: 100, step: "0.5", value: edit.pct, onChange: e => setEdit({ ...edit, pct: e.target.value }) }),
+                _h("input", { "aria-label": "Reason for change", "data-t": "drv-edit-reason", value: edit.reason || "", maxLength: 200, placeholder: isOwnerU ? "Reason (optional)" : "Reason for change (required)", onChange: e => setEdit({ ...edit, reason: e.target.value }), style: { gridColumn: "1 / -1" } }),
                 _h("div", { style: { display: "flex", gap: 6 } },
                   _h("button", { className: "btn-p", onClick: saveEdit, disabled: busy, style: { flex: 1 } }, "Save"),
                   _h("button", { className: "btn-s", onClick: () => setEdit(null), style: { flex: 1 } }, "Cancel")))
@@ -12836,8 +12900,22 @@ function DriversView({ user }) {
                 photoOn && _h("label", { className: "btn-s", "data-t": "drv-photo-btn", style: { minHeight: 38, display: "inline-flex", alignItems: "center", cursor: "pointer" } }, thumbs[d.id] ? "📷 Change photo" : "📷 Photo",
                   _h("input", { type: "file", accept: "image/*", capture: "environment", "data-t": "drv-photo-file", disabled: busy, style: { display: "none" }, onChange: e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f) takePhoto(d, f); } })),
                 photoOn && thumbs[d.id] && _h("button", { className: "btn-s", onClick: () => dropPhoto(d), disabled: busy, "aria-label": "Remove photo", style: { minHeight: 38 } }, "🗑️"),
-                _h("button", { className: "btn-s", onClick: () => setEdit({ id: d.id, name: d.name, phone: d.phone || "", pct: String(d.pct) }), style: { minHeight: 38 } }, "✏️ Edit"),
-                _h("button", { className: "btn-s", onClick: () => run(() => DriverComm.updateDriver(d.id, { active: d.active === false })), disabled: busy, style: { minHeight: 38 } }, d.active === false ? "Activate" : "Close")))),
+                _h("button", { className: "btn-s", onClick: () => { setDel(null); setEdit({ id: d.id, name: d.name, phone: d.phone || "", pct: String(d.pct), reason: "" }); }, style: { minHeight: 38 } }, "✏️ Edit"),
+                _h("button", { className: "btn-s", onClick: () => toggleActive(d), disabled: busy, style: { minHeight: 38 } }, d.active === false ? "Activate" : "Close"),
+                _h("button", { className: "btn-s", "data-t": "drv-del", onClick: () => { setEdit(null); setDel({ id: d.id, reason: "" }); }, disabled: busy, "aria-label": "Delete driver", style: { minHeight: 38, color: "#b91c1c" } }, "🗑️ Delete"),
+                isOwnerU && _h("button", { className: "btn-s", "data-t": "drv-log-btn", onClick: () => setLogFor(logFor === d.id ? null : d.id), style: { minHeight: 38 } }, "📜 Log (" + (Array.isArray(d.log) ? d.log.length : 0) + ")")),
+          del && del.id === d.id && !edit && _h("div", { "data-t": "drv-del-panel", style: { marginTop: 10, background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10, padding: 10 } },
+            _h("div", { style: { fontSize: 12.5, fontWeight: 700, color: "#b91c1c", marginBottom: 6 } }, "Delete " + d.name + "? Their past commission records stay in the reports."),
+            _h("input", { "aria-label": "Reason for deleting", "data-t": "drv-del-reason", value: del.reason, maxLength: 200, placeholder: isOwnerU ? "Reason (optional)" : "Reason for deleting (required)", onChange: e => setDel({ ...del, reason: e.target.value }), style: { width: "100%", boxSizing: "border-box" } }),
+            _h("div", { style: { display: "flex", gap: 6, marginTop: 8 } },
+              _h("button", { className: "btn-p", "data-t": "drv-del-confirm", onClick: doDelete, disabled: busy, style: { flex: 1, background: "#b91c1c" } }, "Delete driver"),
+              _h("button", { className: "btn-s", onClick: () => setDel(null), style: { flex: 1 } }, "Cancel"))),
+          isOwnerU && logFor === d.id && logView(d))),
+      isOwnerU && deletedDrivers.length > 0 && _h("div", { "data-t": "drv-deleted", className: "card", style: { padding: "12px 14px", marginTop: 8, background: "#fafafa" } },
+        _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--muted)", marginBottom: 6 } }, "🗑️ DELETED DRIVERS (" + deletedDrivers.length + ") — tap a name to see who deleted it and why"),
+        deletedDrivers.map(d => _h("div", { key: d.id, style: { marginBottom: 6 } },
+          _h("button", { type: "button", "data-t": "drv-deleted-btn", onClick: () => setLogFor(logFor === d.id ? null : d.id), style: { background: "none", border: "none", padding: "4px 0", cursor: "pointer", color: "var(--navy)", fontWeight: 700, fontSize: 13, textDecoration: "underline" } }, d.name + (d.phone ? " · " + d.phone : "")),
+          logFor === d.id && logView(d)))),
       _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 6 } }, "Changing the % affects only future bookings. Existing records stay unchanged."),
       photoOn && _h("div", { style: { fontSize: 11.5, color: "var(--muted)", marginTop: 4 } }, "📷 Photos: the full photo stays on the phone that took it; a small copy shows on all devices.")),
     viewPhoto && _h(DriverPhotoViewer, { id: viewPhoto.id, name: viewPhoto.name, thumb: thumbs[viewPhoto.id], onClose: () => setViewPhoto(null) }));
