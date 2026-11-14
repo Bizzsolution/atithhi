@@ -7025,6 +7025,7 @@ function FamilyMembersSection({
   }, "Total occupants: ", 1 + family.length, " (1 primary + ", family.length, " additional) — all on one booking"));
 }
 function CheckInView({
+  user,
   rooms,
   checkInRoom,
   onCheckIn,
@@ -8017,10 +8018,16 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     if (hasFeature("driver_commission") && driverPick && driverPick.sel) {
       let known = [];
       try { known = JSON.parse(localStorage.getItem("ab_drivers") || "[]"); } catch (e) {}
-      const dp = resolveDriverPick(driverPick, known);
+      const dp = resolveDriverPick(driverPick, known, user);
       if (dp.error) return alert(dp.error);
       driverInfo = dp.driver;
-      if (dp.newDriver) DriverComm.addDriver(dp.newDriver).catch(e => console.warn("addDriver:", e && e.message));
+      if (dp.newDriver) {
+        const pic = hasFeature("driver_photo") ? dp.photo : null;
+        DriverComm.addDriver(dp.newDriver)
+          .then(() => pic ? DriverPhotos.save(dp.newDriver.id, pic) : null)
+          .then(r => { if (r && r.cloud === "limit") alert("Driver photo saved on this device only — the cloud photo limit is full."); })
+          .catch(e => console.warn("addDriver:", e && e.message));
+      }
     }
     const advancesAll = [...(prefill?.advances || []), ...(extraAdv > 0 ? [{ amount: extraAdv, mode: advMode, date: todayStr(), src: "checkin" }] : [])];
     // Family members travel under this SAME booking (no separate transaction)
@@ -12676,6 +12683,7 @@ function useDriverDoc(k) {
 
 // Check-in form block: which driver brought the guest (optional).
 function DriverPicker({ value, onChange }) {
+  const [photoUrl, setPhotoUrl] = useState("");
   const _h = React.createElement;
   const [drivers] = useDriverDoc("drivers");
   const photoOn = hasFeature("driver_photo");
@@ -12689,25 +12697,41 @@ function DriverPicker({ value, onChange }) {
     _h("select", { id: "ab-drv-sel", value: v.sel, onChange: e => {
       const sel = e.target.value;
       const d = active.find(x => x.id === sel);
-      onChange({ sel, name: "", phone: "", pct: d ? String(d.pct) : (sel === "new" ? "10" : "") });
+      onChange({ sel, name: "", phone: "", vehicle: "", photo: null, pct: d ? String(d.pct) : (sel === "new" ? "10" : "") });
+      setPhotoUrl("");
     } },
       _h("option", { value: "" }, "No — guest came directly"),
-      active.map(d => _h("option", { key: d.id, value: d.id }, d.name + (d.phone ? " · " + d.phone : "") + " · " + d.pct + "%")),
+      active.map(d => _h("option", { key: d.id, value: d.id }, d.name + (d.vehicle ? " · " + d.vehicle : "") + (d.phone ? " · " + d.phone : "") + " · " + d.pct + "%")),
       _h("option", { value: "new" }, "+ Add new driver")),
+    v.sel && v.sel !== "new" && (active.find(x => x.id === v.sel) || {}).vehicle && _h("div", { "data-t": "drv-pick-vehicle", style: { fontSize: 12.5, marginTop: 8, color: "var(--navy)", fontWeight: 700 } }, "🚗 Vehicle: " + (active.find(x => x.id === v.sel) || {}).vehicle),
     photoOn && v.sel && v.sel !== "new" && _h("div", { "data-t": "drv-pick-photo", style: { display: "flex", alignItems: "center", gap: 10, marginTop: 8 } },
       _h(DriverAvatar, { src: thumbs[v.sel], size: 52, name: (active.find(x => x.id === v.sel) || {}).name }),
       _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, thumbs[v.sel] ? "Match the driver with this photo" : "No photo yet — add one in Drivers → Drivers tab")),
     v.sel === "new" && _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 } },
       _h("input", { "aria-label": "Driver name", placeholder: "Driver name *", maxLength: 40, value: v.name, onChange: e => set({ name: e.target.value }) }),
-      _h("input", { "aria-label": "Driver mobile", placeholder: "Mobile", inputMode: "numeric", maxLength: 10, value: v.phone, onChange: e => set({ phone: e.target.value.replace(/\D/g, "") }) })),
+      _h("input", { "aria-label": "Driver mobile", placeholder: "Mobile", inputMode: "numeric", maxLength: 10, value: v.phone, onChange: e => set({ phone: e.target.value.replace(/\D/g, "") }) }),
+      _h("input", { "aria-label": "Vehicle number", "data-t": "drv-new-vehicle", placeholder: "Vehicle no. (optional) e.g. UP16 AT 1234", maxLength: 15, value: v.vehicle || "", onChange: e => set({ vehicle: e.target.value.toUpperCase() }), style: { gridColumn: "1 / -1" } }),
+      photoOn && _h("div", { "data-t": "drv-new-photo", style: { gridColumn: "1 / -1", display: "flex", alignItems: "center", gap: 10 } },
+        photoUrl ? _h("img", { src: photoUrl, alt: "New driver photo", style: { width: 52, height: 52, borderRadius: "50%", objectFit: "cover", border: "2px solid var(--border)" } }) : _h(DriverAvatar, { size: 52 }),
+        _h("label", { className: "btn-s", style: { minHeight: 38, display: "inline-flex", alignItems: "center", cursor: "pointer" } }, photoUrl ? "📷 Retake photo" : "📷 Add driver photo (optional)",
+          _h("input", { type: "file", accept: "image/*", capture: "environment", "data-t": "drv-new-photo-file", style: { display: "none" }, onChange: e => {
+            const f = e.target.files && e.target.files[0]; e.target.value = "";
+            if (!f || !/^image\//.test(f.type || "")) return;
+            if (photoUrl) { try { URL.revokeObjectURL(photoUrl); } catch (x) {} }
+            setPhotoUrl(URL.createObjectURL(f)); set({ photo: f });
+          } })),
+        photoUrl && _h("button", { type: "button", className: "btn-s", "aria-label": "Remove photo", onClick: () => { try { URL.revokeObjectURL(photoUrl); } catch (x) {} setPhotoUrl(""); set({ photo: null }); }, style: { minHeight: 38 } }, "🗑️"))),
     v.sel && _h("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 8 } },
       _h("label", { htmlFor: "ab-drv-pct", style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Commission % (on first night's room rent)"),
       _h("input", { id: "ab-drv-pct", type: "number", min: 0, max: 100, step: "0.5", value: v.pct, onChange: e => set({ pct: e.target.value }), style: { width: 90 } })),
-    v.sel && _h("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 6 } }, "The guest's bill and GST do not change. A commission record is created automatically at checkout."));
+    v.sel && _h("div", { style: { fontSize: 11, color: "var(--muted)", marginTop: 6 } }, "The guest's bill and GST do not change. The commission shows as Due from check-in."));
 }
+// Vehicle number (auto / rickshaw / cab) — optional, kept as typed in
+// capitals: letters, digits, spaces and dashes, max 15.
+function cleanVehicleNo(v) { return String(v || "").toUpperCase().replace(/[^A-Z0-9 -]/g, "").replace(/\s+/g, " ").trim().slice(0, 15); }
 // Turns the picker's value into the booking's `driver` field.
 // Returns { driver, newDriver } or { error }.
-function resolveDriverPick(v, drivers) {
+function resolveDriverPick(v, drivers, user) {
   if (!v || !v.sel) return { driver: null };
   if (!DriverComm.pctOk(v.pct) || v.pct === "") return { error: "Driver commission % must be between 0 and 100" };
   const pct = Math.round(Number(v.pct) * 100) / 100;
@@ -12716,12 +12740,15 @@ function resolveDriverPick(v, drivers) {
     if (!name) return { error: "Please enter the new driver's name" };
     const phone = String(v.phone || "").replace(/\D/g, "").slice(0, 10);
     const now = new Date().toISOString();
-    const nd = { id: DriverComm.newId("DR"), name, phone, pct, active: true, createdAt: now, updatedAt: now };
-    return { driver: { id: nd.id, name, phone, pct }, newDriver: nd };
+    const vehicle = cleanVehicleNo(v.vehicle);
+    const nd = { id: DriverComm.newId("DR"), name, phone, pct, active: true, createdAt: now, updatedAt: now,
+      ...(vehicle ? { vehicle } : {}),
+      log: [DriverComm.logEntry(user || null, "added", { name: ["", name], phone: ["", phone], ...(vehicle ? { vehicle: ["", vehicle] } : {}), pct: ["", pct] }, "Added at check-in")] };
+    return { driver: { id: nd.id, name, phone, pct, ...(vehicle ? { vehicle } : {}) }, newDriver: nd, photo: v.photo || null };
   }
   const d = (drivers || []).find(x => x.id === v.sel);
   if (!d) return { error: "Driver not found in the list — please select again" };
-  return { driver: { id: d.id, name: d.name, phone: d.phone || "", pct } };
+  return { driver: { id: d.id, name: d.name, phone: d.phone || "", pct, ...(d.vehicle ? { vehicle: d.vehicle } : {}) } };
 }
 
 function DriversView({ user }) {
@@ -12735,7 +12762,7 @@ function DriversView({ user }) {
   const [fDrv, setFDrv] = useState("");
   const [fSt, setFSt] = useState("");
   const [busy, setBusy] = useState(false);
-  const [nd, setNd] = useState({ name: "", phone: "", pct: "10" });
+  const [nd, setNd] = useState({ name: "", phone: "", pct: "10", vehicle: "" });
   const [edit, setEdit] = useState(null); // { id, name, phone, pct, reason }
   const [del, setDel] = useState(null); // { id, reason }
   const [logFor, setLogFor] = useState(null); // driver id whose change log is open (Owner)
@@ -12781,8 +12808,8 @@ function DriversView({ user }) {
   };
   const exportCsv = () => {
     const esc = v => { const s = String(v == null ? "" : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
-    const head = ["Checkout date", "Invoice", "Guest", "Room", "Driver", "Driver mobile", "First-night room rent", "Commission %", "Commission ₹", "Status", "Paid date", "Mode"];
-    const body = rows.map(r => [r.checkOut || ("In house since " + (r.checkIn || "")) + (r.bookingCancelled ? " (check-in cancelled)" : ""), r.invoiceNo, r.guest, r.roomId, r.driverName, r.driverPhone, r.base, r.pct, r.amount, r.status === "paid" ? "Paid" : "Due", r.paidAt ? String(r.paidAt).slice(0, 10) : "", r.paidMode || ""].map(esc).join(","));
+    const head = ["Checkout date", "Invoice", "Guest", "Room", "Driver", "Driver mobile", "Vehicle no.", "First-night room rent", "Commission %", "Commission ₹", "Status", "Paid date", "Mode"];
+    const body = rows.map(r => [r.checkOut || ("In house since " + (r.checkIn || "")) + (r.bookingCancelled ? " (check-in cancelled)" : ""), r.invoiceNo, r.guest, r.roomId, r.driverName, r.driverPhone, (drivers.find(x => x.id === r.driverId) || {}).vehicle || "", r.base, r.pct, r.amount, r.status === "paid" ? "Paid" : "Due", r.paidAt ? String(r.paidAt).slice(0, 10) : "", r.paidMode || ""].map(esc).join(","));
     const sumHead = ["", "", "", "", "Driver", "Mobile", "Room rent", "Trips", "Commission ₹", "Paid ₹", "Due ₹"];
     const sumBody = byDriver.map(d => ["", "", "", "", d.name, d.phone, d.base, d.trips, d.amount, d.paid, d.due].map(esc).join(","));
     downloadCSV([head.join(","), ...body, "", "DRIVER-WISE SUMMARY", sumHead.join(","), ...sumBody].join("\n"), "AtithiBook_DriverCommission_" + (from || "start") + "_to_" + (to || todayStr()) + ".csv");
@@ -12792,18 +12819,18 @@ function DriversView({ user }) {
     if (!name) return alert("Please enter the driver's name");
     if (nd.pct === "" || !DriverComm.pctOk(nd.pct)) return alert("Commission % must be between 0 and 100");
     const now = new Date().toISOString();
-    const pct = Math.round(Number(nd.pct) * 100) / 100, phone = nd.phone.replace(/\D/g, "").slice(0, 10);
-    await DriverComm.addDriver({ id: DriverComm.newId("DR"), name, phone, pct, active: true, createdAt: now, updatedAt: now, log: [DriverComm.logEntry(user, "added", { name: ["", name], phone: ["", phone], pct: ["", pct] }, "")] });
-    setNd({ name: "", phone: "", pct: "10" });
+    const pct = Math.round(Number(nd.pct) * 100) / 100, phone = nd.phone.replace(/\D/g, "").slice(0, 10), vehicle = cleanVehicleNo(nd.vehicle);
+    await DriverComm.addDriver({ id: DriverComm.newId("DR"), name, phone, pct, active: true, createdAt: now, updatedAt: now, ...(vehicle ? { vehicle } : {}), log: [DriverComm.logEntry(user, "added", { name: ["", name], phone: ["", phone], ...(vehicle ? { vehicle: ["", vehicle] } : {}), pct: ["", pct] }, "")] });
+    setNd({ name: "", phone: "", pct: "10", vehicle: "" });
   });
   const saveEdit = () => run(async () => {
     const name = String(edit.name || "").trim().slice(0, 40);
     if (!name) return alert("Please enter the driver's name");
     if (edit.pct === "" || !DriverComm.pctOk(edit.pct)) return alert("Commission % must be between 0 and 100");
     const d0 = drivers.find(x => x.id === edit.id) || {};
-    const next = { name, phone: String(edit.phone || "").replace(/\D/g, "").slice(0, 10), pct: Math.round(Number(edit.pct) * 100) / 100 };
+    const next = { name, phone: String(edit.phone || "").replace(/\D/g, "").slice(0, 10), vehicle: cleanVehicleNo(edit.vehicle), pct: Math.round(Number(edit.pct) * 100) / 100 };
     const changes = {};
-    ["name", "phone", "pct"].forEach(k => { if (String(d0[k] == null ? "" : d0[k]) !== String(next[k])) changes[k] = [d0[k] == null ? "" : d0[k], next[k]]; });
+    ["name", "phone", "vehicle", "pct"].forEach(k => { if (String(d0[k] == null ? "" : d0[k]) !== String(next[k])) changes[k] = [d0[k] == null ? "" : d0[k], next[k]]; });
     if (!Object.keys(changes).length) { setEdit(null); return; }
     const reason = String(edit.reason || "").trim();
     if (!isOwnerU && reason.length < 3) return alert("Please write the reason for this change (it is shown to the owner)");
@@ -12821,7 +12848,7 @@ function DriversView({ user }) {
   });
   const toggleActive = d => run(() => DriverComm.updateDriverLogged(d.id, { active: d.active === false }, DriverComm.logEntry(user, d.active === false ? "activated" : "closed", null, "")));
   const ACT = { added: "Added", edited: "Edited", deleted: "Deleted", closed: "Closed", activated: "Activated" };
-  const FLD = { name: "Name", phone: "Mobile", pct: "Commission %" };
+  const FLD = { name: "Name", phone: "Mobile", vehicle: "Vehicle no.", pct: "Commission %" };
   const logView = d => _h("div", { "data-t": "drv-log", style: { marginTop: 10, borderTop: "1px dashed var(--border)", paddingTop: 8 } },
     (Array.isArray(d.log) && d.log.length ? d.log.slice().reverse() : []).map((e, i) => _h("div", { key: i, "data-t": "drv-log-row", style: { fontSize: 12, padding: "6px 0", borderBottom: "1px solid #f1f5f9" } },
       _h("div", null, _h("b", { style: { color: e.action === "deleted" ? "#b91c1c" : "var(--navy)" } }, ACT[e.action] || e.action), " · ", new Date(e.at).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }), " · by ", e.by || "—", " (", e.role || "—", ")"),
@@ -12879,6 +12906,7 @@ function DriversView({ user }) {
         _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: 8 } },
           _h("input", { "aria-label": "Driver name", placeholder: "Naam *", maxLength: 40, value: nd.name, onChange: e => setNd({ ...nd, name: e.target.value }) }),
           _h("input", { "aria-label": "Driver mobile", placeholder: "Mobile", inputMode: "numeric", maxLength: 10, value: nd.phone, onChange: e => setNd({ ...nd, phone: e.target.value.replace(/\D/g, "") }) }),
+          _h("input", { "aria-label": "Vehicle number", placeholder: "Vehicle no. (optional)", maxLength: 15, value: nd.vehicle, onChange: e => setNd({ ...nd, vehicle: e.target.value.toUpperCase() }) }),
           _h("input", { "aria-label": "Commission %", type: "number", min: 0, max: 100, step: "0.5", placeholder: "%", value: nd.pct, onChange: e => setNd({ ...nd, pct: e.target.value }) })),
         _h("button", { className: "btn-p", onClick: addDriver, disabled: busy, "data-t": "dc-add-driver", style: { marginTop: 10, width: "100%" } }, "Save driver")),
       liveDrivers.length === 0 ? _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No drivers yet.")
@@ -12887,6 +12915,7 @@ function DriversView({ user }) {
             ? _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 8 } },
                 _h("input", { "aria-label": "Naam", value: edit.name, maxLength: 40, onChange: e => setEdit({ ...edit, name: e.target.value }) }),
                 _h("input", { "aria-label": "Mobile", value: edit.phone, inputMode: "numeric", maxLength: 10, onChange: e => setEdit({ ...edit, phone: e.target.value.replace(/\D/g, "") }) }),
+                _h("input", { "aria-label": "Vehicle number", placeholder: "Vehicle no. (optional)", value: edit.vehicle || "", maxLength: 15, onChange: e => setEdit({ ...edit, vehicle: e.target.value.toUpperCase() }) }),
                 _h("input", { "aria-label": "Commission %", type: "number", min: 0, max: 100, step: "0.5", value: edit.pct, onChange: e => setEdit({ ...edit, pct: e.target.value }) }),
                 _h("input", { "aria-label": "Reason for change", "data-t": "drv-edit-reason", value: edit.reason || "", maxLength: 200, placeholder: isOwnerU ? "Reason (optional)" : "Reason for change (required)", onChange: e => setEdit({ ...edit, reason: e.target.value }), style: { gridColumn: "1 / -1" } }),
                 _h("div", { style: { display: "flex", gap: 6 } },
@@ -12896,11 +12925,11 @@ function DriversView({ user }) {
                 photoOn && _h(DriverAvatar, { src: thumbs[d.id], name: d.name, onClick: thumbs[d.id] ? () => setViewPhoto({ id: d.id, name: d.name }) : null }),
                 _h("div", { style: { flex: "1 1 160px", minWidth: 0 } },
                   _h("div", { style: { fontWeight: 700, color: "var(--navy)" } }, d.name, d.active === false ? " (band)" : ""),
-                  _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, d.phone || "—", " · ", d.pct, "% commission")),
+                  _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, d.phone || "—", d.vehicle ? " · 🚗 " + d.vehicle : "", " · ", d.pct, "% commission")),
                 photoOn && _h("label", { className: "btn-s", "data-t": "drv-photo-btn", style: { minHeight: 38, display: "inline-flex", alignItems: "center", cursor: "pointer" } }, thumbs[d.id] ? "📷 Change photo" : "📷 Photo",
                   _h("input", { type: "file", accept: "image/*", capture: "environment", "data-t": "drv-photo-file", disabled: busy, style: { display: "none" }, onChange: e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f) takePhoto(d, f); } })),
                 photoOn && thumbs[d.id] && _h("button", { className: "btn-s", onClick: () => dropPhoto(d), disabled: busy, "aria-label": "Remove photo", style: { minHeight: 38 } }, "🗑️"),
-                _h("button", { className: "btn-s", onClick: () => { setDel(null); setEdit({ id: d.id, name: d.name, phone: d.phone || "", pct: String(d.pct), reason: "" }); }, style: { minHeight: 38 } }, "✏️ Edit"),
+                _h("button", { className: "btn-s", onClick: () => { setDel(null); setEdit({ id: d.id, name: d.name, phone: d.phone || "", vehicle: d.vehicle || "", pct: String(d.pct), reason: "" }); }, style: { minHeight: 38 } }, "✏️ Edit"),
                 _h("button", { className: "btn-s", onClick: () => toggleActive(d), disabled: busy, style: { minHeight: 38 } }, d.active === false ? "Activate" : "Close"),
                 _h("button", { className: "btn-s", "data-t": "drv-del", onClick: () => { setEdit(null); setDel({ id: d.id, reason: "" }); }, disabled: busy, "aria-label": "Delete driver", style: { minHeight: 38, color: "#b91c1c" } }, "🗑️ Delete"),
                 isOwnerU && _h("button", { className: "btn-s", "data-t": "drv-log-btn", onClick: () => setLogFor(logFor === d.id ? null : d.id), style: { minHeight: 38 } }, "📜 Log (" + (Array.isArray(d.log) ? d.log.length : 0) + ")")),
@@ -15460,6 +15489,7 @@ function App() {
     onReleaseRoom: handleReleaseStuckRoom
   }), view === "checkin" && /*#__PURE__*/React.createElement(CheckInView, {
     key: resPrefill?.id || "walkin",
+    user: user,
     rooms: rooms,
     checkInRoom: checkInRoom,
     onCheckIn: handleCheckIn,
