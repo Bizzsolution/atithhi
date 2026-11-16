@@ -1477,6 +1477,8 @@ const FeatCache = {
 };
 let CURRENT_FEATURES = FeatCache.load() || []; // array = what this hotel may see
 function hasFeature(id) {
+  // "qr_any" = room QR OR restaurant table QR (they share the order screens)
+  if (id === "qr_any") return hasFeature("qr_ordering") || hasFeature("table_qr");
   return Array.isArray(CURRENT_FEATURES) && CURRENT_FEATURES.includes(id);
 }
 
@@ -2368,7 +2370,10 @@ function normalizeMenu(list) {
     if (!name) return;
     const cat = MENU_CATS.indexOf(m.cat) >= 0 ? m.cat : "🍛 Food";
     const price = Math.round(Math.min(100000, Math.max(0, Number(m.price) || 0)) * 100) / 100;
-    let id = String(m.id || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || ("m" + Date.now().toString(36) + i);
+    // Items without an id (the built-in default menu, never saved) get one
+    // made from the name — the SAME on every device, so a room QR order
+    // placed from one device's menu matches the item on another device.
+    let id = String(m.id || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || ("d" + (() => { let h = 5381; for (const ch of cat + "|" + name) h = ((h * 33) ^ ch.charCodeAt(0)) >>> 0; return h.toString(36); })());
     while (seen[id]) id = id + "x";
     seen[id] = true;
     const sub = cat === "🛎️ Services" ? (MENU_SUBS.indexOf(m.sub) >= 0 ? m.sub : (ITEM_SUBCATEGORY[name] || "")) : "";
@@ -2396,6 +2401,7 @@ const MenuStore = {
     const clean = normalizeMenu(list);
     CURRENT_MENU = clean;
     await WS.set("menu", clean);
+    try { window.dispatchEvent(new Event("ab-menu-changed")); } catch (e) {}
     return clean;
   }
 };
@@ -9211,6 +9217,8 @@ function ProfileEditModal({
   const [name, setName] = useState(() =>
     (!user || user.role === "Owner") ? (profile.ownerName || "") : (user.name || ""));
   const [tagline, setTagline] = useState(profile.hotelTagline || "");
+  // What the form showed when it opened — only fields changed from this are saved
+  const initialRef = useRef(profile);
   const [logo, setLogo] = useState(profile.hotelLogo || null);
   const [stamp, setStamp] = useState(profile.hotelStamp || null);
   const canStamp = isOwner && hasFeature("digital_stamp") && AdminCfg.stampOwnerAllowed();
@@ -9264,7 +9272,8 @@ function ProfileEditModal({
       hotelGstin: hotelGstin.trim().toUpperCase(),
       invoiceFooterName: invoiceFooterName.trim(),
       gstMode,
-      aadhaarPhotoPolicy
+      aadhaarPhotoPolicy,
+      _initial: initialRef.current
     });
   };
   return /*#__PURE__*/React.createElement("div", {
@@ -10096,7 +10105,10 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
   const [toast, setToast] = useState("");
   const [bills, setBills] = useState([]);
   const [editMenu, setEditMenu] = useState(false);
+  const [showStock, setShowStock] = useState(false);
   useEffect(() => { MenuStore.refresh().then(setMenu).catch(() => {}); RestaurantBills.list().then(setBills).catch(() => {}); }, []);
+  // a hidden / shown item updates the order screen right away
+  useEffect(() => { const f = () => setMenu(MenuStore.get()); window.addEventListener("ab-menu-changed", f); return () => window.removeEventListener("ab-menu-changed", f); }, []);
   const active = (bookings || []).filter(b => b.status === "active").sort((a, b) => String(a.roomId).localeCompare(String(b.roomId), undefined, { numeric: true }));
   const sel = active.find(b => b.id === bookingId) || null;
   const cats = mode === "walkin" ? ["☕ Beverages", "🍛 Food"] : null;
@@ -10156,8 +10168,12 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
       _h("div", null,
         _h("h2", { style: { fontSize: 20, fontFamily: "'Josefin Sans',sans-serif", color: "var(--navy)", margin: 0 } }, "🍽️ Restaurant"),
         _h("div", { style: { fontSize: 12, color: "var(--muted)", marginTop: 2 } }, "Today: rooms ", fmtMoney(roomSaleToday), " · walk-in ", fmtMoney(walkinToday), " (", bills.length, " bills)")),
-      isBoss && _h("button", { onClick: () => setEditMenu(true), className: "btn-o", style: { padding: "8px 12px", fontSize: 12.5, width: "auto" } }, "📋 Menu")),
-    _h("div", { style: { display: "flex", gap: 8, padding: "0 14px 10px" } }, seg("room", mode, setMode, "🛏️ Add to room bill"), seg("walkin", mode, setMode, "🚶 Walk-in bill")),
+      isBoss && _h("div", { style: { display: "flex", gap: 6 } },
+        _h("button", { "data-t": "stock-btn", onClick: () => setShowStock(!showStock), className: "btn-o", style: { padding: "8px 12px", fontSize: 12.5, width: "auto" } }, "🚫 Out of stock"),
+        _h("button", { onClick: () => setEditMenu(true), className: "btn-o", style: { padding: "8px 12px", fontSize: 12.5, width: "auto" } }, "📋 Menu"))),
+    isBoss && showStock && _h("div", { style: { padding: "0 14px" } }, _h(MenuStockPanel, { compact: true })),
+    _h("div", { style: { display: "flex", gap: 8, padding: "0 14px 10px" } }, seg("room", mode, setMode, "🛏️ Add to room bill"), seg("walkin", mode, setMode, "🚶 Walk-in bill"), hasFeature("table_qr") && seg("tables", mode, setMode, "🍽️ Tables")),
+    mode === "tables" && _h(TableTabsPanel, { user, openHtmlBill, onBilled: all => setBills(all.filter(x => x.date === localDateStr())) }),
     toast && _h("div", { role: "status", style: { margin: "0 14px 10px", padding: "10px 12px", borderRadius: 10, background: "#dcfce7", color: "#166534", fontSize: 13, fontWeight: 600 } }, toast),
     mode === "room" && _h("div", { style: { padding: "0 14px" } },
       active.length === 0
@@ -10170,9 +10186,9 @@ function RestaurantView({ rooms, bookings, user, onAddCharge, openHtmlBill }) {
     mode === "walkin" && _h("div", { style: { padding: "0 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 } },
       _h("input", { value: cust, onChange: e => setCust(e.target.value), placeholder: "Customer name (optional)", "aria-label": "Customer name", style: field }),
       _h("input", { value: phone, onChange: e => setPhone(e.target.value), placeholder: "Mobile (optional)", type: "tel", "aria-label": "Customer mobile", style: field })),
-    (mode === "walkin" || (sel && src === "restaurant")) && _h("div", { style: { padding: "8px 14px 0" } }, _h("input", { value: table, onChange: e => setTable(e.target.value), placeholder: "Table no. (optional)", "aria-label": "Table number", style: field })),
-    (mode === "walkin" || sel) && _h(MenuPicker, { menu, cart, setCart, cats, height: "46vh" }),
-    items.length > 0 && (mode === "walkin" || sel) && _h("div", { style: { margin: "6px 14px 14px", padding: 12, borderRadius: 14, background: "var(--cream)", border: "1px solid var(--border)" } },
+    (mode === "walkin" || (mode === "room" && sel && src === "restaurant")) && _h("div", { style: { padding: "8px 14px 0" } }, _h("input", { value: table, onChange: e => setTable(e.target.value), placeholder: "Table no. (optional)", "aria-label": "Table number", style: field })),
+    (mode === "walkin" || (mode === "room" && sel)) && _h(MenuPicker, { menu, cart, setCart, cats, height: "46vh" }),
+    items.length > 0 && (mode === "walkin" || (mode === "room" && sel)) && _h("div", { style: { margin: "6px 14px 14px", padding: 12, borderRadius: 14, background: "var(--cream)", border: "1px solid var(--border)" } },
       _h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginBottom: 6 } }, items.map(i => i.qty + "× " + i.name).join(", ")),
       _h("input", { value: note, onChange: e => setNote(e.target.value), placeholder: "Kitchen note (e.g. less spicy)", "aria-label": "Kitchen note", style: { ...field, marginBottom: 8 } }),
       mode === "walkin" && preview && _h("div", { style: { fontSize: 13, marginBottom: 8 } },
@@ -13260,7 +13276,7 @@ function AccessControlView({
     style: {
       padding: "0 14px"
     }
-  }, ["Manager", "Receptionist"].concat(hasFeature("restaurant") ? ["Restaurant"] : []).map(role => /*#__PURE__*/React.createElement("div", {
+  }, ["Manager", "Receptionist"].concat(hasFeature("restaurant") ? ["Restaurant"] : []).concat(hasFeature("qr_any") ? ["Captain", "Chef"] : []).map(role => /*#__PURE__*/React.createElement("div", {
     key: role,
     style: {
       background: "var(--card)",
@@ -13279,7 +13295,7 @@ function AccessControlView({
       alignItems: "center",
       gap: 8
     }
-  }, role === "Manager" ? "👔" : role === "Restaurant" ? "🍽️" : "🛎️", " ", role), /*#__PURE__*/React.createElement("div", {
+  }, role === "Manager" ? "👔" : role === "Restaurant" ? "🍽️" : role === "Captain" ? "🧑‍✈️" : role === "Chef" ? "👨‍🍳" : "🛎️", " ", role), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -13348,7 +13364,8 @@ function BottomNav({
   view,
   setView,
   role,
-  permissions
+  permissions,
+  badges
 }) {
   const baseItems = [{
     id: "dash",
@@ -13390,6 +13407,14 @@ function BottomNav({
     id: "drivers",
     icon: "🛺",
     label: "Drivers"
+  }, {
+    id: "orders",
+    icon: "🛎️",
+    label: "Room Orders"
+  }, {
+    id: "kitchen",
+    icon: "👨‍🍳",
+    label: "Kitchen"
   }];
   // Owner sees everything + Access Control. Manager/Receptionist see only
   // what Owner has allowed them via the permissions settings. Plan features
@@ -13397,7 +13422,7 @@ function BottomNav({
   // plan won't see those tabs even if their role would otherwise allow it.
   const isOwner = role === "Owner";
   const allowed = isOwner ? baseItems.map(i => i.id) : permsFor(permissions, role);
-  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant"), drivers: hasFeature("driver_commission") };
+  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant"), drivers: hasFeature("driver_commission"), orders: hasFeature("qr_any"), kitchen: hasFeature("qr_any") };
   let items = baseItems.filter(i => (allowed.includes(i.id) || (i.id === "reserve" && allowed.includes("checkin"))) && (planGated[i.id] === undefined || planGated[i.id]));
   if (isOwner && hasFeature("roles")) {
     items = [...items, { id: "access", icon: "🔐", label: "Access" }];
@@ -13456,7 +13481,10 @@ function BottomNav({
       filter: view === i.id ? "saturate(1)" : "saturate(.3)",
       transition: "filter .2s"
     }
-  }, i.icon), /*#__PURE__*/React.createElement("span", {
+  }, i.icon), badges && badges[i.id] > 0 && /*#__PURE__*/React.createElement("span", {
+    "data-t": "nav-badge-" + i.id, "aria-label": badges[i.id] + " new",
+    style: { position: "absolute", top: 4, right: "calc(50% - 22px)", minWidth: 17, height: 17, borderRadius: 9, background: "#dc2626", color: "#fff", fontSize: 10.5, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 4px" }
+  }, badges[i.id]), /*#__PURE__*/React.createElement("span", {
     className: "ab-nav-lb",
     style: {
       fontSize: 10,
@@ -13484,7 +13512,10 @@ function BottomNav({
 // Default access — Owner always has everything; these control what
 // Manager/Receptionist can see. Owner can change this from Access Control.
 const DEFAULT_PERMISSIONS = {
-  Manager: ["dash", "rooms", "checkin", "billing", "history", "docs", "storage", "restaurant"],
+  Manager: ["dash", "rooms", "checkin", "billing", "history", "docs", "storage", "restaurant", "orders", "kitchen"],
+  // QR room ordering (paid add-on "qr_ordering")
+  Captain: ["orders", "kitchen"],
+  Chef: ["kitchen"],
   Receptionist: ["dash", "rooms", "checkin", "billing", "restaurant"],
   // Restaurant staff (paid "restaurant" add-on): only the order counter —
   // no room rates, revenue dashboard, guest IDs or registers.
@@ -13494,10 +13525,16 @@ const DEFAULT_PERMISSIONS = {
 // existed (e.g. Restaurant) fall back to that role's defaults.
 function permsFor(permissions, role) {
   const p = permissions && permissions[role];
-  return Array.isArray(p) ? p : (DEFAULT_PERMISSIONS[role] || []);
+  if (!Array.isArray(p)) return DEFAULT_PERMISSIONS[role] || [];
+  // Room Orders / Kitchen arrived after many hotels had already saved their
+  // access rules: a Manager list saved before then gets them (the Manager
+  // approves room orders). Lists saved from now on carry "qrv1", so an
+  // Owner who switches them off for the Manager is respected.
+  if (role === "Manager" && p.indexOf("qrv1") < 0) return p.concat(["orders", "kitchen"].filter(v => p.indexOf(v) < 0));
+  return p;
 }
 // Views that also need a plan feature / paid add-on.
-const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant", drivers: "driver_commission" };
+const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant", drivers: "driver_commission", orders: "qr_any", kitchen: "qr_any" };
 const ALL_FEATURES = [
   { id: "dash", label: "Dashboard", icon: "📊" },
   { id: "rooms", label: "Rooms", icon: "🏨" },
@@ -13507,8 +13544,859 @@ const ALL_FEATURES = [
   { id: "docs", label: "Vault", icon: "🗂️" },
   { id: "storage", label: "Storage", icon: "💾" },
   { id: "restaurant", label: "Restaurant", icon: "🍽️" },
-  { id: "drivers", label: "Drivers", icon: "🛺" }
+  { id: "drivers", label: "Drivers", icon: "🛺" },
+  { id: "orders", label: "Room Orders", icon: "🛎️" },
+  { id: "kitchen", label: "Kitchen", icon: "👨‍🍳" }
 ];
+
+// ── QR ROOM ORDERING (paid add-on "qr_ordering") ─────────────────────
+// A guest scans the QR code kept in the room (…/?order=<TOKEN>&room=101)
+// and orders food from the hotel's menu. Flow:
+//   pending  → Manager/Owner approves (added to the room bill) or rejects
+//   approved → Captain/Manager prints the KOT                    → "kot"
+//   kot      → Chef: preparing → ready
+//   ready    → Captain marks it served (delivered to the room)    → "served"
+// The guest can edit/cancel while pending, and cancel until the kitchen
+// starts preparing (an approved order that is cancelled is taken off the
+// room bill again). Everyone — Owner, Manager, Captain, Chef and the guest
+// in the room — sees each change live.
+//
+// SECURITY: exactly like the direct-booking link, the QR carries a random
+// public token UNRELATED to the license key, and the guest page touches
+// only the room_order/{token} tree — never hotels/{licenseKey}/…. The
+// public document holds the hotel name, the VISIBLE menu and which room
+// numbers are currently occupied (so only checked-in rooms can order);
+// every order still needs a Manager's approval before it is billed.
+const RO_TOKEN_PREFIX = "RO";
+function generateRoomOrderToken() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += alphabet[b % alphabet.length];
+  return RO_TOKEN_PREFIX + out;
+}
+function newRoomOrderId() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += alphabet[b % alphabet.length];
+  return "RO" + out;
+}
+const RO_STATUS = {
+  pending: { label: "Waiting for approval", guest: "Waiting for the hotel to confirm", color: "#b45309", bg: "#fef3c7" },
+  approved: { label: "Approved — print KOT", guest: "Confirmed — going to the kitchen", color: "#1d4ed8", bg: "#dbeafe" },
+  kot: { label: "In kitchen (KOT sent)", guest: "Sent to the kitchen", color: "#7c3aed", bg: "#ede9fe" },
+  preparing: { label: "Preparing", guest: "Your food is being prepared", color: "#c2410c", bg: "#ffedd5" },
+  ready: { label: "Ready — serve", guest: "Ready — on the way to you", color: "#15803d", bg: "#dcfce7" },
+  served: { label: "Served", guest: "Delivered — enjoy your meal!", color: "#166534", bg: "#f0fdf4" },
+  cancelled: { label: "Cancelled", guest: "Cancelled", color: "#6b7280", bg: "#f3f4f6" },
+  rejected: { label: "Rejected", guest: "Could not be accepted", color: "#b91c1c", bg: "#fee2e2" }
+};
+const RO_STEPS = ["pending", "approved", "kot", "preparing", "ready", "served"];
+// Only food & beverages can be ordered from the room (no laundry etc.).
+const RO_CATS = ["☕ Beverages", "🍛 Food"];
+function roOrderRef(token, id) { return window._db.collection("room_order").doc(token).collection("orders").doc(id); }
+function roItemsTotal(items) { return (items || []).reduce((t, i) => t + (Number(i.price) || 0) * (Number(i.qty) || 0), 0); }
+// The snapshot guests read. Built only from outward-facing data.
+function roSnapshot(profile, menu, rooms) {
+  return {
+    hotelName: String((profile && profile.hotelName) || "").slice(0, 200),
+    items: (menu || []).filter(m => m.active !== false && RO_CATS.indexOf(m.cat) >= 0).slice(0, 400)
+      .map(m => ({ id: m.id, name: String(m.name).slice(0, 60), price: Number(m.price) || 0, cat: m.cat, veg: m.veg !== false, sub: String(m.sub || "").slice(0, 40) })),
+    occupied: hasFeature("qr_ordering") ? (rooms || []).filter(r => r && r.status === "occupied").map(r => String(r.id)).slice(0, 500) : [],
+    tables: hasFeature("table_qr") ? (Array.isArray(profile && profile.restaurantTables) ? profile.restaurantTables : []).map(t => "T:" + cleanTableName(t)).filter(t => t.length > 2).slice(0, 200) : [],
+    open: true
+  };
+}
+// Publishes the snapshot (first time: together with its private owner
+// binding, in one batch — same rule design as the booking link).
+async function publishRoomOrderSnapshot(token, snap, opts) {
+  if (!window._db) return { ok: false, reason: "no-db", detail: "Firebase is not connected" };
+  try {
+    const ref = window._db.collection("room_order").doc(token);
+    const data = { ...snap, updatedAt: Date.now() };
+    if (opts && opts.claim) {
+      const batch = window._db.batch();
+      batch.set(window._db.collection("room_order_owner").doc(token), { hotelId: WS._hid(), createdAt: Date.now() });
+      batch.set(ref, data);
+      await batch.commit();
+    } else {
+      await ref.set(data, { merge: true });
+    }
+    return { ok: true };
+  } catch (e) {
+    const msg = (e && e.message) || String(e), code = (e && e.code) || "";
+    console.warn("Publish room-order menu:", code, msg);
+    return { ok: false, reason: /permission|insufficient|PERMISSION_DENIED/i.test(code + " " + msg) ? "permission-denied" : "network", detail: msg };
+  }
+}
+// Short beep for a new order (no sound file needed).
+function roBeep() {
+  try {
+    const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+    const c = roBeep._c || (roBeep._c = new C());
+    [0, 0.22].forEach(t => {
+      const o = c.createOscillator(), g = c.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(c.destination);
+      g.gain.setValueAtTime(0.0001, c.currentTime + t); g.gain.exponentialRampToValueAtTime(0.25, c.currentTime + t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + t + 0.18);
+      o.start(c.currentTime + t); o.stop(c.currentTime + t + 0.2);
+    });
+  } catch (e) {}
+}
+function roTimeAgo(ms) {
+  const m = Math.max(0, Math.round((Date.now() - (Number(ms) || 0)) / 60000));
+  return m < 1 ? "just now" : m < 60 ? m + " min ago" : Math.floor(m / 60) + " h " + (m % 60) + " min ago";
+}
+function roStatusChip(status, guest) {
+  const s = RO_STATUS[status] || RO_STATUS.pending;
+  return React.createElement("span", { "data-t": "ro-status", style: { display: "inline-block", fontSize: 11.5, fontWeight: 700, color: s.color, background: s.bg, borderRadius: 20, padding: "3px 10px" } }, guest ? s.guest : s.label);
+}
+
+// ── GUEST PAGE (no login) ───────────────────────────────────────────
+// v5.29.1 — premium in-room dining look: spruce + saffron, room key-tag
+// hero, search + veg filter, sticky category tabs, cart sheet, live tracker.
+const RO_ART = [[/chai|\btea\b|green tea/i, "🍵"], [/coffee|cappuccino|latte/i, "☕"], [/cold drink|cola|soda|pepsi|coke|sprite|soft drink/i, "🥤"], [/water/i, "💧"], [/lassi|milk|shake|buttermilk|chaas/i, "🥛"], [/juice|nimbu|lemonade|shikanji/i, "🧃"], [/thali|meal|lunch|dinner/i, "🍛"], [/paratha|roti|naan|chapati|kulcha/i, "🫓"], [/rice|biryani|pulao|khichdi/i, "🍚"], [/dal|curry|sabzi|paneer|chole|rajma/i, "🍲"], [/sandwich|toast/i, "🥪"], [/maggi|noodle|pasta|chowmein/i, "🍜"], [/egg|omelette|bhurji|breakfast/i, "🍳"], [/chicken|mutton|kebab|tikka|fish/i, "🍗"], [/pizza/i, "🍕"], [/burger/i, "🍔"], [/fries|chips|pakora|samosa/i, "🍟"], [/soup/i, "🥣"], [/salad/i, "🥗"], [/ice cream|dessert|sweet|gulab|kheer|halwa|cake/i, "🍨"], [/poha|upma|idli|dosa|uttapam/i, "🥘"]];
+function roArt(m) { const n = String((m && m.name) || ""); for (const [re, e] of RO_ART) if (re.test(n)) return e; return ""; }
+const RO_GUEST_STEPS = ["Placed", "Confirmed", "Sent to kitchen", "Cooking", "On the way", "Delivered"];
+const RO_CSS = `
+.rop{--sp:#12343B;--sp2:#1D4C55;--sf:#E9A23B;--sfd:#9A5F0A;--sft:#FCEFD9;--mist:#EEF2F0;--ink:#17262A;--mute:#5B6B6F;--line:#DDE4E2;--veg:#2E7D4F;--nv:#B3261E;min-height:100svh;background:var(--mist);color:var(--ink);font-family:Hind,system-ui,sans-serif;font-size:15px;line-height:1.45;padding-bottom:120px}
+.rop *{box-sizing:border-box}
+.rop button{font-family:inherit;cursor:pointer}
+.rop button:focus-visible,.rop input:focus-visible,.rop textarea:focus-visible{outline:3px solid var(--sf);outline-offset:2px}
+.rop-wrap{max-width:560px;margin:0 auto}
+.rop-hero{background:var(--sp);color:#fff;padding:22px 18px 46px}
+.rop-hero-in{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.rop-hotel{font-family:Fraunces,Georgia,serif;font-weight:600;font-size:27px;line-height:1.12;margin:0;letter-spacing:-.01em;overflow-wrap:anywhere}
+.rop-lead{color:#C9D9D6;font-size:14.5px;margin-top:8px;max-width:30ch}
+.rop-tag{flex:0 0 auto;width:76px;padding:22px 0 12px;background:var(--sf);color:var(--sp);border-radius:12px 12px 38px 38px;text-align:center;position:relative;transform:rotate(4deg);box-shadow:0 10px 24px rgba(0,0,0,.28)}
+.rop-tag:before{content:"";position:absolute;top:8px;left:50%;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:var(--sp)}
+.rop-tag small{display:block;font-size:11.5px;font-weight:600;opacity:.8}
+.rop-tag b{display:block;font-family:Fraunces,Georgia,serif;font-style:italic;font-weight:500;font-size:28px;line-height:1.05;overflow-wrap:anywhere;padding:0 4px}
+.rop-tools{display:flex;gap:8px;margin:-26px 14px 0;position:relative}
+.rop-search{flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:#fff;border-radius:14px;padding:0 14px;height:52px;box-shadow:0 6px 18px rgba(18,52,59,.14)}
+.rop-search input{flex:1;border:0;outline:0;font:inherit;font-size:15.5px;background:transparent;color:var(--ink);min-width:0;width:100%;height:100%;-webkit-appearance:none;appearance:none}
+.rop-search svg{flex:0 0 auto;color:var(--mute)}
+.rop-veg{flex:0 0 auto;height:52px;padding:0 14px;border-radius:14px;border:0;background:#fff;color:var(--ink);font-weight:600;font-size:14px;display:flex;align-items:center;gap:8px;box-shadow:0 6px 18px rgba(18,52,59,.14)}
+.rop-veg[aria-pressed=true]{background:var(--veg);color:#fff}
+.rop-veg .rop-sw{width:30px;height:18px;border-radius:9px;background:var(--line);position:relative;transition:background .2s}
+.rop-veg .rop-sw:after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .2s}
+.rop-veg[aria-pressed=true] .rop-sw{background:rgba(255,255,255,.35)}
+.rop-veg[aria-pressed=true] .rop-sw:after{transform:translateX(12px)}
+.rop-tabs{position:sticky;top:0;z-index:5;background:rgba(238,242,240,.94);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);padding:14px 18px 0;margin-top:6px;overflow-x:auto;border-bottom:1px solid var(--line)}
+.rop-tab{background:none;border:0;padding:6px 0 11px;font-size:15px;font-weight:600;color:var(--mute);white-space:nowrap;border-bottom:3px solid transparent;margin-bottom:-1px}
+.rop-tab[aria-current=true]{color:var(--sp);border-bottom-color:var(--sf)}
+.rop-tab span{font-weight:500;opacity:.7;margin-left:4px}
+.rop-banner{margin:14px 14px 0;background:var(--sft);color:#6B4206;border-radius:14px;padding:12px 14px;font-size:14px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.rop-banner button{background:none;border:0;color:#6B4206;font-weight:600;text-decoration:underline;padding:4px}
+.rop-sec{padding:22px 14px 0;scroll-margin-top:56px}
+.rop-sec h2{font-family:Fraunces,Georgia,serif;font-weight:600;font-size:22px;margin:0 4px 10px;color:var(--sp)}
+.rop-sub{font-size:13.5px;font-weight:600;color:var(--mute);margin:14px 4px 6px}
+.rop-list{background:#fff;border-radius:18px;padding:2px 14px;box-shadow:0 1px 0 var(--line)}
+.rop-item{display:flex;align-items:center;gap:13px;padding:14px 0;border-bottom:1px solid var(--line)}
+.rop-item:last-child{border-bottom:0}
+.rop-art{flex:0 0 auto;width:62px;height:62px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:31px;background:#E3EEEC}
+.rop-art.food{background:var(--sft)}
+.rop-art i{font-family:Fraunces,Georgia,serif;font-style:italic;font-size:24px;color:var(--sp2)}
+.rop-body{flex:1;min-width:0}
+.rop-name{font-weight:600;font-size:16px;line-height:1.25;display:flex;gap:7px;align-items:flex-start}
+.rop-mark{flex:0 0 auto;margin-top:3px;width:13px;height:13px;border:1.5px solid var(--veg);border-radius:2px;display:inline-flex;align-items:center;justify-content:center}
+.rop-mark:after{content:"";width:6px;height:6px;border-radius:50%;background:var(--veg)}
+.rop-mark.nv{border-color:var(--nv)}.rop-mark.nv:after{background:var(--nv);border-radius:0;width:0;height:0;border-left:3.5px solid transparent;border-right:3.5px solid transparent;border-bottom:6px solid var(--nv);background:none}
+.rop-price{font-weight:600;font-size:15px;color:var(--ink);margin-top:3px}
+.rop-add{flex:0 0 auto;min-width:92px;height:40px;border-radius:12px;border:1.5px solid var(--sp);background:#fff;color:var(--sp);font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:center;gap:6px}
+.rop-add:active{transform:scale(.96)}
+.rop-step{flex:0 0 auto;min-width:92px;height:40px;border-radius:12px;background:var(--sp);color:#fff;display:flex;align-items:center;justify-content:space-between;animation:ropPop .22s ease-out}
+.rop-step button{width:34px;height:40px;border:0;background:none;color:#fff;font-size:20px;font-weight:600;line-height:1}
+.rop-step span{font-weight:700;min-width:16px;text-align:center}
+.rop-step.light{background:var(--sft);color:var(--sp)}.rop-step.light button{color:var(--sp)}
+.rop-empty{text-align:center;color:var(--mute);padding:34px 20px}
+.rop-empty b{display:block;font-family:Fraunces,Georgia,serif;font-weight:600;font-size:20px;color:var(--sp);margin-bottom:6px}
+.rop-bar{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:20;max-width:536px;margin:0 auto;background:var(--sp);color:#fff;border:0;border-radius:18px;padding:12px 12px 12px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;box-shadow:0 14px 30px rgba(18,52,59,.35);animation:ropUp .28s ease-out;text-align:left;width:auto}
+.rop-bar small{display:block;color:#C9D9D6;font-size:13px}
+.rop-bar strong{font-size:18px;font-weight:700}
+.rop-bar em{font-style:normal;background:var(--sf);color:var(--sp);font-weight:700;border-radius:12px;padding:11px 16px;font-size:15px;white-space:nowrap}
+.rop-scrim{position:fixed;inset:0;z-index:30;background:rgba(18,52,59,.5);display:flex;align-items:flex-end;justify-content:center;animation:ropFade .2s ease-out}
+.rop-sheet{background:#fff;width:100%;max-width:560px;max-height:88svh;overflow-y:auto;border-radius:24px 24px 0 0;padding:10px 18px calc(18px + env(safe-area-inset-bottom));animation:ropUp .28s ease-out}
+.rop-grip{width:44px;height:5px;border-radius:3px;background:var(--line);margin:0 auto 12px}
+.rop-sh-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+.rop-sh-head h2{font-family:Fraunces,Georgia,serif;font-weight:600;font-size:22px;margin:0;color:var(--sp)}
+.rop-x{width:40px;height:40px;border-radius:50%;border:0;background:var(--mist);color:var(--ink);font-size:20px}
+.rop-line{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}
+.rop-line .rop-body small{color:var(--mute);font-size:13.5px}
+.rop-line .amt{font-weight:600;min-width:62px;text-align:right}
+.rop-sheet textarea{width:100%;margin-top:14px;padding:12px 14px;border-radius:14px;border:1.5px solid var(--line);font:inherit;font-size:15px;resize:none;background:var(--mist)}
+.rop-sum{display:flex;justify-content:space-between;align-items:baseline;margin-top:16px;font-size:15px}
+.rop-sum b{font-family:Fraunces,Georgia,serif;font-weight:600;font-size:24px;color:var(--sp)}
+.rop-fine{font-size:13px;color:var(--mute);margin-top:4px}
+.rop-place{width:100%;margin-top:16px;height:56px;border:0;border-radius:16px;background:var(--sf);color:var(--sp);font-size:17px;font-weight:700;display:flex;align-items:center;justify-content:space-between;padding:0 20px}
+.rop-place:disabled{opacity:.6}
+.rop-orders{padding:28px 14px 0;scroll-margin-top:10px}
+.rop-orders h2{font-family:Fraunces,Georgia,serif;font-weight:600;font-size:22px;margin:0 4px 12px;color:var(--sp)}
+.rop-ord{background:#fff;border-radius:18px;padding:16px;margin-bottom:12px;box-shadow:0 1px 0 var(--line)}
+.rop-ord-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.rop-live{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--mute)}
+.rop-live i{width:8px;height:8px;border-radius:50%;background:var(--veg);animation:ropPulse 1.6s ease-in-out infinite}
+.rop-track{display:flex;gap:4px;margin:14px 0 6px}
+.rop-track div{flex:1;height:6px;border-radius:3px;background:var(--line)}
+.rop-track div.on{background:var(--sp)}
+.rop-track div.now{background:var(--sf)}
+.rop-stepname{font-size:13.5px;color:var(--mute)}
+.rop-stepname b{color:var(--ink);font-weight:600}
+.rop-ord-items{margin-top:10px;font-size:14.5px}
+.rop-ord-items div{display:flex;justify-content:space-between;gap:10px;padding:2px 0}
+.rop-ord-items span:last-child{color:var(--mute)}
+.rop-ord-note{font-size:13.5px;color:var(--mute);margin-top:6px}
+.rop-ord-bad{font-size:13.5px;color:var(--nv);margin-top:6px}
+.rop-ord-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
+.rop-ord-foot b{font-size:17px}
+.rop-btn{height:40px;padding:0 16px;border-radius:12px;font-weight:600;font-size:14.5px;border:1.5px solid var(--sp);background:#fff;color:var(--sp)}
+.rop-btn.warn{border-color:var(--nv);color:var(--nv)}
+.rop-toast{position:fixed;left:50%;top:16px;z-index:40;transform:translateX(-50%);background:var(--ink);color:#fff;border-radius:14px;padding:12px 18px;font-weight:600;font-size:14.5px;box-shadow:0 10px 24px rgba(0,0,0,.25);animation:ropDrop .3s ease-out;max-width:calc(100% - 32px)}
+.rop-note-card{margin:18px 14px 0;background:#fff;border-radius:18px;padding:22px 18px;text-align:center;line-height:1.55}
+.rop-note-card b{display:block;font-family:Fraunces,Georgia,serif;font-weight:600;font-size:21px;color:var(--sp);margin-bottom:6px}
+.rop-skel{height:84px;border-radius:18px;background:#fff;margin:14px;opacity:.7;animation:ropPulse 1.4s ease-in-out infinite}
+@keyframes ropPop{from{transform:scale(.85);opacity:.4}to{transform:scale(1);opacity:1}}
+@keyframes ropUp{from{transform:translateY(24px);opacity:0}to{transform:none;opacity:1}}
+@keyframes ropDrop{from{transform:translate(-50%,-16px);opacity:0}to{transform:translate(-50%,0);opacity:1}}
+@keyframes ropFade{from{opacity:0}to{opacity:1}}
+@keyframes ropPulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.rop *,.rop{animation:none!important;transition:none!important}}
+@media (max-width:360px){.rop-hotel{font-size:23px}.rop-tag{width:66px}.rop-tag b{font-size:24px}.rop-veg b{display:none}}
+`;
+function RoomOrderPage({ token, room, table }) {
+  const _h = React.createElement;
+  // a restaurant table orders as room "T:<name>" (see TableTabs)
+  const where = table ? "T:" + table : String(room);
+  const place_ = table ? "Table " + table : "Room " + room;
+  const helpDesk = table ? "ask the staff" : "call reception";
+  const [state, setState] = useState("loading"); // loading | ready | closed | error
+  const [snap, setSnap] = useState(null);
+  const [cart, setCart] = useState({});
+  const [note, setNote] = useState("");
+  const [cat, setCat] = useState("");
+  const [q, setQ] = useState("");
+  const [vegOnly, setVegOnly] = useState(false);
+  const [sheet, setSheet] = useState(false);
+  const [toast, setToast] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(null); // order id being edited
+  const [orders, setOrders] = useState({}); // id -> order (live)
+  const LS = "ab_ro_" + token + "_" + where;
+  const myIds = () => { try { const v = JSON.parse(localStorage.getItem(LS) || "[]"); return Array.isArray(v) ? v : []; } catch (e) { return []; } };
+  const [ids, setIds] = useState(myIds);
+  const [dbReady, setDbReady] = useState(false);
+  useEffect(() => {
+    document.title = place_ + " · Order food";
+    if (window.__hideLoader) window.__hideLoader(); // the guest page draws its own loading state
+    let un = () => {}, alive = true, waited = 0;
+    // Firebase loads from the network after the page — on a slow phone
+    // connection wait for it (up to ~15 s) instead of failing at once.
+    const start = () => {
+      if (!alive) return;
+      if (!window._db) { if ((waited += 250) > 15000) { setState("error"); return; } setTimeout(start, 250); return; }
+      try {
+        un = window._db.collection("room_order").doc(token).onSnapshot(s => {
+          if (!s || !s.exists) { setState("error"); return; }
+          const d = s.data();
+          setSnap(d);
+          const list_ = table ? d.tables : d.occupied;
+          setState(d.open && Array.isArray(list_) && list_.indexOf(where) >= 0 ? "ready" : "closed");
+        }, () => setState("error"));
+      } catch (e) { setState("error"); }
+      setDbReady(true);
+    };
+    start();
+    return () => { alive = false; try { un(); } catch (e) {} };
+  }, [token, where]);
+  // live status of this room's own orders (kept on this phone)
+  useEffect(() => {
+    if (!dbReady || !window._db) return;
+    const uns = ids.map(id => { try { return roOrderRef(token, id).onSnapshot(s => { if (s && s.exists) setOrders(o => ({ ...o, [id]: s.data() })); }, () => {}); } catch (e) { return () => {}; } });
+    return () => uns.forEach(u => { try { u(); } catch (e) {} });
+  }, [ids.join(","), dbReady]);
+  // cart sheet: lock page scroll, close on Escape
+  useEffect(() => {
+    if (!sheet) return;
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    const k = e => { if (e.key === "Escape") setSheet(false); };
+    window.addEventListener("keydown", k);
+    return () => { document.body.style.overflow = prev; window.removeEventListener("keydown", k); };
+  }, [sheet]);
+  // keep the active category tab in step with what is on screen
+  useEffect(() => {
+    if (state !== "ready") return;
+    let raf = 0;
+    const onScroll = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => {
+      let cur = "";
+      RO_CATS.forEach((c, i) => { const el = document.getElementById("rop-sec-" + i); if (el && (!cur || el.getBoundingClientRect().top <= 90)) cur = c; });
+      if (cur) setCat(cur);
+    }); };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("scroll", onScroll); };
+  }, [state]);
+  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(""), 3200); return () => clearTimeout(t); }, [toast]);
+  const items = (snap && snap.items) || [];
+  const cats = RO_CATS.filter(c => items.some(m => m.cat === c));
+  const curCat = cats.indexOf(cat) >= 0 ? cat : cats[0] || "";
+  const lines = items.filter(m => cart[m.id] > 0).map(m => ({ id: m.id, name: m.name, price: m.price, qty: cart[m.id] }));
+  const total = roItemsTotal(lines);
+  const count = lines.reduce((t, l) => t + l.qty, 0);
+  const setQty = (id, n) => setCart(p => { const x = { ...p }; if (n > 0) x[id] = Math.min(50, n); else delete x[id]; return x; });
+  useEffect(() => { if (sheet && !lines.length) setSheet(false); }, [lines.length, sheet]);
+  const scrollToOrders = () => setTimeout(() => { const el = document.getElementById("ro-my-orders"); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" }); }, 150);
+  const place = async () => {
+    if (!lines.length || busy) return;
+    setBusy(true);
+    try {
+      const now = Date.now();
+      if (editing) {
+        await roOrderRef(token, editing).update({ items: lines, note: note.trim().slice(0, 200), total, updatedAt: now });
+      } else {
+        const id = newRoomOrderId();
+        await roOrderRef(token, id).set({ id, room: where, items: lines, note: note.trim().slice(0, 200), total, status: "pending", createdAt: now, updatedAt: now });
+        const next = [id, ...ids].slice(0, 30);
+        try { localStorage.setItem(LS, JSON.stringify(next)); } catch (e) {}
+        setIds(next);
+      }
+      setToast(editing ? "Order updated" : "Order sent — the hotel will confirm it shortly");
+      setCart({}); setNote(""); setEditing(null); setSheet(false);
+      scrollToOrders();
+    } catch (e) {
+      alert(editing ? "Could not update the order — it may already be confirmed by the hotel." : "Could not place the order. Please check the internet, or " + helpDesk + ".");
+    } finally { setBusy(false); }
+  };
+  const cancel = async o => {
+    if (!confirm("Cancel this order?")) return;
+    try { await roOrderRef(token, o.id).update({ status: "cancelled", cancelledBy: "guest", updatedAt: Date.now() }); setToast("Order cancelled"); }
+    catch (e) { alert("This order can no longer be cancelled — the kitchen has started it. Please " + helpDesk + "."); }
+  };
+  const edit = o => {
+    const c = {}; (o.items || []).forEach(i => { if (items.some(m => m.id === i.id)) c[i.id] = i.qty; });
+    setCart(c); setNote(o.note || ""); setEditing(o.id);
+    window.scrollTo && window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const stopEdit = () => { setEditing(null); setCart({}); setNote(""); setSheet(false); };
+  const hotel = (snap && snap.hotelName) || "Room service";
+  const css = _h("style", null, RO_CSS);
+  const hero = _h("header", { className: "rop-hero" }, _h("div", { className: "rop-wrap rop-hero-in" },
+    _h("div", { style: { minWidth: 0 } },
+      _h("h1", { className: "rop-hotel" }, hotel),
+      _h("div", { className: "rop-lead" }, table ? "Order from Table " + table + ". We bring it to your table." : "In-room dining for Room " + room + ". Order here and we bring it to your door.")),
+    _h("div", { className: "rop-tag", "aria-label": place_ }, _h("small", null, table ? "Table" : "Room"), _h("b", null, table || room))));
+  const toastEl = toast && _h("div", { className: "rop-toast", role: "status", "data-t": "ro-toast" }, toast);
+  if (state === "loading") return _h("div", { className: "rop" }, css, hero, _h("div", { className: "rop-wrap", style: { paddingTop: 14 }, "aria-label": "Loading menu" }, _h("div", { className: "rop-skel" }), _h("div", { className: "rop-skel" }), _h("div", { className: "rop-skel" })));
+  if (state === "error") return _h("div", { className: "rop" }, css, hero, _h("div", { className: "rop-wrap" }, _h("div", { className: "rop-note-card", "data-t": "ro-error" }, _h("b", null, "This menu link is not active"), "Please " + helpDesk + " to place your order.")));
+  const myOrders = ids.map(id => orders[id]).filter(Boolean).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const myList = myOrders.length > 0 && _h("section", { id: "ro-my-orders", "data-t": "ro-my-orders", className: "rop-orders rop-wrap", "aria-label": "Your orders" },
+    _h("h2", null, "Your orders"),
+    myOrders.map(o => {
+      const step = RO_STEPS.indexOf(o.status);
+      const live = step >= 0 && o.status !== "served";
+      return _h("article", { key: o.id, "data-t": "ro-my-order", className: "rop-ord" },
+        _h("div", { className: "rop-ord-top" }, roStatusChip(o.status, true), live ? _h("span", { className: "rop-live" }, _h("i", { "aria-hidden": "true" }), "Live · " + roTimeAgo(o.createdAt)) : _h("span", { className: "rop-live" }, roTimeAgo(o.createdAt))),
+        step >= 0 && _h(React.Fragment, null,
+          _h("div", { className: "rop-track", "aria-hidden": "true" }, RO_STEPS.map((s, i) => _h("div", { key: s, className: i < step ? "on" : i === step ? (o.status === "served" ? "on" : "now") : "" }))),
+          _h("div", { className: "rop-stepname" }, "Step " + (step + 1) + " of " + RO_STEPS.length + ": ", _h("b", null, RO_GUEST_STEPS[step]))),
+        _h("div", { className: "rop-ord-items" }, (o.items || []).map((i, k) => _h("div", { key: k }, _h("span", null, i.qty + " × " + i.name), _h("span", null, fmtMoney((Number(i.price) || 0) * (Number(i.qty) || 0)))))),
+        o.note && _h("div", { className: "rop-ord-note" }, "Note: " + o.note),
+        o.status === "rejected" && o.reason && _h("div", { className: "rop-ord-bad" }, "Reason: " + o.reason),
+        _h("div", { className: "rop-ord-foot" },
+          _h("b", null, fmtMoney(o.total)),
+          _h("div", { style: { display: "flex", gap: 8 } },
+            o.status === "pending" && _h("button", { "data-t": "ro-edit", className: "rop-btn", onClick: () => edit(o) }, "Edit"),
+            ["pending", "approved", "kot"].indexOf(o.status) >= 0 && _h("button", { "data-t": "ro-cancel", className: "rop-btn warn", onClick: () => cancel(o) }, "Cancel"))));
+    }));
+  if (state === "closed") return _h("div", { className: "rop" }, css, toastEl, hero, _h("div", { className: "rop-wrap" }, _h("div", { className: "rop-note-card", "data-t": "ro-closed" }, _h("b", null, table ? "Ordering is closed for this table" : "Ordering is closed for this room"), table ? "QR ordering is not open for this table right now. Please ask the staff." : "In-room ordering works only while the room is checked in. Please call reception.")), myList);
+  const term = q.trim().toLowerCase();
+  const visible = items.filter(m => (!vegOnly || m.veg) && (!term || String(m.name).toLowerCase().indexOf(term) >= 0));
+  const jump = c => { setCat(c); const el = document.getElementById("rop-sec-" + RO_CATS.indexOf(c)); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" }); };
+  const stepper = (m, light) => _h("div", { className: "rop-step" + (light ? " light" : "") },
+    _h("button", { "aria-label": "Less " + m.name, onClick: () => setQty(m.id, cart[m.id] - 1) }, "−"),
+    _h("span", { "aria-live": "polite" }, cart[m.id]),
+    _h("button", { "aria-label": "More " + m.name, onClick: () => setQty(m.id, cart[m.id] + 1) }, "+"));
+  const row = m => {
+    const art = roArt(m);
+    return _h("div", { key: m.id, "data-t": "ro-item", className: "rop-item" },
+      _h("div", { className: "rop-body" },
+        _h("div", { className: "rop-name", "data-t": "ro-item-name" }, _h("span", { className: "rop-mark" + (m.veg ? "" : " nv"), role: "img", "aria-label": m.veg ? "Veg" : "Non-veg" }), _h("span", null, m.name)),
+        _h("div", { className: "rop-price" }, fmtMoney(m.price))),
+      _h("div", { className: "rop-art" + (m.cat === RO_CATS[1] ? " food" : ""), "aria-hidden": "true" }, art || _h("i", null, String(m.name || "?").trim().charAt(0).toUpperCase())),
+      cart[m.id] ? stepper(m) : _h("button", { "data-t": "ro-add", className: "rop-add", "aria-label": "Add " + m.name, onClick: () => setQty(m.id, 1) }, "Add", _h("span", { "aria-hidden": "true", style: { fontSize: 18, lineHeight: 1 } }, "+")));
+  };
+  const sections = cats.map(c => {
+    const list = visible.filter(m => m.cat === c);
+    if (!list.length) return null;
+    const subs = []; list.forEach(m => { const s = m.sub || ""; if (subs.indexOf(s) < 0) subs.push(s); });
+    return _h("section", { key: c, id: "rop-sec-" + RO_CATS.indexOf(c), className: "rop-sec rop-wrap" },
+      _h("h2", null, c.replace(/^\S+\s/, "")),
+      subs.length > 1
+        ? subs.map(s => _h(React.Fragment, { key: s || "_" }, s && _h("div", { className: "rop-sub" }, s), _h("div", { className: "rop-list" }, list.filter(m => (m.sub || "") === s).map(row))))
+        : _h("div", { className: "rop-list" }, list.map(row)));
+  });
+  const nothing = !items.length
+    ? _h("div", { className: "rop-empty" }, _h("b", null, "The menu is not available right now"), "Please " + helpDesk + " to order.")
+    : !visible.length && _h("div", { className: "rop-empty" }, _h("b", null, "No dishes match"), vegOnly ? "Try turning off Veg only, or search another name." : "Try another name.");
+  const bar = lines.length > 0 && !sheet && _h("button", { className: "rop-bar", "data-t": "ro-cart-bar", onClick: () => setSheet(true) },
+    _h("span", null, _h("small", null, count + (count === 1 ? " item" : " items")), _h("strong", null, fmtMoney(total))),
+    _h("em", null, editing ? "Review changes" : "View order"));
+  const sheetEl = sheet && lines.length > 0 && _h("div", { className: "rop-scrim", onClick: e => { if (e.target === e.currentTarget) setSheet(false); } },
+    _h("div", { className: "rop-sheet", role: "dialog", "aria-modal": "true", "aria-label": "Your order", "data-t": "ro-sheet" },
+      _h("div", { className: "rop-grip", "aria-hidden": "true" }),
+      _h("div", { className: "rop-sh-head" }, _h("h2", null, editing ? "Edit your order" : "Your order"), _h("button", { className: "rop-x", "aria-label": "Close", onClick: () => setSheet(false) }, "×")),
+      _h("div", { style: { color: "var(--mute)", fontSize: 14 } }, table ? "Served at Table " + table : "Delivered to Room " + room),
+      lines.map(l => { const m = items.find(x => x.id === l.id); return _h("div", { key: l.id, className: "rop-line" },
+        _h("div", { className: "rop-body" }, _h("div", { className: "rop-name" }, _h("span", { className: "rop-mark" + (m.veg ? "" : " nv"), role: "img", "aria-label": m.veg ? "Veg" : "Non-veg" }), _h("span", null, l.name)), _h("small", null, fmtMoney(l.price) + " each")),
+        stepper(m, true),
+        _h("span", { className: "amt" }, fmtMoney(l.price * l.qty))); }),
+      _h("textarea", { "aria-label": "Note for the kitchen", "data-t": "ro-note", value: note, maxLength: 200, onChange: e => setNote(e.target.value), placeholder: "Note for the kitchen, e.g. less spicy, no onion", rows: 2 }),
+      _h("div", { className: "rop-sum" }, _h("span", null, "Item total"), _h("b", null, fmtMoney(total))),
+      _h("div", { className: "rop-fine" }, table ? "The restaurant confirms your order first. Pay at the counter when you leave; taxes as applicable." : "The hotel confirms your order first. It is added to your room bill; taxes as applicable."),
+      _h("button", { "data-t": "ro-place", className: "rop-place", onClick: place, disabled: busy },
+        _h("span", null, busy ? "Sending…" : editing ? "Update order" : "Place order"), _h("span", null, fmtMoney(total)))));
+  return _h("div", { className: "rop", "data-t": "ro-page" }, css, toastEl, hero,
+    _h("div", { className: "rop-wrap" },
+      _h("div", { className: "rop-tools" },
+        _h("label", { className: "rop-search" },
+          _h("svg", { width: 20, height: 20, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", "aria-hidden": "true" }, _h("circle", { cx: 11, cy: 11, r: 7 }), _h("path", { d: "M20 20l-3.5-3.5" })),
+          _h("input", { type: "search", "aria-label": "Search the menu", "data-t": "ro-search", placeholder: "Search dishes", value: q, onChange: e => setQ(e.target.value) })),
+        _h("button", { className: "rop-veg", "data-t": "ro-veg", "aria-pressed": vegOnly ? "true" : "false", onClick: () => setVegOnly(v => !v) }, _h("span", { className: "rop-sw", "aria-hidden": "true" }), _h("b", { style: { fontWeight: 600 } }, "Veg only")))),
+    cats.length > 1 && _h("nav", { className: "rop-tabs", "aria-label": "Menu sections" }, _h("div", { className: "rop-wrap", style: { display: "flex", gap: 22, width: "100%" } }, cats.map(c => _h("button", { key: c, className: "rop-tab", "aria-current": c === curCat ? "true" : "false", onClick: () => jump(c) }, c.replace(/^\S+\s/, ""), _h("span", null, visible.filter(m => m.cat === c).length))))),
+    editing && _h("div", { className: "rop-wrap" }, _h("div", { "data-t": "ro-editing", className: "rop-banner" }, _h("span", null, "Editing your order. Change the items, then tap Review changes."), _h("button", { onClick: stopEdit }, "Stop editing"))),
+    sections, nothing && _h("div", { className: "rop-wrap" }, nothing),
+    myList, bar, sheetEl);
+}
+
+// ── STAFF: shared order actions ─────────────────────────────────────
+const RoomOrderOps = {
+  by(user) { return String((user && (user.name || user.u)) || "").slice(0, 40); },
+  log(o, s, user) { return [...(Array.isArray(o.log) ? o.log : []), { s, at: Date.now(), by: RoomOrderOps.by(user), role: (user && user.role) || "" }].slice(-20); },
+  // move an order from one status to the next, only if it is still where we saw it
+  async move(token, o, from, patch) {
+    const ref = roOrderRef(token, o.id);
+    let ok = false;
+    await window._db.runTransaction(async t => {
+      const s = await t.get(ref);
+      if (!s.exists) return;
+      const cur = s.data();
+      if ((Array.isArray(from) ? from : [from]).indexOf(cur.status) < 0) return;
+      t.set(ref, { ...cur, ...patch, updatedAt: Date.now() });
+      ok = true;
+    });
+    return ok;
+  }
+};
+
+// Out-of-stock: one-tap hide/show for menu items (Owner / Manager).
+function MenuStockPanel({ compact }) {
+  const _h = React.createElement;
+  const [menu, setMenu] = useState(() => MenuStore.get());
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState("");
+  useEffect(() => { MenuStore.refresh().then(setMenu).catch(() => {}); }, []);
+  const toggle = async m => {
+    setBusy(m.id);
+    try {
+      const fresh = await MenuStore.refresh();
+      const next = fresh.map(x => x.id === m.id ? { ...x, active: x.active === false } : x);
+      const saved = await MenuStore.save(next);
+      setMenu(saved);
+      AuditLog.add("MENU_STOCK", m.name + (m.active === false ? " shown" : " hidden"));
+      window.dispatchEvent(new Event("ab-menu-changed"));
+    } catch (e) { alert("Could not save: " + e.message); } finally { setBusy(""); }
+  };
+  const list = menu.filter(m => m.cat !== "🛎️ Services" && (!q.trim() || m.name.toLowerCase().indexOf(q.trim().toLowerCase()) >= 0));
+  const hidden = menu.filter(m => m.active === false && m.cat !== "🛎️ Services").length;
+  return _h("div", { className: "card", "data-t": "menu-stock", style: { padding: "12px 14px", marginBottom: 12 } },
+    _h("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 14 } }, "🚫 Out of stock — hide / show menu items"),
+    _h("div", { style: { fontSize: 11.5, color: "var(--muted)", margin: "2px 0 8px" } }, "Hidden items do not show to guests (room QR menu) or in the staff order screen. " + (hidden ? hidden + " item(s) hidden now." : "")),
+    _h("input", { value: q, onChange: e => setQ(e.target.value), placeholder: "🔎 Search item", "aria-label": "Search menu item", style: { width: "100%", boxSizing: "border-box", padding: "8px 12px", borderRadius: 10, border: "1.5px solid var(--border)", marginBottom: 6 } }),
+    _h("div", { style: { maxHeight: compact ? 260 : 420, overflowY: "auto" } },
+      list.map(m => _h("div", { key: m.id, "data-t": "stock-row", style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: "1px solid var(--border)", opacity: m.active === false ? .6 : 1 } },
+        _h("div", { style: { flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600 } }, m.name, _h("span", { style: { color: "var(--muted)", fontWeight: 400, fontSize: 12 } }, " · " + fmtMoney(m.price))),
+        _h("button", { className: "btn-s", "data-t": "stock-toggle", "aria-pressed": m.active === false, disabled: busy === m.id, onClick: () => toggle(m), style: { minHeight: 34, fontSize: 12, color: m.active === false ? "#166534" : "#b91c1c" } }, m.active === false ? "👁️ Show" : "🚫 Hide")))));
+}
+
+// Owner sets up the room QR codes (one per room) and prints them.
+function RoomQrCard({ profile, rooms, onSaveToken }) {
+  const _h = React.createElement;
+  const token = (profile && profile.roomOrderToken) || "";
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const link = r => window.location.origin + "/?order=" + token + "&room=" + encodeURIComponent(r);
+  const create = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      const t = generateRoomOrderToken();
+      const res = await publishRoomOrderSnapshot(t, roSnapshot(profile, MenuStore.get(), rooms), { claim: true });
+      if (!res.ok) { setMsg(res); return; }
+      await onSaveToken(t);
+      setMsg({ ok: true });
+    } finally { setBusy(false); }
+  };
+  const loadQr = () => new Promise((res, rej) => {
+    if (window.qrcode) return res(window.qrcode);
+    const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("Could not load the QR maker")); document.head.appendChild(s);
+  });
+  const printSheet = async () => {
+    try {
+      const qr = await loadQr();
+      const list = (rooms || []).slice().sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+      const cards = list.map(r => {
+        const q = qr(0, "M"); q.addData(link(r.id)); q.make();
+        return "<div class=c><div class=h>" + escHtml((profile && profile.hotelName) || "") + "</div>" + q.createSvgTag(5, 2) + "<div class=r>ROOM " + escHtml(r.id) + "</div><div class=t>Scan to order food &amp; drinks to your room</div></div>";
+      }).join("");
+      const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>Room QR codes</title><style>body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+      const w = window.open("", "_blank");
+      if (w) { w.document.write(html); w.document.close(); } else alert("Please allow pop-ups to print the QR codes.");
+    } catch (e) { alert(e.message); }
+  };
+  return _h("div", { className: "card", "data-t": "room-qr-card", style: { padding: "12px 14px", marginBottom: 12 } },
+    _h("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 14 } }, "📱 Room QR codes"),
+    !token ? _h(React.Fragment, null,
+      _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 8px" } }, "Turn on QR ordering to get one QR code per room. Guests in a checked-in room can scan it and order; every order needs a Manager's approval."),
+      _h("button", { className: "btn-p", "data-t": "ro-setup", onClick: create, disabled: busy, style: { width: "100%" } }, busy ? "Setting up…" : "Turn on QR ordering"))
+      : _h(React.Fragment, null,
+        _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 8px" } }, "Print and keep each room's QR code in that room. Only checked-in rooms can order."),
+        _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+          _h("button", { className: "btn-p", "data-t": "ro-print-qr", onClick: printSheet, style: { flex: "1 1 160px" } }, "🖨️ Print QR codes (all rooms)"),
+          _h("button", { className: "btn-s", onClick: () => { const r = (rooms || [])[0]; if (r) window.open(link(r.id), "_blank"); }, style: { flex: "1 1 120px" } }, "👀 Preview guest page"))),
+    msg && !msg.ok && _h("div", { role: "alert", style: { fontSize: 12, color: "#b91c1c", marginTop: 8 } }, msg.reason === "permission-denied" ? "Could not turn on: the Firebase rules for room ordering are not published yet. Please publish the new firestore.rules in the Firebase Console, then try again." : "Could not turn on: " + msg.detail),
+    msg && msg.ok && _h("div", { role: "status", style: { fontSize: 12, color: "#166534", marginTop: 8 } }, "✅ QR ordering is on. Print the QR codes for the rooms."));
+}
+
+// ── RESTAURANT TABLE QR (paid add-on "table_qr") ─────────────────────
+// Same token, same guest page and same approval flow as the room QR:
+// a table's QR is …/?order=<TOKEN>&table=5 and its orders carry
+// room = "T:5". Approved table orders collect on that table's running
+// tab (hotels/<KEY>/data/table_tabs); the counter makes ONE walk-in bill
+// from the tab when the guests leave, which empties the tab.
+function roIsTable(w) { return String(w || "").indexOf("T:") === 0; }
+function roWhere(w) { return roIsTable(w) ? "Table " + String(w).slice(2) : "Room " + w; }
+function cleanTableName(t) { return String(t || "").trim().replace(/[^A-Za-z0-9-]/g, "").slice(0, 10); }
+const TableTabs = {
+  KEY: "table_tabs",
+  async get() {
+    try { const v = await WS.get(this.KEY, true); if (v && typeof v === "object" && v.tabs) return v; } catch (e) {}
+    try { const v = JSON.parse(localStorage.getItem("ab_" + this.KEY) || "null"); if (v && v.tabs) return v; } catch (e) {}
+    return { tabs: {} };
+  },
+  // read-modify-write in a transaction so two devices cannot overwrite each other
+  async update(fn) {
+    if (window._db) {
+      try {
+        const ref = WS._ref(this.KEY);
+        const out = await window._db.runTransaction(async tx => {
+          const sn = await tx.get(ref);
+          const cur = (sn.exists && sn.data().value && sn.data().value.tabs) ? sn.data().value : { tabs: {} };
+          const next = fn(JSON.parse(JSON.stringify(cur)));
+          tx.set(ref, { value: cloudSafe(next), ts: Date.now() });
+          return next;
+        });
+        try { localStorage.setItem("ab_" + this.KEY, JSON.stringify(out)); } catch (e) {}
+        return out;
+      } catch (e) { console.warn("table tab transaction failed, saving via normal sync:", e.message); }
+    }
+    const next = fn(await this.get());
+    await WS.set(this.KEY, next);
+    return next;
+  },
+  addOrder(table, entry) {
+    return this.update(d => {
+      const t = d.tabs[table] || { openedAt: Date.now(), orders: [] };
+      if (!t.orders.some(o => o.qr === entry.qr)) t.orders.push(entry);
+      d.tabs[table] = t; return d;
+    });
+  },
+  removeOrder(table, qr) {
+    return this.update(d => {
+      const t = d.tabs[table]; if (!t) return d;
+      t.orders = t.orders.filter(o => o.qr !== qr);
+      if (!t.orders.length) delete d.tabs[table];
+      return d;
+    });
+  },
+  // closes only the orders that went on the bill (a new order that came in
+  // while the bill was being made stays on the tab)
+  closeOrders(table, qrs) {
+    return this.update(d => {
+      const t = d.tabs[table]; if (!t) return d;
+      t.orders = t.orders.filter(o => qrs.indexOf(o.qr) < 0);
+      if (!t.orders.length) delete d.tabs[table];
+      return d;
+    });
+  },
+  // the bill lines of a tab: same dish at the same price is merged
+  lines(tab) {
+    const m = {};
+    (tab && tab.orders || []).forEach(o => (o.items || []).forEach(i => {
+      const k = i.id + "|" + i.price;
+      if (!m[k]) m[k] = { name: i.name, price: Number(i.price) || 0, qty: 0, cat: i.cat || "🍛 Food" };
+      m[k].qty += Number(i.qty) || 0;
+    }));
+    return Object.values(m).filter(l => l.qty > 0);
+  }
+};
+// Owner/Manager: which tables exist + print their QR codes.
+function TableQrCard({ profile, rooms, onSaveTables, onSaveToken }) {
+  const _h = React.createElement;
+  const token = (profile && profile.roomOrderToken) || "";
+  const saved = Array.isArray(profile && profile.restaurantTables) ? profile.restaurantTables : [];
+  const [text, setText] = useState(saved.join(", "));
+  const [count, setCount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  useEffect(() => { setText(saved.join(", ")); }, [saved.join(",")]);
+  const parse = s => { const out = []; String(s || "").split(/[,\n]+/).map(cleanTableName).forEach(t => { if (t && out.indexOf(t) < 0) out.push(t); }); return out.slice(0, 200); };
+  const list = parse(text);
+  const changed = list.join(",") !== saved.join(",");
+  const link = t => window.location.origin + "/?order=" + token + "&table=" + encodeURIComponent(t);
+  const save = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      let newToken = "";
+      if (!token) {
+        newToken = generateRoomOrderToken();
+        const res = await publishRoomOrderSnapshot(newToken, roSnapshot({ ...profile, restaurantTables: list }, MenuStore.get(), rooms), { claim: true });
+        if (!res.ok) { setMsg(res); return; }
+      }
+      // one profile save for both (two saves in a row would race)
+      await onSaveTables(list, newToken);
+      AuditLog.add("TABLE_QR_TABLES", list.length + " tables");
+      setMsg({ ok: true });
+    } catch (e) { setMsg({ ok: false, detail: e.message }); } finally { setBusy(false); }
+  };
+  const fill = () => { const n = Math.max(1, Math.min(200, Math.round(Number(count) || 0))); if (!n) return; setText(Array.from({ length: n }, (_, i) => String(i + 1)).join(", ")); };
+  const printSheet = async () => {
+    try {
+      const qr = await new Promise((res, rej) => {
+        if (window.qrcode) return res(window.qrcode);
+        const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("Could not load the QR maker")); document.head.appendChild(s);
+      });
+      const cards = saved.map(t => {
+        const q = qr(0, "M"); q.addData(link(t)); q.make();
+        return "<div class=c><div class=h>" + escHtml((profile && profile.hotelName) || "") + "</div>" + q.createSvgTag(5, 2) + "<div class=r>TABLE " + escHtml(t) + "</div><div class=t>Scan to see the menu and order</div></div>";
+      }).join("");
+      const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>Table QR codes</title><style>body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+      const w = window.open("", "_blank");
+      if (w) { w.document.write(html); w.document.close(); } else alert("Please allow pop-ups to print the QR codes.");
+    } catch (e) { alert(e.message); }
+  };
+  return _h("div", { className: "card", "data-t": "table-qr-card", style: { padding: "12px 14px", marginBottom: 12 } },
+    _h("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 14 } }, "🍽️ Restaurant table QR codes"),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 8px" } }, "Guests scan the QR on their table and order. Every order needs a Manager's approval, then goes to the table's running bill. Make one bill from Restaurant → Tables when they leave."),
+    !hasFeature("restaurant") && _h("div", { role: "alert", style: { fontSize: 12, color: "#b45309", marginBottom: 8 } }, "Table bills are made from the Restaurant screen — ask your provider to turn on the Restaurant add-on too."),
+    _h("div", { style: { display: "flex", gap: 6, marginBottom: 6 } },
+      _h("input", { type: "number", min: 1, max: 200, "data-t": "tq-count", value: count, onChange: e => setCount(e.target.value), placeholder: "No. of tables", style: { flex: 1, minWidth: 0 } }),
+      _h("button", { className: "btn-s", "data-t": "tq-fill", onClick: fill, style: { width: "auto" } }, "Number them 1, 2, 3…")),
+    _h("textarea", { "data-t": "tq-list", value: text, rows: 2, onChange: e => setText(e.target.value), placeholder: "Table names, separated by commas (e.g. 1, 2, 3, G1, Roof-1)", style: { width: "100%", boxSizing: "border-box", fontSize: 13 } }),
+    _h("div", { style: { fontSize: 11.5, color: "var(--muted)", margin: "2px 0 8px" } }, list.length + " tables · letters, numbers and - only, up to 10 characters each"),
+    _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+      _h("button", { className: "btn-p", "data-t": "tq-save", disabled: busy || (!changed && !!token) || !list.length, onClick: save, style: { flex: "1 1 140px" } }, busy ? "Saving…" : "Save tables"),
+      saved.length > 0 && token && _h("button", { className: "btn-s", "data-t": "tq-print", onClick: printSheet, style: { flex: "1 1 140px" } }, "🖨️ Print table QR codes"),
+      saved.length > 0 && token && _h("button", { className: "btn-s", onClick: () => window.open(link(saved[0]), "_blank"), style: { flex: "1 1 120px" } }, "👀 Preview")),
+    msg && !msg.ok && _h("div", { role: "alert", style: { fontSize: 12, color: "#b91c1c", marginTop: 8 } }, msg.reason === "permission-denied" ? "Could not turn on: the Firebase rules for QR ordering are not published yet. Please publish the new firestore.rules, then try again." : "Could not save: " + msg.detail),
+    msg && msg.ok && _h("div", { role: "status", style: { fontSize: 12, color: "#166534", marginTop: 8 } }, "✅ Tables saved. Print the QR codes and keep one on each table."));
+}
+// Restaurant counter: running table bills (from approved table QR orders).
+function TableTabsPanel({ user, openHtmlBill, onBilled }) {
+  const _h = React.createElement;
+  const [data, setData] = useState({ tabs: {} });
+  const [open, setOpen] = useState("");
+  const [payMode, setPayMode] = useState("Cash");
+  const [cust, setCust] = useState("");
+  const [phone, setPhone] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = () => TableTabs.get().then(setData).catch(() => {});
+  useEffect(() => { load(); const iv = setInterval(() => { if (!document.hidden) load(); }, 10000); return () => clearInterval(iv); }, []);
+  const names = Object.keys(data.tabs || {}).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const bill = async t => {
+    const tab = (data.tabs || {})[t]; if (!tab || busy) return;
+    const ph = phone.trim();
+    if (ph && ph.replace(/\D/g, "").length < 10) { alert("Enter a 10-digit phone number (or leave blank)"); return; }
+    const lines = TableTabs.lines(tab); if (!lines.length) return;
+    setBusy(true);
+    try {
+      const g = calcRestaurantBill(lines);
+      const now = new Date();
+      const id = await generateDocumentNumber("RB");
+      const b = {
+        id, date: localDateStr(now), time: localTimeStr(now), cust: cust.trim().slice(0, 60), phone: ph.slice(0, 20), table: t,
+        items: lines.map(i => ({ name: i.name, price: i.price, qty: i.qty, cat: i.cat })), payMode, source: "table_qr",
+        rate: g.rate, sac: g.sac, ruleId: g.ruleId, inclusive: g.inclusive, taxable: g.taxable, cgst: g.cgst, sgst: g.sgst, total: g.total,
+        by: String(user && (user.name || user.u) || "").slice(0, 40), kot: "", createdAt: now.toISOString()
+      };
+      const all = await RestaurantBills.append(b);
+      await TableTabs.closeOrders(t, tab.orders.map(o => o.qr));
+      AuditLog.add("TABLE_BILL", "Table " + t + " · " + id + " · " + fmtMoney(g.total) + " · " + payMode);
+      if (onBilled) onBilled(all);
+      setOpen(""); setCust(""); setPhone(""); load();
+      openHtmlBill(b);
+    } catch (e) { alert("Could not create bill: " + e.message); } finally { setBusy(false); }
+  };
+  const field = { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 13.5 };
+  return _h("div", { "data-t": "table-tabs", style: { padding: "0 14px" } },
+    _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", margin: "2px 0 8px" } },
+      _h("div", { style: { fontSize: 12.5, color: "var(--muted)" } }, "Tables with approved QR orders. Make the bill when the guests leave."),
+      _h("button", { className: "btn-s", onClick: load, style: { width: "auto", padding: "6px 10px", fontSize: 12 } }, "↻")),
+    names.length === 0 && _h("div", { className: "card", "data-t": "tt-empty", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No open tables. Approved table QR orders appear here."),
+    names.map(t => {
+      const tab = data.tabs[t], lines = TableTabs.lines(tab), amt = lines.reduce((s, l) => s + l.price * l.qty, 0);
+      return _h("div", { key: t, className: "card", "data-t": "tt-tab", style: { padding: "12px 14px", marginBottom: 8 } },
+        _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } },
+          _h("div", null, _h("b", { style: { fontSize: 16, color: "var(--navy)" } }, "Table " + t), _h("span", { style: { fontSize: 12, color: "var(--muted)" } }, " · " + tab.orders.length + (tab.orders.length === 1 ? " order" : " orders") + " · open " + roTimeAgo(tab.openedAt))),
+          _h("b", { style: { fontSize: 15 } }, fmtMoney(amt))),
+        _h("div", { style: { fontSize: 13, marginTop: 4, color: "#374151" } }, lines.map(l => l.qty + " × " + l.name).join(", ")),
+        open !== t ? _h("button", { className: "btn-p", "data-t": "tt-bill", onClick: () => setOpen(t), style: { marginTop: 8, width: "100%" } }, "🧾 Make bill for Table " + t)
+          : _h("div", { style: { marginTop: 8, display: "grid", gap: 6 } },
+            _h("div", { style: { display: "flex", gap: 6 } },
+              _h("input", { "aria-label": "Customer name", value: cust, maxLength: 60, onChange: e => setCust(e.target.value), placeholder: "Customer name (optional)", style: field }),
+              _h("input", { "aria-label": "Phone", value: phone, maxLength: 15, inputMode: "tel", onChange: e => setPhone(e.target.value), placeholder: "Phone (optional)", style: field })),
+            _h("select", { "aria-label": "Payment mode", "data-t": "tt-pay", value: payMode, onChange: e => setPayMode(e.target.value), style: field }, ["Cash", "UPI", "Card"].map(p => _h("option", { key: p }, p))),
+            _h("div", { style: { display: "flex", gap: 6 } },
+              _h("button", { className: "btn-p", "data-t": "tt-confirm", disabled: busy, onClick: () => bill(t), style: { flex: 1 } }, busy ? "Making bill…" : "Make bill"),
+              _h("button", { className: "btn-s", onClick: () => setOpen(""), style: { width: "auto" } }, "Cancel"))));
+    }));
+}
+
+function roItemsText(o) { return (o.items || []).map(i => i.qty + " × " + i.name).join(", "); }
+
+// ── STAFF: Room Orders screen (Owner, Manager, Captain) ─────────────
+function RoomOrdersView({ user, orders, token, profile, rooms, bookings, onApprove, onSaveToken, onSaveTables }) {
+  const _h = React.createElement;
+  const role = (user && user.role) || "";
+  const boss = role === "Owner" || role === "Manager";
+  const canKot = boss || role === "Captain";
+  const [busy, setBusy] = useState("");
+  const [showDone, setShowDone] = useState(false);
+  const [rejecting, setRejecting] = useState(null);
+  const list = (orders || []).slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  const group = s => list.filter(o => s.indexOf(o.status) >= 0);
+  const act = async (o, fn) => { setBusy(o.id); try { await fn(); } catch (e) { alert("Could not update: " + e.message); } finally { setBusy(""); } };
+  const approve = o => act(o, async () => { const r = await onApprove(o); if (r && r.error) alert(r.error); });
+  const reject = o => act(o, async () => {
+    const reason = String(rejecting.reason || "").trim().slice(0, 120);
+    await RoomOrderOps.move(token, o, "pending", { status: "rejected", reason: reason || "Not available right now", decidedAt: Date.now(), decidedBy: RoomOrderOps.by(user), log: RoomOrderOps.log(o, "rejected", user) });
+    AuditLog.add("ROOM_QR_REJECT", roWhere(o.room) + (reason ? " · " + reason : ""));
+    setRejecting(null);
+  });
+  const kot = o => act(o, async () => {
+    const kotNo = nextKotNumber();
+    const ok = await RoomOrderOps.move(token, o, "approved", { status: "kot", kot: kotNo, kotAt: Date.now(), kotBy: RoomOrderOps.by(user), log: RoomOrderOps.log(o, "kot", user) });
+    if (!ok) { alert("This order was changed (maybe cancelled by the guest). Please check again."); return; }
+    AuditLog.add("ROOM_QR_KOT", roWhere(o.room) + " · " + kotNo);
+    printKOT({ kot: kotNo, date: localDateStr(), time: localTimeStr(), by: RoomOrderOps.by(user), note: o.note || "", where: roWhere(o.room) + " · QR order", items: (o.items || []).map(i => ({ qty: i.qty, name: i.name })) }).catch(() => {});
+  });
+  const served = o => act(o, () => RoomOrderOps.move(token, o, "ready", { status: "served", log: RoomOrderOps.log(o, "served", user) }));
+  const card = o => {
+    const isT = roIsTable(o.room);
+    const bk = isT ? null : (bookings || []).find(b => b.status === "active" && String(b.roomId) === String(o.room));
+    return _h("div", { key: o.id, className: "card", "data-t": "ro-card", "data-status": o.status, style: { padding: "12px 14px", marginBottom: 8, borderLeft: "4px solid " + ((RO_STATUS[o.status] || {}).color || "#999") } },
+      _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+        _h("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 15 } }, (isT ? "🍽️ " : "🛎️ ") + roWhere(o.room), bk ? _h("span", { style: { fontWeight: 400, color: "var(--muted)", fontSize: 12.5 } }, " · " + bk.name) : null, o.kot ? _h("span", { style: { fontWeight: 400, fontSize: 12.5 } }, " · " + o.kot) : null),
+        _h("div", { style: { display: "flex", gap: 6, alignItems: "center" } }, roStatusChip(o.status), _h("span", { style: { fontSize: 11, color: "var(--muted)" } }, roTimeAgo(o.createdAt)))),
+      _h("div", { style: { fontSize: 13.5, marginTop: 6 } }, roItemsText(o)),
+      o.note && _h("div", { style: { fontSize: 12, color: "#92400e", marginTop: 3 } }, "Note: " + o.note),
+      o.status === "rejected" && o.reason && _h("div", { style: { fontSize: 12, color: "#b91c1c" } }, "Reason: " + o.reason),
+      o.status === "cancelled" && _h("div", { style: { fontSize: 12, color: "var(--muted)" } }, "Cancelled by " + (o.cancelledBy === "guest" ? "the guest" : (o.cancelledBy || "staff")) + (o.chargeOrderId ? (o.unbilledAt ? " · removed from the " + (isT ? "table" : "room") + " bill" : " · removing from the bill…") : "")),
+      _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, gap: 8, flexWrap: "wrap" } },
+        _h("b", null, fmtMoney(o.total)),
+        _h("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
+          o.status === "pending" && boss && !isT && !bk && _h("span", { style: { fontSize: 12, color: "#b91c1c" } }, "Room not checked in"),
+          o.status === "pending" && boss && _h("button", { className: "btn-p", "data-t": "ro-approve", disabled: busy === o.id || (!isT && !bk), onClick: () => approve(o), style: { minHeight: 36, width: "auto", padding: "6px 14px" } }, "✅ Approve"),
+          o.status === "pending" && boss && _h("button", { className: "btn-s", "data-t": "ro-reject", disabled: busy === o.id, onClick: () => setRejecting({ id: o.id, reason: "" }), style: { minHeight: 36, color: "#b91c1c" } }, "Reject"),
+          o.status === "pending" && !boss && _h("span", { style: { fontSize: 12, color: "var(--muted)" } }, "Waiting for the Manager"),
+          o.status === "approved" && canKot && _h("button", { className: "btn-p", "data-t": "ro-kot", disabled: busy === o.id, onClick: () => kot(o), style: { minHeight: 36, width: "auto", padding: "6px 14px" } }, "🧾 Print KOT & send to kitchen"),
+          o.status === "ready" && canKot && _h("button", { className: "btn-p", "data-t": "ro-served", disabled: busy === o.id, onClick: () => served(o), style: { minHeight: 36, width: "auto", padding: "6px 14px", background: "#15803d" } }, "🚶 Mark served"))),
+      rejecting && rejecting.id === o.id && _h("div", { style: { display: "flex", gap: 6, marginTop: 8 } },
+        _h("input", { "data-t": "ro-reject-reason", value: rejecting.reason, maxLength: 120, placeholder: "Reason for the guest (e.g. item finished)", onChange: e => setRejecting({ ...rejecting, reason: e.target.value }), style: { flex: 1, minWidth: 0 } }),
+        _h("button", { className: "btn-p", "data-t": "ro-reject-confirm", onClick: () => reject(o), style: { width: "auto", background: "#b91c1c" } }, "Reject"),
+        _h("button", { className: "btn-s", onClick: () => setRejecting(null) }, "✕")));
+  };
+  const sec = (title, arr, t) => arr.length > 0 && _h("div", { "data-t": t, style: { marginBottom: 6 } }, _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--muted)", margin: "10px 2px 6px" } }, title + " (" + arr.length + ")"), arr.map(card));
+  const open = group(["pending", "approved", "kot", "preparing", "ready"]);
+  const done = group(["served", "cancelled", "rejected"]).slice().reverse();
+  return _h("div", { className: "scrollable hs", "data-t": "room-orders-view", style: { height: "100%", padding: "14px 14px 30px", boxSizing: "border-box", overflowY: "auto" } },
+    _h("h2", { style: { fontSize: 20, marginBottom: 2 } }, hasFeature("table_qr") ? "🛎️ QR Orders" : "🛎️ Room Orders"),
+    _h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginBottom: 10 } }, boss ? (hasFeature("table_qr") ? "Orders guests place from the room / table QR codes. Approve to add them to the room bill or the table's running bill." : "Orders guests place from the room QR code. Approve to add them to the room bill.") : "Approved orders: print the KOT and serve when the kitchen marks them ready."),
+    !token && boss ? null : !token && _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "QR ordering is not set up yet — ask the Owner or Manager."),
+    token && open.length === 0 && _h("div", { className: "card", "data-t": "ro-empty", style: { padding: 14, fontSize: 13, color: "var(--muted)", marginBottom: 10 } }, "No open orders right now."),
+    sec("NEW — WAITING FOR APPROVAL", group(["pending"]), "ro-sec-pending"),
+    sec("APPROVED — PRINT KOT", group(["approved"]), "ro-sec-approved"),
+    sec("IN THE KITCHEN", group(["kot", "preparing"]), "ro-sec-kitchen"),
+    sec("READY — SERVE", group(["ready"]), "ro-sec-ready"),
+    done.length > 0 && _h("button", { className: "btn-s", onClick: () => setShowDone(!showDone), style: { margin: "8px 0", width: "100%" } }, (showDone ? "▲ Hide" : "▼ Show") + " finished / cancelled today (" + done.length + ")"),
+    showDone && done.map(card),
+    boss && _h("div", { style: { marginTop: 14 } }, _h(MenuStockPanel, { compact: true }), hasFeature("qr_ordering") && _h(RoomQrCard, { profile, rooms, onSaveToken }), hasFeature("table_qr") && _h(TableQrCard, { profile, rooms, onSaveToken, onSaveTables })));
+}
+
+// ── STAFF: Kitchen display (Chef; Owner/Manager/Captain may view) ───
+function KitchenView({ user, orders, token }) {
+  const _h = React.createElement;
+  const [busy, setBusy] = useState("");
+  const [, tick] = useState(0);
+  useEffect(() => { const iv = setInterval(() => tick(x => x + 1), 30000); return () => clearInterval(iv); }, []);
+  const list = (orders || []).filter(o => ["kot", "preparing", "ready"].indexOf(o.status) >= 0).sort((a, b) => (a.kotAt || a.createdAt || 0) - (b.kotAt || b.createdAt || 0));
+  const go = async (o, from, to) => {
+    setBusy(o.id);
+    try {
+      const ok = await RoomOrderOps.move(token, o, from, { status: to, log: RoomOrderOps.log(o, to, user) });
+      if (!ok) alert("This order was changed (maybe cancelled by the guest).");
+    } catch (e) { alert("Could not update: " + e.message); } finally { setBusy(""); }
+  };
+  const col = (title, s, color) => {
+    const arr = list.filter(o => o.status === s);
+    return _h("div", { "data-t": "kds-col-" + s, style: { flex: "1 1 260px", minWidth: 0 } },
+      _h("div", { style: { fontSize: 13, fontWeight: 800, color, margin: "4px 2px 8px" } }, title + " (" + arr.length + ")"),
+      arr.length === 0 && _h("div", { style: { fontSize: 12, color: "var(--muted)", padding: "6px 2px" } }, "—"),
+      arr.map(o => _h("div", { key: o.id, className: "card", "data-t": "kds-ticket", style: { padding: "12px 14px", marginBottom: 8, borderTop: "4px solid " + color } },
+        _h("div", { style: { display: "flex", justifyContent: "space-between", gap: 8 } }, _h("b", { style: { fontSize: 16 } }, (o.kot || "KOT") + " · " + roWhere(o.room)), _h("span", { style: { fontSize: 11.5, color: "var(--muted)" } }, roTimeAgo(o.kotAt || o.createdAt))),
+        _h("div", { style: { marginTop: 6 } }, (o.items || []).map((i, k) => _h("div", { key: k, style: { fontSize: 15, fontWeight: 700, padding: "2px 0" } }, i.qty + " × " + i.name))),
+        o.note && _h("div", { style: { fontSize: 13, color: "#b45309", marginTop: 4, fontWeight: 700 } }, "Note: " + o.note),
+        s === "kot" && _h("button", { className: "btn-p", "data-t": "kds-start", disabled: busy === o.id, onClick: () => go(o, "kot", "preparing"), style: { marginTop: 10, width: "100%", background: "#c2410c" } }, "👨‍🍳 Start preparing"),
+        s === "preparing" && _h("button", { className: "btn-p", "data-t": "kds-ready", disabled: busy === o.id, onClick: () => go(o, "preparing", "ready"), style: { marginTop: 10, width: "100%", background: "#15803d" } }, "✅ Ready"),
+        s === "ready" && _h("div", { style: { marginTop: 8, fontSize: 12, color: "#15803d", fontWeight: 700 } }, "Waiting for the Captain to serve"))));
+  };
+  return _h("div", { className: "scrollable hs", "data-t": "kitchen-view", style: { height: "100%", padding: "14px 14px 30px", boxSizing: "border-box", overflowY: "auto" } },
+    _h("h2", { style: { fontSize: 20, marginBottom: 2 } }, "👨‍🍳 Kitchen"),
+    _h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginBottom: 10 } }, "Orders appear here as soon as the KOT is printed. Tap to update — the Manager, Captain and the guest see it instantly."),
+    !token && _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "QR ordering is not set up yet."),
+    _h("div", { style: { display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-start" } },
+      col("NEW KOT", "kot", "#7c3aed"), col("PREPARING", "preparing", "#c2410c"), col("READY", "ready", "#15803d")));
+}
+
+// Fixed-username staff login (Owner sets the password) — used for the
+// restaurant counter, the Captain and the Chef.
+function StaffLoginCard({ username, role, title, desc }) {
+  const _h = React.createElement;
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const exists = (() => { try { return JSON.parse(localStorage.getItem("ab_users") || "[]").some(x => x.u === username); } catch (e) { return false; } })();
+  const save = async () => {
+    if (pw.length < 8) { setMsg("❌ Password must be at least 8 characters"); return; }
+    try {
+      const users = JSON.parse(localStorage.getItem("ab_users") || "[]");
+      const hash = await SecUtils.hashPassword(pw);
+      const had = users.some(x => x.u === username);
+      const next = had ? users.map(x => x.u === username ? { ...x, p: hash, role, mustChange: false } : x)
+        : users.concat([{ u: username, p: hash, name: role, role, mustChange: false }]);
+      localStorage.setItem("ab_users", JSON.stringify(next));
+      CloudSync.users(next);
+      AuditLog.add(had ? "STAFF_LOGIN_RESET" : "STAFF_LOGIN_CREATED", username);
+      setPw("");
+      setMsg("✅ Login ready — Username: " + username + " · Password: the one you just set");
+    } catch (e) { setMsg("❌ Could not create login: " + e.message); }
+  };
+  return _h("div", { "data-t": "staff-login-" + username, style: { background: "var(--card)", borderRadius: 16, padding: 18, border: "1px solid var(--border)", marginTop: 14 } },
+    _h("div", { style: { fontWeight: 700, fontSize: 16, color: "var(--navy)", marginBottom: 4 } }, title),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 10 } }, "Username ", _h("b", null, username), " — " + desc + " ", exists ? "Login exists; enter a new password to reset it." : "Not created yet."),
+    _h("div", { style: { display: "flex", gap: 8 } },
+      _h("input", { value: pw, onChange: e => setPw(e.target.value), type: "password", placeholder: "New password (min 8)", "aria-label": title + " password", autoComplete: "new-password", style: { flex: 1, minWidth: 0, boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 13.5 } }),
+      _h("button", { className: "btn-o", onClick: save, style: { width: "auto", whiteSpace: "nowrap", padding: "8px 12px" } }, exists ? "Reset" : "Set")),
+    msg && _h("div", { role: "status", style: { fontSize: 12.5, marginTop: 8, color: msg.startsWith("❌") ? "#b91c1c" : "#166534" } }, msg));
+}
 
 // ── PUBLIC BOOKING REQUEST PAGE ──────────────────────────────────
 // Rendered instead of the normal staff app when the URL has a `?book=`
@@ -13935,6 +14823,7 @@ function App() {
   useEffect(() => { if (view !== "checkin") setResPrefill(null); }, [view]);
   const [modal, setModal] = useState(null);
   const [checkInRoom, setCIR] = useState(null);
+  const applyCloudProfileRef = useRef(null);
   const [profile, setProfile] = useState(() => {
     try {
       return {
@@ -13955,7 +14844,9 @@ function App() {
         // reliable way to satisfy UIDAI guidance, since pixel-level masking
         // can't guarantee it covers the number on every card photo angle.
         // "masked" = store a best-effort masked image (hotel's own choice).
-        aadhaarPhotoPolicy: localStorage.getItem("aadhaarPhotoPolicy") || "none"
+        aadhaarPhotoPolicy: localStorage.getItem("aadhaarPhotoPolicy") || "none",
+        // last full copy seen from the cloud / own save (newest of all)
+        ...(() => { try { const x = JSON.parse(localStorage.getItem("ab_profile") || "null"); return x && typeof x === "object" && !Array.isArray(x) ? x : {}; } catch (e) { return {}; } })()
       };
     } catch {
       return {
@@ -13986,6 +14877,26 @@ function App() {
   useEffect(() => {
     rememberBookings(bookings);
   }, [bookings]);
+  // Keeps this device's own copy of the hotel profile (the per-field keys
+  // the app starts from) equal to what it last saw — from its own save OR
+  // from the cloud — so a reload never shows older details than before.
+  const persistProfileLocal = p => {
+    try {
+      const put = (k, v) => localStorage.setItem(k, v == null ? "" : String(v));
+      if ("ownerName" in p) put("ownerName", p.ownerName);
+      ["hotelTagline", "hotelName", "hotelAddr", "hotelPhone", "hotelEmail", "hotelGstin", "invoiceFooterName", "publicBookingToken"].forEach(k => { if (k in p) put(k, p[k]); });
+      if ("gstMode" in p) put("gstMode", p.gstMode || "exclusive");
+      if ("aadhaarPhotoPolicy" in p) put("aadhaarPhotoPolicy", p.aadhaarPhotoPolicy || "none");
+      ["hotelLogo", "hotelBanner"].forEach(k => { if (k in p) { if (p[k]) localStorage.setItem(k, p[k]); else localStorage.removeItem(k); } });
+    } catch {}
+  };
+  // Profile arriving from the cloud (live listener, or the backup refresh).
+  const applyCloudProfile = data => {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
+    setProfile(p => ({ ...p, ...data }));
+    persistProfileLocal(data);
+  };
+  applyCloudProfileRef.current = applyCloudProfile;
   const saveProfile = async p => {
     setProfile(p);
     try {
@@ -14006,7 +14917,24 @@ function App() {
     // Sync business identity (name/address/GSTIN) across devices for this
     // hotel — every staff login should print invoices with the SAME real
     // hotel details, not just whatever was set on one particular device.
-    await WS.set("profile", p).catch(() => {});
+    // A failed cloud save used to be silent (the details then stayed on this
+    // phone only); now the user is told, with the likely reason.
+    const size = (() => { try { return JSON.stringify(cloudSafe(p)).length; } catch (e) { return 0; } })();
+    if (size > 950000) {
+      try { localStorage.setItem("ab_profile", JSON.stringify(p)); } catch {}
+      alert("Saved on this device, but NOT on your other devices: the logo / banner / stamp images are too large together (" + Math.round(size / 1024) + " KB, limit about 900 KB). Please upload a smaller banner or logo and save again.");
+      return;
+    }
+    let ok = false;
+    try {
+      try { localStorage.setItem("ab_profile", JSON.stringify(p)); } catch {}
+      const ref = WS._ref("profile");
+      if (ref) { await ref.set({ value: cloudSafe(p), ts: Date.now() }, { merge: true }); ok = true; }
+    } catch (e) {
+      console.warn("FB set: profile", e && e.message);
+      alert("Saved on this device, but it could not reach your other devices right now (" + ((e && e.message) || "no internet") + "). Please check the internet and save again.");
+    }
+    return ok;
   };
 
   // Inject CSS
@@ -14219,7 +15147,7 @@ function App() {
         if (cancelled) return;
         unsubProfile = WS.onSnapshot("profile", data => {
           if (!data) return;
-          setProfile(p => ({ ...p, ...data }));
+          if (applyCloudProfileRef.current) applyCloudProfileRef.current(data); else setProfile(p => ({ ...p, ...data }));
           // BUG FIX (2026-09): this listener used to update ONLY React state.
           // The booking-requests listener and handleRequestDecision below both
           // read localStorage.publicBookingToken directly (not React state) —
@@ -14300,19 +15228,37 @@ function App() {
     // Also do one immediate poll whenever the tab becomes visible again
     // (e.g. phone screen turned back on) — catches up right away instead
     // of waiting up to 20s after someone returns to the app.
+    // Hotel profile (name, address, GSTIN, logo…) gets the same backup as
+    // rooms/bookings — its live listener can be knocked out by the same SDK
+    // bug, after which a Manager's phone never saw the Owner's changes until
+    // the app was fully closed and reopened. It is a bigger document
+    // (images), so it is re-read less often: when the app comes back to the
+    // screen and every 2 minutes while it stays open.
+    let lastProfilePull = 0;
+    const pullProfile = () => {
+      if (cancelled || !window._db || document.hidden) return;
+      lastProfilePull = Date.now();
+      window._db.collection("hotels").doc(WS._hid()).collection("data").doc("profile").get({ source: 'server' })
+        .then(s => { if (!cancelled && s.exists && applyCloudProfileRef.current) applyCloudProfileRef.current(s.data().value); }).catch(() => {});
+    };
+    const profileInterval = setInterval(() => { if (Date.now() - lastProfilePull >= 110000) pullProfile(); }, 30000);
     const onVisible = () => {
       if (!document.hidden && !cancelled && window._db) {
         window._db.collection("hotels").doc(WS._hid()).collection("data").doc("rooms").get({ source: 'server' })
           .then(s => { if (!cancelled && s.exists) setRooms(s.data().value); }).catch(() => {});
+        if (Date.now() - lastProfilePull >= 15000) setTimeout(pullProfile, 600);
       }
     };
     document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
 
     return () => {
       cancelled = true;
       if (pollTimer) clearTimeout(pollTimer);
       clearInterval(pollInterval);
+      clearInterval(profileInterval);
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
       unsubRooms();
       unsubBk();
       unsubRes();
@@ -14719,7 +15665,9 @@ function App() {
     setSyncing(false);
     AuditLog.add('CHECKIN', b[b.length - 1]?.name || 'guest');
   };
-  const savePermissions = async p => {
+  const savePermissions = async p0 => {
+    const p = { ...(p0 || {}) };
+    Object.keys(p).forEach(r => { if (Array.isArray(p[r]) && p[r].indexOf("qrv1") < 0) p[r] = p[r].concat(["qrv1"]); });
     setPermissions(p);
     await WS.set("permissions", p);
     AuditLog.add('ACCESS_CONTROL_CHANGED', user?.u || '');
@@ -14978,6 +15926,116 @@ function App() {
     AuditLog.add("CHARGE_VOIDED", "Room " + b.roomId + " · " + c.name + " x" + c.qty + " · " + reason);
     if (modal?.b?.id === bid) setModal(p => ({ ...p, b: nb.find(x => x.id === bid) }));
   };
+  // ── QR room ordering (staff side) ──────────────────────────────────
+  const roToken = profile.roomOrderToken || "";
+  const roOn = !!(hasFeature("qr_any") && roToken && user && ["Owner", "Manager", "Captain", "Chef"].indexOf(user.role) >= 0);
+  const [roomOrders, setRoomOrders] = useState([]);
+  useEffect(() => {
+    if (!roOn || !window._db) { setRoomOrders([]); return; }
+    const since = Date.now() - 36 * 3600 * 1000;
+    const q = () => window._db.collection("room_order").doc(roToken).collection("orders").where("createdAt", ">=", since);
+    const take = qs => { const arr = []; qs.forEach(d => { const v = d.data(); if (v && v.id) arr.push(v); }); setRoomOrders(arr); };
+    let un = () => {};
+    try { un = q().onSnapshot(take, e => console.warn("room orders:", e && e.message)); } catch (e) {}
+    // backup refresh (the live listener can be knocked out — same SDK bug as rooms/bookings)
+    const poll = () => { if (!document.hidden) q().get().then(take).catch(() => {}); };
+    const iv = setInterval(poll, 25000);
+    document.addEventListener("visibilitychange", poll);
+    return () => { try { un(); } catch (e) {} clearInterval(iv); document.removeEventListener("visibilitychange", poll); };
+  }, [roOn, roToken]);
+  // beep + badge for what THIS role has to act on
+  const roMine = o => !user ? false : (user.role === "Owner" || user.role === "Manager") ? o.status === "pending"
+    : user.role === "Captain" ? (o.status === "approved" || o.status === "ready") : user.role === "Chef" ? o.status === "kot" : false;
+  const roSeen = useRef(null);
+  useEffect(() => {
+    const now = new Set(roomOrders.filter(roMine).map(o => o.id + ":" + o.status));
+    if (roSeen.current && [...now].some(k => !roSeen.current.has(k))) roBeep();
+    roSeen.current = now;
+  }, [roomOrders]);
+  const roBadges = roOn ? {
+    orders: user && user.role !== "Chef" ? roomOrders.filter(o => roMine(o)).length : 0,
+    kitchen: roomOrders.filter(o => o.status === "kot").length
+  } : null;
+  // keep the guests' menu + which rooms are occupied up to date
+  const [menuTick, setMenuTick] = useState(0);
+  const roLastPub = useRef("");
+  useEffect(() => { const f = () => setMenuTick(x => x + 1); window.addEventListener("ab-menu-changed", f); return () => window.removeEventListener("ab-menu-changed", f); }, []);
+  useEffect(() => { if (roOn) MenuStore.refresh().then(() => setMenuTick(x => x + 1)).catch(() => {}); }, [roOn]);
+  useEffect(() => {
+    if (!hasFeature("qr_any") || !roToken || !user || !window._db) return;
+    const t = setTimeout(async () => {
+      const snap = roSnapshot(profile, MenuStore.get(), rooms);
+      const key = JSON.stringify(snap);
+      if (key === roLastPub.current) return;
+      const r = await publishRoomOrderSnapshot(roToken, snap);
+      if (r.ok) roLastPub.current = key;
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [roToken, profile.hotelName, JSON.stringify(profile.restaurantTables || []), rooms, menuTick, user && user.u, enabledFeatures]);
+  // Approve = re-price from the hotel's own menu (never the guest's copy),
+  // mark the order approved, then add it to the room bill.
+  const handleRoomOrderApprove = async o => {
+    if (roIsTable(o.room)) {
+      const table = String(o.room).slice(2);
+      const menu = await MenuStore.refresh();
+      const lines = (o.items || []).map(i => { const m = menu.find(x => x.id === i.id); return m ? { id: m.id, name: m.name, price: m.price, qty: Math.max(1, Math.min(50, Math.round(Number(i.qty) || 1))), cat: m.cat } : null; }).filter(Boolean);
+      if (!lines.length) return { error: "None of these items are on the menu any more — please reject the order." };
+      const total = roItemsTotal(lines);
+      const ok = await RoomOrderOps.move(roToken, o, "pending", {
+        status: "approved", decidedAt: Date.now(), decidedBy: RoomOrderOps.by(user), chargeOrderId: "tab:" + table,
+        items: lines.map(l => ({ id: l.id, name: l.name, price: l.price, qty: l.qty })), total, log: RoomOrderOps.log(o, "approved", user)
+      });
+      if (!ok) return { error: "The guest changed or cancelled this order just now — please check it again." };
+      await TableTabs.addOrder(table, { qr: o.id, at: Date.now(), items: lines, total });
+      AuditLog.add("TABLE_QR_APPROVE", "Table " + table + " · " + fmtMoney(total));
+      return { ok: true };
+    }
+    const bk = bookings.find(b => b.status === "active" && String(b.roomId) === String(o.room));
+    if (!bk) return { error: "Room " + o.room + " is not checked in." };
+    const menu = await MenuStore.refresh();
+    const lines = (o.items || []).map(i => { const m = menu.find(x => x.id === i.id); return m ? { id: m.id, name: m.name, price: m.price, qty: Math.max(1, Math.min(50, Math.round(Number(i.qty) || 1))), cat: m.cat, sub: m.sub || "" } : null; }).filter(Boolean);
+    if (!lines.length) return { error: "None of these items are on the menu any more — please reject the order." };
+    const charges = makeChargeItems(lines, { src: "room", user });
+    charges.forEach(c => { c.qr = o.id; });
+    const total = roItemsTotal(lines);
+    const ok = await RoomOrderOps.move(roToken, o, "pending", {
+      status: "approved", decidedAt: Date.now(), decidedBy: RoomOrderOps.by(user), bookingId: bk.id, chargeOrderId: charges[0].orderId,
+      items: lines.map(l => ({ id: l.id, name: l.name, price: l.price, qty: l.qty })), total, log: RoomOrderOps.log(o, "approved", user)
+    });
+    if (!ok) return { error: "The guest changed or cancelled this order just now — please check it again." };
+    await handleAddCharge(bk.id, charges);
+    AuditLog.add("ROOM_QR_APPROVE", "Room " + o.room + " · " + fmtMoney(total));
+    return { ok: true };
+  };
+  // An approved order the guest cancels comes off the room bill again
+  // (moved to voidedCharges, never silently deleted). One device does it.
+  useEffect(() => {
+    if (!roOn || !user || user.role === "Chef") return;
+    roomOrders.filter(o => o.status === "cancelled" && o.chargeOrderId && !o.unbilledAt).forEach(async o => {
+      try {
+        let claimed = false;
+        const ref = roOrderRef(roToken, o.id);
+        await window._db.runTransaction(async t => {
+          const sn = await t.get(ref); if (!sn.exists) return;
+          const cur = sn.data(); if (cur.status !== "cancelled" || cur.unbilledAt) return;
+          t.set(ref, { ...cur, unbilledAt: Date.now(), updatedAt: Date.now() }); claimed = true;
+        });
+        if (!claimed) return;
+        if (roIsTable(o.room)) {
+          await TableTabs.removeOrder(String(o.room).slice(2), o.id);
+          AuditLog.add("TABLE_QR_CANCEL_UNBILL", roWhere(o.room) + " · " + fmtMoney(o.total));
+          return;
+        }
+        const b = bookings.find(x => x.id === o.bookingId);
+        if (!b || b.status !== "active") return;
+        const gone = (b.charges || []).filter(c => c && c.orderId === o.chargeOrderId);
+        if (!gone.length) return;
+        const at = new Date().toISOString();
+        await saveBk(bookings.map(x => x.id === b.id ? { ...x, charges: (x.charges || []).filter(c => !(c && c.orderId === o.chargeOrderId)), voidedCharges: [...(x.voidedCharges || []), ...gone.map(c => ({ ...c, voidBy: o.cancelledBy === "guest" ? "Guest (room QR)" : RoomOrderOps.by(user), voidAt: at, voidReason: "Room QR order cancelled" }))] } : x));
+        AuditLog.add("ROOM_QR_CANCEL_UNBILL", "Room " + o.room + " · " + fmtMoney(o.total));
+      } catch (e) { console.warn("unbill:", e && e.message); }
+    });
+  }, [roomOrders]);
   // Driver commission shows as DUE from check-in (first night's rent).
   const syncDriverDue = async (bk) => {
     if (!hasFeature("driver_commission") || !bk || !bk.driver || !bk.driver.id || !(Number(bk.driver.pct) > 0)) return;
@@ -15337,7 +16395,9 @@ function App() {
     onDone: () => setUpdatePwd(false)
   }), hasFeature("restaurant") && /*#__PURE__*/React.createElement("div", {
     style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
-  }, /*#__PURE__*/React.createElement(KotPrinterCard, null), user.role === "Owner" && /*#__PURE__*/React.createElement(RestaurantStaffLoginCard, null)));
+  }, /*#__PURE__*/React.createElement(KotPrinterCard, null), user.role === "Owner" && /*#__PURE__*/React.createElement(RestaurantStaffLoginCard, null),
+    user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "captain", role: "Captain", title: "🧑‍✈️ Captain login", desc: "sees approved room orders, prints the KOT and marks orders served (Room Orders + Kitchen only)." }),
+    user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "chef", role: "Chef", title: "👨‍🍳 Chef login", desc: "sees only the Kitchen screen and updates the order status." })));
   // Owner-deleted entries stay only as small stubs (status "deleted") so other
   // devices can't bring them back — every screen works without them.
   const viewBookings = bookings.filter(b => b && b.status !== "deleted");
@@ -15529,6 +16589,13 @@ function App() {
     openHtmlBill: bill => setInvoiceView({ kind: "rbill", bill, label: bill.id, html: buildRestaurantBillHTML(bill) })
   }), view === "drivers" && hasFeature("driver_commission") && /*#__PURE__*/React.createElement(DriversView, {
     user: user
+  }), view === "orders" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(RoomOrdersView, {
+    user: user, orders: roomOrders, token: profile.roomOrderToken || "", profile: profile, rooms: rooms, bookings: viewBookings,
+    onApprove: handleRoomOrderApprove,
+    onSaveToken: t => saveProfile({ ...profile, roomOrderToken: t }),
+    onSaveTables: (list, tok) => saveProfile({ ...profile, restaurantTables: list, ...(tok ? { roomOrderToken: tok } : {}) })
+  }), view === "kitchen" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(KitchenView, {
+    user: user, orders: roomOrders, token: profile.roomOrderToken || ""
   }), view === "none" && /*#__PURE__*/React.createElement("div", {
     style: { padding: 28, textAlign: "center", color: "var(--muted)", fontSize: 14 }
   }, "No sections are enabled for your login yet. Please contact the Owner."), invoiceView && /*#__PURE__*/React.createElement("div", {
@@ -15587,7 +16654,8 @@ function App() {
     view: view,
     setView: setView,
     role: user?.role,
-    permissions: permissions
+    permissions: permissions,
+    badges: roBadges
   })), modal?.type === "booking" && liveB && /*#__PURE__*/React.createElement(BookingModal, {
     b: liveB,
     room: modal.room,
@@ -15635,9 +16703,26 @@ function App() {
           setUser(nu);
         }
       }
-      const { _selfName, ...rest } = p;
-      saveProfile(rest);
+      // Save ONLY the fields this person actually changed, on top of the
+      // latest hotel profile this device has (which follows the cloud).
+      // Re-writing the whole form used to put back any detail that had been
+      // changed meanwhile on another device (e.g. the Manager saving their
+      // own name could undo the Owner's new address/logo).
+      const { _selfName, _initial, ...rest } = p;
+      const same = (a, b) => JSON.stringify(a == null ? null : a) === JSON.stringify(b == null ? null : b);
+      const changed = {};
+      Object.keys(rest).forEach(k => { if (!same(rest[k], (_initial || {})[k])) changed[k] = rest[k]; });
       setModal(null);
+      if (!Object.keys(changed).length) return;
+      (async () => {
+        let latest = null;
+        try {
+          const ref = WS._ref("profile");
+          if (ref) { const sn = await Promise.race([ref.get({ source: "server" }), new Promise((_, rj) => setTimeout(() => rj(new Error("timeout")), 6000))]); if (sn && sn.exists) latest = sn.data().value; }
+        } catch (e) { /* offline: build on this device's copy */ }
+        const base = latest && typeof latest === "object" && !Array.isArray(latest) ? { ...profile, ...latest } : profile;
+        await saveProfile({ ...base, ...changed });
+      })();
     },
     onClose: () => setModal(null)
   }));
@@ -15648,8 +16733,17 @@ function App() {
 // instead of the normal staff app — no login, no phone-verification,
 // nothing staff-only reachable from this path.
 const _bookParam = new URLSearchParams(window.location.search).get("book");
+const _orderParam = new URLSearchParams(window.location.search).get("order");
+const _roomParam = new URLSearchParams(window.location.search).get("room");
+const _tableParam = new URLSearchParams(window.location.search).get("table");
 const root = ReactDOM.createRoot(document.getElementById('root'));
-if (_bookParam) {
+if (_orderParam && _tableParam && cleanTableName(_tableParam)) {
+  // Restaurant table QR ordering (guest) — same public token as the room QR.
+  root.render(/*#__PURE__*/React.createElement(RoomOrderPage, { token: _orderParam.trim(), table: cleanTableName(_tableParam) }));
+} else if (_orderParam && _roomParam) {
+  // Room QR ordering (guest) — a PUBLIC token, never a license key.
+  root.render(/*#__PURE__*/React.createElement(RoomOrderPage, { token: _orderParam.trim(), room: String(_roomParam).trim().slice(0, 12) }));
+} else if (_bookParam) {
   // The param is a PUBLIC BOOKING TOKEN (see PublicBookingPage), not a
   // license key. Passed through as-is apart from trimming whitespace —
   // the token's alphabet is fixed-case, so unlike the old license-key
