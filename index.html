@@ -13408,6 +13408,10 @@ function BottomNav({
     icon: "🛺",
     label: "Drivers"
   }, {
+    id: "banquet",
+    icon: "🎉",
+    label: "Banquet"
+  }, {
     id: "orders",
     icon: "🛎️",
     label: "Room Orders"
@@ -13422,7 +13426,7 @@ function BottomNav({
   // plan won't see those tabs even if their role would otherwise allow it.
   const isOwner = role === "Owner";
   const allowed = isOwner ? baseItems.map(i => i.id) : permsFor(permissions, role);
-  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant"), drivers: hasFeature("driver_commission"), orders: hasFeature("qr_any"), kitchen: hasFeature("qr_any") };
+  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant"), drivers: hasFeature("driver_commission"), orders: hasFeature("qr_any"), kitchen: hasFeature("qr_any"), banquet: hasFeature("banquet") };
   let items = baseItems.filter(i => (allowed.includes(i.id) || (i.id === "reserve" && allowed.includes("checkin"))) && (planGated[i.id] === undefined || planGated[i.id]));
   if (isOwner && hasFeature("roles")) {
     items = [...items, { id: "access", icon: "🔐", label: "Access" }];
@@ -13512,7 +13516,7 @@ function BottomNav({
 // Default access — Owner always has everything; these control what
 // Manager/Receptionist can see. Owner can change this from Access Control.
 const DEFAULT_PERMISSIONS = {
-  Manager: ["dash", "rooms", "checkin", "billing", "history", "docs", "storage", "restaurant", "orders", "kitchen"],
+  Manager: ["dash", "rooms", "checkin", "billing", "history", "docs", "storage", "restaurant", "orders", "kitchen", "banquet"],
   // QR room ordering (paid add-on "qr_ordering")
   Captain: ["orders", "kitchen"],
   Chef: ["kitchen"],
@@ -13524,17 +13528,19 @@ const DEFAULT_PERMISSIONS = {
 // A role's allowed views. Hotels that saved permissions before a role
 // existed (e.g. Restaurant) fall back to that role's defaults.
 function permsFor(permissions, role) {
-  const p = permissions && permissions[role];
+  let p = permissions && permissions[role];
   if (!Array.isArray(p)) return DEFAULT_PERMISSIONS[role] || [];
   // Room Orders / Kitchen arrived after many hotels had already saved their
   // access rules: a Manager list saved before then gets them (the Manager
   // approves room orders). Lists saved from now on carry "qrv1", so an
   // Owner who switches them off for the Manager is respected.
-  if (role === "Manager" && p.indexOf("qrv1") < 0) return p.concat(["orders", "kitchen"].filter(v => p.indexOf(v) < 0));
+  if (role === "Manager" && p.indexOf("qrv1") < 0) p = p.concat(["orders", "kitchen"].filter(v => p.indexOf(v) < 0));
+  // Banquet (v5.31) — same idea, marker "bqv1"
+  if (role === "Manager" && p.indexOf("bqv1") < 0 && p.indexOf("banquet") < 0) p = p.concat(["banquet"]);
   return p;
 }
 // Views that also need a plan feature / paid add-on.
-const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant", drivers: "driver_commission", orders: "qr_any", kitchen: "qr_any" };
+const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant", drivers: "driver_commission", orders: "qr_any", kitchen: "qr_any", banquet: "banquet" };
 const ALL_FEATURES = [
   { id: "dash", label: "Dashboard", icon: "📊" },
   { id: "rooms", label: "Rooms", icon: "🏨" },
@@ -13545,6 +13551,7 @@ const ALL_FEATURES = [
   { id: "storage", label: "Storage", icon: "💾" },
   { id: "restaurant", label: "Restaurant", icon: "🍽️" },
   { id: "drivers", label: "Drivers", icon: "🛺" },
+  { id: "banquet", label: "Banquet", icon: "🎉" },
   { id: "orders", label: "Room Orders", icon: "🛎️" },
   { id: "kitchen", label: "Kitchen", icon: "👨‍🍳" }
 ];
@@ -14065,6 +14072,427 @@ function RoomQrCard({ profile, rooms, onSaveToken }) {
           _h("button", { className: "btn-s", onClick: () => { const r = (rooms || [])[0]; if (r) window.open(link(r.id), "_blank"); }, style: { flex: "1 1 120px" } }, "👀 Preview guest page"))),
     msg && !msg.ok && _h("div", { role: "alert", style: { fontSize: 12, color: "#b91c1c", marginTop: 8 } }, msg.reason === "permission-denied" ? "Could not turn on: the Firebase rules for room ordering are not published yet. Please publish the new firestore.rules in the Firebase Console, then try again." : "Could not turn on: " + msg.detail),
     msg && msg.ok && _h("div", { role: "status", style: { fontSize: 12, color: "#166534", marginTop: 8 } }, "✅ QR ordering is on. Print the QR codes for the rooms."));
+}
+
+// ── BANQUET (paid add-on "banquet") ──────────────────────────────────
+// Per-plate party business: quotation → booking (hall + date + slot,
+// double booking blocked) → advances with receipts → final bill on the
+// actual guests (never below the guaranteed number) → dues.
+// Storage: hotels/<KEY>/data/banquet_cfg (halls, GST, terms) and one
+// document per event YEAR, bq_<YYYY> (keeps each doc far below 1 MiB).
+const BQ_SLOTS = ["Lunch", "Dinner", "Full day"];
+const BQ_TYPES = ["Wedding", "Reception", "Engagement", "Birthday", "Anniversary", "Corporate", "Kitty party", "Other"];
+const BQ_PAY_MODES = ["Cash", "UPI", "Card", "Bank Transfer", "Cheque"];
+const BQ_DEFAULT_CFG = { halls: [], gstRate: 0.18, inclusive: false, sac: "996334", terms: "50% advance to confirm the booking; balance before the event.\nFinal bill on actual guests, not below the guaranteed number.\nAdvance is not refundable on cancellation within 15 days of the event." };
+const BQ = {
+  CFG: "banquet_cfg",
+  yk(y) { return "bq_" + y; },
+  yearOf(date) { return String(date || localDateStr()).slice(0, 4); },
+  async getDoc(k, dflt) {
+    try { const v = await WS.get(k, true); if (v != null) return v; } catch (e) {}
+    try { const v = JSON.parse(localStorage.getItem("ab_" + k) || "null"); if (v != null) return v; } catch (e) {}
+    return dflt;
+  },
+  async cfg() { const c = await this.getDoc(this.CFG, null); return { ...BQ_DEFAULT_CFG, ...(c && typeof c === "object" ? c : {}) }; },
+  async saveCfg(c) { await WS.set(this.CFG, c); return c; },
+  async events() {
+    const y = new Date().getFullYear(), out = [];
+    for (const yr of [y - 1, y, y + 1, y + 2]) { const v = await this.getDoc(this.yk(yr), []); if (Array.isArray(v)) out.push(...v); }
+    return out;
+  },
+  // transaction on the year document (two counters cannot overwrite each other)
+  async tx(k, fn) {
+    if (window._db) {
+      try {
+        const ref = WS._ref(k);
+        const next = await window._db.runTransaction(async t => {
+          const sn = await t.get(ref);
+          const cur = (sn.exists && Array.isArray(sn.data().value)) ? sn.data().value : [];
+          const n = fn(cur.slice());
+          t.set(ref, { value: cloudSafe(n), ts: Date.now() });
+          return n;
+        });
+        try { localStorage.setItem("ab_" + k, JSON.stringify(next)); } catch (e) {}
+        return next;
+      } catch (e) { console.warn("banquet transaction failed, saving via normal sync:", e.message); }
+    }
+    const cur = await this.getDoc(k, []);
+    const n = fn(Array.isArray(cur) ? cur.slice() : []);
+    await WS.set(k, n);
+    return n;
+  },
+  // save an event; if its date moved to another year it moves documents
+  async upsert(ev, oldDate) {
+    const ny = this.yearOf(ev.date), oy = oldDate ? this.yearOf(oldDate) : ny;
+    if (oy !== ny) await this.tx(this.yk(oy), arr => arr.filter(x => x.id !== ev.id));
+    await this.tx(this.yk(ny), arr => { const i = arr.findIndex(x => x.id === ev.id); if (i >= 0) arr[i] = ev; else arr.push(ev); return arr; });
+    return ev;
+  },
+  // change one event safely on the latest copy (payments, status …)
+  async patch(ev, fn) {
+    let out = null;
+    await this.tx(this.yk(this.yearOf(ev.date)), arr => { const i = arr.findIndex(x => x.id === ev.id); if (i >= 0) { arr[i] = fn({ ...arr[i] }); out = arr[i]; } return arr; });
+    return out;
+  }
+};
+const bqNum = v => Math.max(0, Math.round(Number(v) || 0));
+// all money of an event; final=true uses the billed guests
+function bqCalc(ev, cfg) {
+  const rate = ev.gstRate != null ? Number(ev.gstRate) : Number((cfg || BQ_DEFAULT_CFG).gstRate);
+  const inclusive = ev.inclusive != null ? !!ev.inclusive : !!(cfg || BQ_DEFAULT_CFG).inclusive;
+  const fin = ev.final || null;
+  const pax = bqNum(ev.pax);
+  const billedPax = fin ? Math.max(pax, bqNum(fin.actualPax)) : pax;
+  const plates = billedPax * bqNum(ev.platePrice);
+  const extras = (ev.extras || []).reduce((t, x) => t + bqNum(x.amt), 0) + (fin ? (fin.extra || []).reduce((t, x) => t + bqNum(x.amt), 0) : 0);
+  const hallRent = bqNum(ev.hallRent), discount = bqNum(ev.discount);
+  const sub = Math.max(0, plates + hallRent + extras - discount);
+  const taxable = inclusive ? Math.round(sub / (1 + rate)) : sub;
+  const gst = inclusive ? sub - taxable : Math.round(sub * rate);
+  const cs = splitCgstSgst(gst);
+  const total = taxable + gst;
+  const paid = (ev.payments || []).reduce((t, p) => t + (Number(p.amt) || 0), 0);
+  return { rate, inclusive, pax, billedPax, plates, extras, hallRent, discount, sub, taxable, gst, cgst: cs.cgst, sgst: cs.sgst, total, paid, due: Math.max(0, total - paid) };
+}
+function bqSlotsClash(a, b) { return a === b || a === "Full day" || b === "Full day"; }
+// a confirmed (or billed) event already on that hall/date/slot
+function bqClash(events, ev) {
+  return (events || []).find(x => x.id !== ev.id && (x.status === "booked" || x.status === "done") && x.date === ev.date && String(x.hallId || "") === String(ev.hallId || "") && bqSlotsClash(x.slot, ev.slot)) || null;
+}
+function bqHallName(cfg, id) { const h = ((cfg && cfg.halls) || []).find(x => x.id === id); return h ? h.name : (id ? "Hall" : "—"); }
+function bqFmtDate(d) { try { return new Date(d + "T00:00:00").toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short", year: "numeric" }); } catch (e) { return d; } }
+// Quotation / booking confirmation / receipt / tax invoice (print + PDF share)
+function buildBanquetHTML(kind, ev, cfg, pay) {
+  const P = CURRENT_PROFILE || {}, c = bqCalc(ev, cfg), name = P.hotelName || HOTEL.name, logo = invoiceLogo();
+  const title = kind === "bill" ? "TAX INVOICE — BANQUET" : kind === "receipt" ? "PAYMENT RECEIPT" : ev.status === "quote" ? "QUOTATION" : "BOOKING CONFIRMATION";
+  const no = kind === "bill" ? (ev.final && ev.final.billNo) : kind === "receipt" ? pay.receiptNo : ev.id;
+  const dt = kind === "bill" ? (ev.final && ev.final.date) : kind === "receipt" ? pay.date : ev.createdOn;
+  const pct = (c.rate * 100 / 2).toFixed(1).replace(/\.0$/, "");
+  const row = (a, b, q, r) => "<tr><td>" + a + "</td><td class=num>" + (q != null ? escHtml(q) : "") + "</td><td class=num>" + (r != null ? inrAmt(r) : "") + "</td><td class=num>" + inrAmt(b) + "</td></tr>";
+  let rows = row(escHtml((ev.packageName || "Food — per plate") + (kind === "bill" && ev.final && bqNum(ev.final.actualPax) !== c.pax ? " (actual " + bqNum(ev.final.actualPax) + ", guaranteed " + c.pax + ")" : "")), c.plates, c.billedPax, bqNum(ev.platePrice));
+  if (c.hallRent) rows += row("Hall rent — " + escHtml(bqHallName(cfg, ev.hallId)), c.hallRent);
+  (ev.extras || []).forEach(x => { if (bqNum(x.amt)) rows += row(escHtml(x.name), bqNum(x.amt)); });
+  if (kind === "bill" && ev.final) (ev.final.extra || []).forEach(x => { if (bqNum(x.amt)) rows += row(escHtml(x.name), bqNum(x.amt)); });
+  if (c.discount) rows += "<tr><td>Discount</td><td></td><td></td><td class=num>− " + inrAmt(c.discount) + "</td></tr>";
+  const pays = (ev.payments || []).map(p => "<div><span>" + escHtml(p.date) + " · " + escHtml(p.mode) + (p.receiptNo ? " · " + escHtml(p.receiptNo) : "") + "</span><b>" + inrAmt(p.amt) + "</b></div>").join("");
+  const head = "<div class=hd>" + (logo ? "<img src=\"" + logo + "\" class=lg>" : "") + "<div class=hn>" + escHtml(name) + "</div><div class=ad>" + escHtml(String(P.hotelAddr || "").replace(/\n/g, ", ")) + "</div><div class=ad>" + [P.hotelGstin ? "GSTIN: " + escHtml(P.hotelGstin) : "", P.hotelPhone ? "Ph: " + escHtml(P.hotelPhone) : ""].filter(Boolean).join(" | ") + "</div></div>" +
+    "<div class=tt><b>" + title + "</b><span>No: " + escHtml(no || "") + "<br>Date: " + escHtml(dt || "") + "</span></div>" +
+    "<div class=mt><b>" + escHtml(ev.client && ev.client.name) + "</b>" + (ev.client && ev.client.phone ? " · " + escHtml(ev.client.phone) : "") + (ev.client && ev.client.gstin ? "<br>GSTIN: " + escHtml(ev.client.gstin) : "") + (ev.client && ev.client.addr ? "<br>" + escHtml(ev.client.addr) : "") +
+    "<br>Event: <b>" + escHtml(ev.type || "") + "</b> on <b>" + escHtml(bqFmtDate(ev.date)) + "</b> (" + escHtml(ev.slot) + ") · " + escHtml(bqHallName(cfg, ev.hallId)) + "<br>Guaranteed guests: <b>" + c.pax + "</b></div>";
+  let bodyHtml;
+  if (kind === "receipt") {
+    bodyHtml = "<div class=tot><div class=g><span>Received</span><span>" + inrAmt(pay.amt) + "</span></div><div><span>Mode</span><b>" + escHtml(pay.mode) + "</b></div>" + (pay.note ? "<div><span>Note</span><b>" + escHtml(pay.note) + "</b></div>" : "") +
+      "<div><span>Event total</span><b>" + inrAmt(c.total) + "</b></div><div><span>Total received till now</span><b>" + inrAmt(c.paid) + "</b></div><div><span>Balance due</span><b>" + inrAmt(c.due) + "</b></div></div>";
+  } else {
+    bodyHtml = "<table><tr><th>Particulars</th><th class=num>Qty</th><th class=num>Rate</th><th class=num>Amount</th></tr>" + rows + "</table>" +
+      "<div class=tot><div><span>Taxable value (SAC " + escHtml((cfg && cfg.sac) || "996334") + ")</span><b>" + inrAmt(c.taxable) + "</b></div><div><span>CGST @ " + pct + "%</span><b>" + inrAmt(c.cgst) + "</b></div><div><span>SGST @ " + pct + "%</span><b>" + inrAmt(c.sgst) + "</b></div>" +
+      "<div class=g><span>" + (kind === "bill" ? "Invoice total" : "Estimated total") + "</span><span>" + inrAmt(c.total) + "</span></div>" + (pays ? "<div class=sb>Payments received</div>" + pays + "<div class=g><span>Balance due</span><span>" + inrAmt(c.due) + "</span></div>" : "") + "</div>" +
+      (ev.menu ? "<div class=mn><b>Menu</b><br>" + escHtml(ev.menu).replace(/\n/g, "<br>") + "</div>" : "") +
+      (kind !== "bill" && cfg && cfg.terms ? "<div class=mn><b>Terms</b><br>" + escHtml(cfg.terms).replace(/\n/g, "<br>") + "</div>" : "");
+  }
+  const share = (kind === "bill" ? "🧾 *Banquet bill* " : kind === "receipt" ? "✅ *Payment received* " : "🎉 *" + title.charAt(0) + title.slice(1).toLowerCase() + "* ") + (no || "") + "\n" + name + "\n" + (ev.type || "") + " · " + bqFmtDate(ev.date) + " (" + ev.slot + ")\n" + (kind === "receipt" ? "Received: ₹" + pay.amt + "\nBalance due: ₹" + c.due : "Total: ₹" + c.total + (c.paid ? "\nPaid: ₹" + c.paid + "\nBalance: ₹" + c.due : ""));
+  return "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + escHtml(title + " " + (no || "")) + "</title><style>" +
+    "*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:#e8e8e8;padding:16px}.sheet{max-width:640px;margin:0 auto;background:#fff;border:2px solid #000}" +
+    ".actbar{display:flex;gap:10px;padding:12px;background:#e8e8e8}.actbtn{flex:1;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer}.p{background:#1e3a5f;color:#fff}.s{background:#25d366;color:#fff}" +
+    ".hd{text-align:center;padding:12px;border-bottom:2px solid #000}.lg{max-height:54px;max-width:160px;margin-bottom:4px}.hn{font-size:22px;font-weight:700;color:#1e3a5f}.ad{font-size:11px;color:#444;margin-top:3px}" +
+    ".tt{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #000;font-size:12px}.tt b{font-size:15px;color:#1e3a5f}.tt span{text-align:right}" +
+    ".mt{padding:8px 12px;font-size:12.5px;border-bottom:1px solid #000;line-height:1.7}table{width:100%;border-collapse:collapse}th{background:#f0f0f0;font-size:11px;padding:6px;border-bottom:1px solid #000;text-align:left}td{padding:6px;font-size:12.5px;border-bottom:1px solid #ddd}.num{text-align:right}" +
+    ".tot{padding:8px 12px;font-size:12.5px}.tot div{display:flex;justify-content:space-between;padding:2px 0}.g{font-size:16px;font-weight:700;border-top:1px solid #000;margin-top:4px;padding-top:4px;color:#1e3a5f}.sb{font-weight:700;margin-top:8px;font-size:12px;color:#555}" +
+    ".mn{padding:8px 12px;font-size:11.5px;border-top:1px solid #000;line-height:1.6}.sg{display:flex;justify-content:space-between;padding:28px 12px 10px;font-size:11px;border-top:1px solid #000}" +
+    "@media print{body{padding:0;background:#fff}.actbar{display:none}.sheet{border:none}}</style>" +
+    "<script>if (window.self !== window.top) { document.write('<style>.actbar{display:none!important}<\\/style>'); }<\/script></head><body><div class=sheet>" +
+    "<div class=actbar><button class='actbtn p' onclick='window.print()'>🖨️ Print</button><button class='actbtn s' onclick='shareBill()'>📤 WhatsApp</button></div>" +
+    head + bodyHtml + "<div class=sg><span>Client signature</span><span>For " + escHtml(name) + "<br><br>Authorised signatory</span></div></div>" +
+    "<script>function shareBill(){var t=" + jsonForScript(share) + ";if(navigator.share){navigator.share({title:'Banquet',text:t}).catch(function(){})}else{window.open('https://wa.me/?text='+encodeURIComponent(t),'_blank')}}<\/script></body></html>";
+}
+const BQ_STATUS = { quote: ["Quotation", "#b45309", "#fef3c7"], booked: ["Booked", "#1d4ed8", "#dbeafe"], done: ["Billed", "#166534", "#dcfce7"], cancelled: ["Cancelled", "#6b7280", "#f3f4f6"] };
+function bqChip(s) { const m = BQ_STATUS[s] || [s, "#333", "#eee"]; return React.createElement("span", { "data-t": "bq-status", style: { fontSize: 11.5, fontWeight: 700, color: m[1], background: m[2], borderRadius: 20, padding: "2px 9px", whiteSpace: "nowrap" } }, m[0]); }
+
+function BanquetView({ user, openHtml }) {
+  const _h = React.createElement;
+  const boss = user && (user.role === "Owner" || user.role === "Manager");
+  const by = String((user && (user.name || user.u)) || "").slice(0, 40);
+  const [cfg, setCfg] = useState(BQ_DEFAULT_CFG);
+  const [events, setEvents] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("cal");
+  const [month, setMonth] = useState(() => localDateStr().slice(0, 7));
+  const [day, setDay] = useState("");
+  const [edit, setEdit] = useState(null);     // event being edited (copy)
+  const [openId, setOpenId] = useState("");   // event detail
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const load = async () => { const [c, e] = await Promise.all([BQ.cfg(), BQ.events()]); setCfg(c); setEvents(e); setLoaded(true); };
+  useEffect(() => { load().catch(() => setLoaded(true)); const iv = setInterval(() => { if (!document.hidden && !edit) load().catch(() => {}); }, 30000); return () => clearInterval(iv); }, []);
+  const flash = t => { setMsg(t); setTimeout(() => setMsg(""), 3000); };
+  const field = { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 14, background: "#fff" };
+  const lab = (t, el) => _h("label", { style: { display: "block", fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, t, _h("div", { style: { marginTop: 3 } }, el));
+  const halls = cfg.halls || [];
+  const newEvent = date => ({ id: "", status: "quote", client: { name: "", phone: "", gstin: "", addr: "" }, type: "Wedding", date: date || localDateStr(), slot: "Dinner", hallId: halls[0] ? halls[0].id : "", pax: "", platePrice: "", packageName: "", menu: "", hallRent: halls[0] ? bqNum(halls[0].rent) : "", extras: [], discount: "", notes: "", payments: [] });
+
+  // ── editor ─────────────────────────────────────────────────────────
+  if (edit) {
+    const ev = edit, set = p => setEdit({ ...ev, ...p }), setC = p => setEdit({ ...ev, client: { ...ev.client, ...p } });
+    const c = bqCalc(ev, cfg), clash = bqClash(events, ev), hall = halls.find(h => h.id === ev.hallId);
+    const save = async () => {
+      if (!String(ev.client.name).trim()) { alert("Enter the client's name"); return; }
+      if (String(ev.client.phone).replace(/\D/g, "").length < 10) { alert("Enter a 10-digit phone number"); return; }
+      if (!ev.date) { alert("Choose the event date"); return; }
+      if (halls.length && !ev.hallId) { alert("Choose the hall"); return; }
+      if (!(bqNum(ev.pax) > 0) || !(bqNum(ev.platePrice) > 0)) { alert("Enter guests and the per-plate rate"); return; }
+      if (clash && ev.status !== "quote") { alert("This hall is already booked on " + bqFmtDate(ev.date) + " (" + clash.slot + ") for " + clash.client.name + ". Choose another hall, date or slot."); return; }
+      setBusy(true);
+      try {
+        const old = events.find(x => x.id === ev.id);
+        const id = ev.id || await generateDocumentNumber("BQ");
+        const out = { ...ev, id, pax: bqNum(ev.pax), platePrice: bqNum(ev.platePrice), hallRent: bqNum(ev.hallRent), discount: bqNum(ev.discount),
+          extras: (ev.extras || []).filter(x => String(x.name || "").trim() || bqNum(x.amt)).map(x => ({ name: String(x.name || "Extra").trim().slice(0, 60), amt: bqNum(x.amt) })),
+          client: { name: String(ev.client.name).trim().slice(0, 80), phone: String(ev.client.phone).trim().slice(0, 20), gstin: String(ev.client.gstin || "").trim().toUpperCase().slice(0, 15), addr: String(ev.client.addr || "").trim().slice(0, 200) },
+          packageName: String(ev.packageName || "").slice(0, 80), menu: String(ev.menu || "").slice(0, 1500), notes: String(ev.notes || "").slice(0, 500),
+          gstRate: ev.gstRate != null ? ev.gstRate : cfg.gstRate, inclusive: ev.inclusive != null ? ev.inclusive : cfg.inclusive,
+          createdOn: ev.createdOn || localDateStr(), createdBy: ev.createdBy || by, updatedAt: Date.now() };
+        await BQ.upsert(out, old && old.date);
+        AuditLog.add(ev.id ? "BANQUET_EDIT" : "BANQUET_QUOTE", id + " · " + out.client.name + " · " + out.date + " · " + fmtMoney(bqCalc(out, cfg).total));
+        await load(); setEdit(null); setOpenId(id); flash(ev.id ? "Saved" : "Quotation " + id + " created");
+      } catch (e) { alert("Could not save: " + e.message); } finally { setBusy(false); }
+    };
+    const row2 = (a, b) => _h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 } }, a, b);
+    return _h("div", { className: "scrollable hs", "data-t": "bq-editor", style: { height: "100%", overflowY: "auto", padding: "14px 14px 30px", boxSizing: "border-box" } },
+      _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 } },
+        _h("h2", { style: { fontSize: 19, margin: 0, color: "var(--navy)" } }, ev.id ? "Edit " + ev.id : "New quotation"),
+        _h("button", { className: "btn-s", onClick: () => setEdit(null), style: { width: "auto" } }, "✕ Close")),
+      _h("div", { className: "card", style: { padding: 12, display: "grid", gap: 8, marginBottom: 10 } },
+        _h("b", { style: { color: "var(--navy)" } }, "Client"),
+        row2(lab("Name *", _h("input", { "data-t": "bq-name", value: ev.client.name, onChange: e => setC({ name: e.target.value }), style: field })),
+          lab("Phone *", _h("input", { "data-t": "bq-phone", inputMode: "tel", value: ev.client.phone, onChange: e => setC({ phone: e.target.value }), style: field }))),
+        row2(lab("GSTIN (optional)", _h("input", { value: ev.client.gstin, onChange: e => setC({ gstin: e.target.value }), style: field })),
+          lab("Address (optional)", _h("input", { value: ev.client.addr, onChange: e => setC({ addr: e.target.value }), style: field })))),
+      _h("div", { className: "card", style: { padding: 12, display: "grid", gap: 8, marginBottom: 10 } },
+        _h("b", { style: { color: "var(--navy)" } }, "Event"),
+        row2(lab("Occasion", _h("select", { value: ev.type, onChange: e => set({ type: e.target.value }), style: field }, BQ_TYPES.map(t => _h("option", { key: t }, t)))),
+          lab("Date *", _h("input", { type: "date", "data-t": "bq-date", value: ev.date, onChange: e => set({ date: e.target.value }), style: field }))),
+        row2(lab("Slot", _h("select", { "data-t": "bq-slot", value: ev.slot, onChange: e => set({ slot: e.target.value }), style: field }, BQ_SLOTS.map(t => _h("option", { key: t }, t)))),
+          lab("Hall" + (halls.length ? " *" : ""), halls.length ? _h("select", { "data-t": "bq-hall", value: ev.hallId, onChange: e => { const h = halls.find(x => x.id === e.target.value); set({ hallId: e.target.value, hallRent: h ? bqNum(h.rent) : ev.hallRent }); }, style: field }, halls.map(h => _h("option", { key: h.id, value: h.id }, h.name + (h.cap ? " (" + h.cap + ")" : ""))))
+            : _h("div", { style: { fontSize: 12, color: "#b45309", padding: "8px 0" } }, boss ? "Add halls in Halls & GST" : "No halls set up"))),
+        clash && _h("div", { role: "alert", "data-t": "bq-clash", style: { fontSize: 12.5, color: "#b91c1c", background: "#fee2e2", borderRadius: 8, padding: "8px 10px" } }, "⚠️ Already booked: " + clash.client.name + " (" + clash.id + ") on this hall, date and slot." + (ev.status === "quote" ? " You can save the quotation, but it cannot be confirmed for this slot." : "")),
+        hall && hall.cap && bqNum(ev.pax) > bqNum(hall.cap) && _h("div", { style: { fontSize: 12, color: "#b45309" } }, "Guests are more than the hall capacity (" + hall.cap + ").")),
+      _h("div", { className: "card", style: { padding: 12, display: "grid", gap: 8, marginBottom: 10 } },
+        _h("b", { style: { color: "var(--navy)" } }, "Food & charges"),
+        row2(lab("Guaranteed guests (pax) *", _h("input", { type: "number", min: 1, "data-t": "bq-pax", value: ev.pax, onChange: e => set({ pax: e.target.value }), style: field })),
+          lab("Rate per plate (₹) *", _h("input", { type: "number", min: 0, "data-t": "bq-plate", value: ev.platePrice, onChange: e => set({ platePrice: e.target.value }), style: field }))),
+        lab("Package name", _h("input", { value: ev.packageName, placeholder: "e.g. Silver veg package", onChange: e => set({ packageName: e.target.value }), style: field })),
+        lab("Menu (shows on the quotation)", _h("textarea", { rows: 3, value: ev.menu, placeholder: "Welcome drink, 2 starters, paneer, dal makhani, naan, rice, 2 sweets…", onChange: e => set({ menu: e.target.value }), style: field })),
+        row2(lab("Hall rent (₹)", _h("input", { type: "number", min: 0, "data-t": "bq-rent", value: ev.hallRent, onChange: e => set({ hallRent: e.target.value }), style: field })),
+          lab("Discount (₹)", _h("input", { type: "number", min: 0, "data-t": "bq-discount", value: ev.discount, onChange: e => set({ discount: e.target.value }), style: field }))),
+        _h("div", { style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Extras (decoration, DJ, stage …)"),
+        (ev.extras || []).map((x, i) => _h("div", { key: i, style: { display: "flex", gap: 6 } },
+          _h("input", { "data-t": "bq-extra-name", value: x.name, placeholder: "Item", onChange: e => set({ extras: ev.extras.map((y, j) => j === i ? { ...y, name: e.target.value } : y) }), style: { ...field, flex: 2 } }),
+          _h("input", { "data-t": "bq-extra-amt", type: "number", min: 0, value: x.amt, placeholder: "₹", onChange: e => set({ extras: ev.extras.map((y, j) => j === i ? { ...y, amt: e.target.value } : y) }), style: { ...field, flex: 1 } }),
+          _h("button", { className: "btn-s", "aria-label": "Remove extra", onClick: () => set({ extras: ev.extras.filter((_, j) => j !== i) }), style: { width: "auto" } }, "✕"))),
+        _h("button", { className: "btn-s", "data-t": "bq-add-extra", onClick: () => set({ extras: [...(ev.extras || []), { name: "", amt: "" }] }) }, "+ Add extra"),
+        lab("Internal notes", _h("input", { value: ev.notes, onChange: e => set({ notes: e.target.value }), style: field }))),
+      _h("div", { className: "card", "data-t": "bq-total-box", style: { padding: 12, marginBottom: 10, background: "var(--cream)" } },
+        [["Food (" + c.pax + " × " + fmtMoney(bqNum(ev.platePrice)) + ")", c.plates], ["Hall rent", c.hallRent], ["Extras", c.extras], ["Discount", -c.discount], ["Taxable value", c.taxable], ["GST @ " + Math.round(c.rate * 100) + "%" + (c.inclusive ? " (included)" : ""), c.gst]].map(([a, b]) => _h("div", { key: a, style: { display: "flex", justifyContent: "space-between", fontSize: 13, padding: "2px 0" } }, _h("span", null, a), _h("span", null, (b < 0 ? "− " : "") + fmtMoney(Math.abs(b))))),
+        _h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 17, fontWeight: 800, borderTop: "1px solid var(--border)", marginTop: 4, paddingTop: 6, color: "var(--navy)" } }, _h("span", null, "Total"), _h("span", { "data-t": "bq-total" }, fmtMoney(c.total)))),
+      _h("button", { className: "btn-p", "data-t": "bq-save", disabled: busy, onClick: save, style: { width: "100%" } }, busy ? "Saving…" : ev.id ? "Save changes" : "Save quotation"));
+  }
+
+  // ── detail ─────────────────────────────────────────────────────────
+  const cur = openId ? events.find(x => x.id === openId) : null;
+  if (cur) return _h(BanquetDetail, { ev: cur, cfg, events, user, by, boss, openHtml, onBack: () => setOpenId(""), onEdit: () => setEdit(JSON.parse(JSON.stringify(cur))), reload: load, flash });
+
+  // ── lists ──────────────────────────────────────────────────────────
+  const today = localDateStr();
+  const live = events.filter(e => e.status !== "cancelled");
+  const quotes = events.filter(e => e.status === "quote").sort((a, b) => a.date.localeCompare(b.date));
+  const bookings = events.filter(e => e.status === "booked" || e.status === "done").sort((a, b) => a.date.localeCompare(b.date));
+  const dues = bookings.map(e => ({ e, c: bqCalc(e, cfg) })).filter(x => x.c.due > 0).sort((a, b) => a.e.date.localeCompare(b.e.date));
+  const card = e => { const c = bqCalc(e, cfg); return _h("div", { key: e.id, className: "card", "data-t": "bq-card", onClick: () => setOpenId(e.id), style: { padding: "11px 13px", marginBottom: 8, cursor: "pointer" } },
+    _h("div", { style: { display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" } }, _h("b", { style: { color: "var(--navy)", fontSize: 14.5 } }, e.client.name), bqChip(e.status)),
+    _h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginTop: 3 } }, e.type + " · " + bqFmtDate(e.date) + " · " + e.slot + " · " + bqHallName(cfg, e.hallId)),
+    _h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 13, marginTop: 5 } }, _h("span", null, c.pax + " pax · " + e.id), _h("span", null, _h("b", null, fmtMoney(c.total)), c.paid > 0 ? _h("span", { style: { color: c.due ? "#b45309" : "#166534" } }, " · due " + fmtMoney(c.due)) : null)),
+    e.status === "quote" && e.date < today && _h("div", { style: { fontSize: 11.5, color: "#b91c1c", marginTop: 3 } }, "Event date has passed")); };
+  const tabBtn = (id, label, n) => _h("button", { key: id, "data-t": "bq-tab-" + id, onClick: () => setTab(id), "aria-pressed": tab === id, style: { flex: "1 0 auto", padding: "8px 12px", borderRadius: 20, border: "1.5px solid " + (tab === id ? "var(--navy)" : "var(--border)"), background: tab === id ? "var(--navy)" : "#fff", color: tab === id ? "#fff" : "var(--navy)", fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", cursor: "pointer" } }, label + (n ? " (" + n + ")" : ""));
+  // calendar
+  const [yy, mm] = month.split("-").map(Number);
+  const first = new Date(yy, mm - 1, 1), days = new Date(yy, mm, 0).getDate(), lead = (first.getDay() + 6) % 7;
+  const ds = d => month + "-" + String(d).padStart(2, "0");
+  const shift = n => { const d = new Date(yy, mm - 1 + n, 1); setMonth(d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0")); setDay(""); };
+  const cal = _h("div", { "data-t": "bq-calendar" },
+    _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", margin: "4px 0 8px" } },
+      _h("button", { className: "btn-s", "aria-label": "Previous month", onClick: () => shift(-1), style: { width: "auto" } }, "‹"),
+      _h("b", { style: { color: "var(--navy)" } }, first.toLocaleDateString("en-IN", { month: "long", year: "numeric" })),
+      _h("button", { className: "btn-s", "aria-label": "Next month", onClick: () => shift(1), style: { width: "auto" } }, "›")),
+    _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 3, fontSize: 11, textAlign: "center", color: "var(--muted)", marginBottom: 3 } }, ["M", "T", "W", "T", "F", "S", "S"].map((d, i) => _h("div", { key: i }, d))),
+    _h("div", { style: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 3 } },
+      Array.from({ length: lead }, (_, i) => _h("div", { key: "x" + i })),
+      Array.from({ length: days }, (_, i) => {
+        const d = ds(i + 1), evs = live.filter(e => e.date === d), bk = evs.filter(e => e.status !== "quote").length, q = evs.length - bk;
+        return _h("button", { key: d, "data-t": "bq-day", "data-date": d, onClick: () => setDay(d), style: { minHeight: 48, borderRadius: 8, border: "1.5px solid " + (day === d ? "var(--navy)" : d === today ? "#f59e0b" : "var(--border)"), background: bk ? "#dbeafe" : q ? "#fef3c7" : "#fff", padding: 2, cursor: "pointer", fontSize: 12.5, color: "var(--navy)" } },
+          _h("div", { style: { fontWeight: 700 } }, i + 1),
+          (bk || q) ? _h("div", { style: { fontSize: 10, color: bk ? "#1d4ed8" : "#b45309", fontWeight: 700 } }, bk ? bk + " bkd" : q + " qt") : null);
+      })),
+    _h("div", { style: { fontSize: 11, color: "var(--muted)", margin: "6px 2px" } }, "Blue = booked, yellow = only quotations. Tap a date."),
+    day && _h("div", { style: { marginTop: 6 } },
+      _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", margin: "4px 2px 8px" } }, _h("b", null, bqFmtDate(day)),
+        _h("button", { className: "btn-p", "data-t": "bq-new-on-day", onClick: () => setEdit(newEvent(day)), style: { width: "auto", padding: "7px 12px" } }, "+ Quotation")),
+      halls.length > 0 && _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 6 } }, halls.map(h => { const taken = live.filter(e => e.date === day && e.hallId === h.id && e.status !== "quote").map(e => e.slot); return h.name + ": " + (taken.length ? "booked " + taken.join(", ") : "free"); }).join(" | ")),
+      live.filter(e => e.date === day).map(card)));
+  const settings = boss && _h(BanquetSettings, { cfg, onSave: async c => { await BQ.saveCfg(c); setCfg(c); AuditLog.add("BANQUET_SETTINGS", (c.halls || []).length + " halls · GST " + Math.round(c.gstRate * 100) + "%"); flash("Saved"); } });
+  return _h("div", { className: "scrollable hs", "data-t": "banquet-view", style: { height: "100%", overflowY: "auto", padding: "14px 14px 30px", boxSizing: "border-box" } },
+    _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 } },
+      _h("div", null, _h("h2", { style: { fontSize: 20, margin: 0, color: "var(--navy)" } }, "🎉 Banquet"),
+        _h("div", { style: { fontSize: 12, color: "var(--muted)", marginTop: 2 } }, bookings.filter(e => e.date >= today).length + " upcoming · due " + fmtMoney(dues.reduce((t, x) => t + x.c.due, 0)))),
+      _h("button", { className: "btn-p", "data-t": "bq-new", onClick: () => setEdit(newEvent(day || "")), style: { width: "auto", padding: "8px 14px" } }, "+ New quotation")),
+    msg && _h("div", { role: "status", style: { margin: "8px 0", padding: "9px 12px", borderRadius: 10, background: "#dcfce7", color: "#166534", fontSize: 13, fontWeight: 600 } }, msg),
+    boss && !halls.length && loaded && _h("div", { style: { margin: "8px 0", padding: "9px 12px", borderRadius: 10, background: "#fef3c7", color: "#92400e", fontSize: 12.5 } }, "First add your halls in Halls & GST, so double booking can be checked."),
+    _h("div", { style: { display: "flex", gap: 6, overflowX: "auto", margin: "10px 0 12px", paddingBottom: 2 } },
+      tabBtn("cal", "📅 Calendar"), tabBtn("quotes", "📝 Quotations", quotes.length), tabBtn("bookings", "🎉 Bookings", bookings.filter(e => e.date >= today).length), tabBtn("due", "💰 Due", dues.length), boss && tabBtn("set", "⚙️ Halls & GST")),
+    !loaded ? _h("div", { style: { color: "var(--muted)", fontSize: 13 } }, "Loading…")
+      : tab === "cal" ? cal
+      : tab === "quotes" ? (quotes.length ? quotes.map(card) : _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No open quotations. Tap + New quotation."))
+      : tab === "bookings" ? _h(React.Fragment, null,
+        bookings.filter(e => e.date >= today).map(card),
+        !bookings.filter(e => e.date >= today).length && _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No upcoming bookings."),
+        bookings.filter(e => e.date < today).length > 0 && _h("div", { style: { fontSize: 12, fontWeight: 700, color: "var(--muted)", margin: "12px 2px 6px" } }, "Past events"),
+        bookings.filter(e => e.date < today).reverse().map(card))
+      : tab === "due" ? _h("div", { "data-t": "bq-due-list" }, dues.length ? dues.map(({ e, c }) => _h("div", { key: e.id, className: "card", "data-t": "bq-due", style: { padding: "11px 13px", marginBottom: 8 } },
+          _h("div", { style: { display: "flex", justifyContent: "space-between" } }, _h("b", { style: { color: "var(--navy)", cursor: "pointer" }, onClick: () => setOpenId(e.id) }, e.client.name), _h("b", { style: { color: "#b45309" } }, fmtMoney(c.due))),
+          _h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginTop: 2 } }, bqFmtDate(e.date) + " · " + e.id + " · total " + fmtMoney(c.total) + " · paid " + fmtMoney(c.paid)),
+          _h("div", { style: { display: "flex", gap: 6, marginTop: 8 } },
+            _h("button", { className: "btn-s", onClick: () => setOpenId(e.id), style: { flex: 1 } }, "Open"),
+            _h("a", { className: "btn-s", href: "https://wa.me/" + (String(e.client.phone).replace(/\D/g, "").length === 10 ? "91" : "") + String(e.client.phone).replace(/\D/g, "") + "?text=" + encodeURIComponent("Namaste " + e.client.name + ", a gentle reminder: balance of ₹" + c.due + " is due for your " + e.type + " on " + bqFmtDate(e.date) + " (" + e.id + "). - " + ((CURRENT_PROFILE && CURRENT_PROFILE.hotelName) || "")), target: "_blank", rel: "noopener", style: { flex: 1, textAlign: "center", textDecoration: "none" } }, "📲 WhatsApp reminder"))))
+        : _h("div", { className: "card", style: { padding: 14, fontSize: 13, color: "var(--muted)" } }, "No dues. 🎉"))
+      : settings);
+}
+
+function BanquetSettings({ cfg, onSave }) {
+  const _h = React.createElement;
+  const [c, setC] = useState(() => JSON.parse(JSON.stringify(cfg)));
+  const [busy, setBusy] = useState(false);
+  const field = { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 14, background: "#fff" };
+  const setH = (i, p) => setC({ ...c, halls: c.halls.map((h, j) => j === i ? { ...h, ...p } : h) });
+  const save = async () => {
+    const halls = (c.halls || []).filter(h => String(h.name || "").trim()).map(h => ({ id: h.id || ("H" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)), name: String(h.name).trim().slice(0, 40), cap: bqNum(h.cap), rent: bqNum(h.rent) }));
+    setBusy(true); try { await onSave({ ...c, halls, sac: String(c.sac || "996334").replace(/\D/g, "").slice(0, 8) || "996334", terms: String(c.terms || "").slice(0, 1500) }); setC(x => ({ ...x, halls })); } catch (e) { alert("Could not save: " + e.message); } finally { setBusy(false); }
+  };
+  return _h("div", { "data-t": "bq-settings" },
+    _h("div", { className: "card", style: { padding: 12, marginBottom: 10, display: "grid", gap: 8 } },
+      _h("b", { style: { color: "var(--navy)" } }, "Halls / lawns"),
+      (c.halls || []).map((h, i) => _h("div", { key: h.id || i, style: { display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: 6 } },
+        _h("input", { "data-t": "bq-hall-name", "aria-label": "Hall name", value: h.name, placeholder: "Name", onChange: e => setH(i, { name: e.target.value }), style: field }),
+        _h("input", { "data-t": "bq-hall-cap", "aria-label": "Capacity", type: "number", value: h.cap, placeholder: "Capacity", onChange: e => setH(i, { cap: e.target.value }), style: field }),
+        _h("input", { "data-t": "bq-hall-rent", "aria-label": "Hall rent", type: "number", value: h.rent, placeholder: "Rent ₹", onChange: e => setH(i, { rent: e.target.value }), style: field }),
+        _h("button", { className: "btn-s", "aria-label": "Remove hall", onClick: () => setC({ ...c, halls: c.halls.filter((_, j) => j !== i) }), style: { width: "auto" } }, "✕"))),
+      _h("button", { className: "btn-s", "data-t": "bq-add-hall", onClick: () => setC({ ...c, halls: [...(c.halls || []), { id: "", name: "", cap: "", rent: "" }] }) }, "+ Add hall")),
+    _h("div", { className: "card", style: { padding: 12, marginBottom: 10, display: "grid", gap: 8 } },
+      _h("b", { style: { color: "var(--navy)" } }, "GST on banquet bills"),
+      _h("div", { style: { display: "flex", gap: 6 } }, [0.05, 0.12, 0.18].map(r => _h("button", { key: r, "data-t": "bq-gst-" + Math.round(r * 100), "aria-pressed": c.gstRate === r, onClick: () => setC({ ...c, gstRate: r }), style: { flex: 1, padding: "9px 6px", borderRadius: 10, border: "1.5px solid " + (c.gstRate === r ? "var(--navy)" : "var(--border)"), background: c.gstRate === r ? "var(--navy)" : "#fff", color: c.gstRate === r ? "#fff" : "var(--navy)", fontWeight: 700, cursor: "pointer" } }, Math.round(r * 100) + "%"))),
+      _h("label", { style: { display: "flex", gap: 8, alignItems: "center", fontSize: 13 } }, _h("input", { type: "checkbox", checked: !!c.inclusive, onChange: e => setC({ ...c, inclusive: e.target.checked }) }), "Plate rate / charges already include GST"),
+      _h("label", { style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "SAC code", _h("input", { value: c.sac, onChange: e => setC({ ...c, sac: e.target.value }), style: { ...field, marginTop: 3 } })),
+      _h("div", { style: { fontSize: 11.5, color: "var(--muted)" } }, "New quotations use this rate. Saved quotations keep the rate they were made with. Please confirm the right rate with your CA.")),
+    _h("div", { className: "card", style: { padding: 12, marginBottom: 10 } },
+      _h("b", { style: { color: "var(--navy)" } }, "Terms on the quotation"),
+      _h("textarea", { rows: 4, value: c.terms, onChange: e => setC({ ...c, terms: e.target.value }), style: { ...field, marginTop: 6 } })),
+    _h("button", { className: "btn-p", "data-t": "bq-settings-save", disabled: busy, onClick: save, style: { width: "100%" } }, busy ? "Saving…" : "Save"));
+}
+
+function BanquetDetail({ ev, cfg, events, user, by, boss, openHtml, onBack, onEdit, reload, flash }) {
+  const _h = React.createElement;
+  const c = bqCalc(ev, cfg);
+  const [pay, setPay] = useState(null);       // {amt, mode, note}
+  const [fin, setFin] = useState(null);       // {actualPax, extra:[]}
+  const [cancel, setCancel] = useState(null); // {reason}
+  const [busy, setBusy] = useState(false);
+  const field = { width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 14, background: "#fff" };
+  const clash = bqClash(events, ev);
+  const run = async fn => { setBusy(true); try { await fn(); await reload(); } catch (e) { alert("Could not save: " + e.message); } finally { setBusy(false); } };
+  const doc = (kind, p) => openHtml((kind === "bill" ? (ev.final && ev.final.billNo) : kind === "receipt" ? p.receiptNo : ev.id) || ev.id, buildBanquetHTML(kind, ev, cfg, p));
+  const confirmBooking = () => run(async () => {
+    const fresh = await BQ.events(); const cl = bqClash(fresh, ev);
+    if (cl) { alert("This hall is already booked on " + bqFmtDate(ev.date) + " (" + cl.slot + ") for " + cl.client.name + " (" + cl.id + "). Edit the quotation to change the hall, date or slot."); return; }
+    await BQ.patch(ev, x => ({ ...x, status: "booked", bookedOn: localDateStr(), bookedBy: by, updatedAt: Date.now() }));
+    AuditLog.add("BANQUET_BOOKED", ev.id + " · " + ev.client.name + " · " + ev.date + " " + ev.slot);
+    flash("Booking confirmed");
+  });
+  const addPay = () => run(async () => {
+    const amt = Math.round(Number(pay.amt) || 0);
+    if (!(amt > 0)) { alert("Enter the amount received"); return; }
+    const receiptNo = await generateDocumentNumber("BR");
+    const p = { id: "P" + Date.now().toString(36), amt, mode: pay.mode, note: String(pay.note || "").slice(0, 120), date: localDateStr(), at: new Date().toISOString(), by, receiptNo };
+    const out = await BQ.patch(ev, x => ({ ...x, payments: [...(x.payments || []), p], updatedAt: Date.now() }));
+    AuditLog.add("BANQUET_PAYMENT", ev.id + " · " + receiptNo + " · " + fmtMoney(amt) + " · " + p.mode);
+    setPay(null); flash("Payment saved — receipt " + receiptNo);
+    if (out) openHtml(receiptNo, buildBanquetHTML("receipt", out, cfg, p));
+  });
+  const makeBill = () => run(async () => {
+    const actual = Math.round(Number(fin.actualPax) || 0);
+    if (!(actual > 0)) { alert("Enter the actual number of guests"); return; }
+    const billNo = await generateDocumentNumber("BB");
+    const final = { actualPax: actual, extra: (fin.extra || []).filter(x => String(x.name || "").trim() && bqNum(x.amt)).map(x => ({ name: String(x.name).trim().slice(0, 60), amt: bqNum(x.amt) })), billNo, date: localDateStr(), by };
+    const out = await BQ.patch(ev, x => ({ ...x, status: "done", final, updatedAt: Date.now() }));
+    AuditLog.add("BANQUET_BILL", ev.id + " · " + billNo + " · " + fmtMoney(bqCalc(out || ev, cfg).total));
+    setFin(null); flash("Bill " + billNo + " made");
+    if (out) openHtml(billNo, buildBanquetHTML("bill", out, cfg));
+  });
+  const doCancel = () => run(async () => {
+    const reason = String(cancel.reason || "").trim();
+    if (reason.length < 3) { alert("Enter the reason"); return; }
+    await BQ.patch(ev, x => ({ ...x, status: "cancelled", cancelReason: reason.slice(0, 160), cancelledBy: by, cancelledOn: localDateStr(), updatedAt: Date.now() }));
+    AuditLog.add("BANQUET_CANCEL", ev.id + " · " + reason);
+    setCancel(null); flash("Cancelled");
+  });
+  const line = (a, b, strong) => _h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: strong ? 16 : 13, fontWeight: strong ? 800 : 400, padding: "2px 0", color: strong ? "var(--navy)" : undefined } }, _h("span", null, a), _h("span", null, b));
+  const btn = (t, label, on, style) => _h("button", { className: "btn-p", "data-t": t, disabled: busy, onClick: on, style: { flex: "1 1 150px", ...(style || {}) } }, label);
+  const btnS = (t, label, on) => _h("button", { className: "btn-s", "data-t": t, disabled: busy, onClick: on, style: { flex: "1 1 130px" } }, label);
+  return _h("div", { className: "scrollable hs", "data-t": "bq-detail", style: { height: "100%", overflowY: "auto", padding: "14px 14px 30px", boxSizing: "border-box" } },
+    _h("button", { className: "btn-s", onClick: onBack, style: { width: "auto", marginBottom: 10 } }, "‹ Back"),
+    _h("div", { className: "card", style: { padding: 13, marginBottom: 10 } },
+      _h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 } }, _h("b", { style: { fontSize: 17, color: "var(--navy)" } }, ev.client.name), bqChip(ev.status)),
+      _h("div", { style: { fontSize: 13, color: "var(--muted)", marginTop: 4, lineHeight: 1.6 } }, ev.id + " · " + ev.client.phone, _h("br"), ev.type + " · " + bqFmtDate(ev.date) + " · " + ev.slot + " · " + bqHallName(cfg, ev.hallId), _h("br"), c.pax + " guaranteed guests × " + fmtMoney(ev.platePrice) + (ev.packageName ? " · " + ev.packageName : "")),
+      ev.notes && _h("div", { style: { fontSize: 12.5, color: "#92400e", marginTop: 4 } }, "Note: " + ev.notes),
+      ev.status === "cancelled" && _h("div", { style: { fontSize: 12.5, color: "#b91c1c", marginTop: 4 } }, "Cancelled on " + ev.cancelledOn + " by " + ev.cancelledBy + ": " + ev.cancelReason + (c.paid ? " · ₹" + c.paid + " was received — settle any refund with the client." : "")),
+      ev.status === "quote" && clash && _h("div", { role: "alert", style: { fontSize: 12.5, color: "#b91c1c", marginTop: 6 } }, "⚠️ This slot is now booked for " + clash.client.name + " — edit the hall/date/slot before confirming.")),
+    _h("div", { className: "card", "data-t": "bq-money", style: { padding: 13, marginBottom: 10 } },
+      ev.final && line("Billed guests (actual " + ev.final.actualPax + ", guaranteed " + c.pax + ")", c.billedPax),
+      line("Food", fmtMoney(c.plates)), c.hallRent > 0 && line("Hall rent", fmtMoney(c.hallRent)), c.extras > 0 && line("Extras", fmtMoney(c.extras)), c.discount > 0 && line("Discount", "− " + fmtMoney(c.discount)),
+      line("GST @ " + Math.round(c.rate * 100) + "%" + (c.inclusive ? " (included)" : ""), fmtMoney(c.gst)),
+      line(ev.final ? "Bill total" : "Total", fmtMoney(c.total), true),
+      line("Received", fmtMoney(c.paid)),
+      _h("div", { "data-t": "bq-due-amt", style: { display: "flex", justifyContent: "space-between", fontWeight: 800, fontSize: 15, color: c.due ? "#b45309" : "#166534", paddingTop: 4 } }, _h("span", null, "Balance due"), _h("span", null, fmtMoney(c.due)))),
+    (ev.payments || []).length > 0 && _h("div", { className: "card", style: { padding: 13, marginBottom: 10 } },
+      _h("b", { style: { fontSize: 13, color: "var(--navy)" } }, "Payments"),
+      ev.payments.map(p => _h("div", { key: p.id, "data-t": "bq-pay-row", style: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, padding: "6px 0", borderBottom: "1px solid var(--border)" } },
+        _h("span", null, p.date + " · " + p.mode + (p.note ? " · " + p.note : ""), _h("br"), _h("span", { style: { fontSize: 11.5, color: "var(--muted)" } }, p.receiptNo + " · by " + p.by)),
+        _h("span", { style: { display: "flex", gap: 6, alignItems: "center" } }, _h("b", null, fmtMoney(p.amt)), _h("button", { className: "btn-s", onClick: () => doc("receipt", p), style: { width: "auto", padding: "4px 8px", fontSize: 12 } }, "🧾"))))),
+    pay && _h("div", { className: "card", "data-t": "bq-pay-form", style: { padding: 13, marginBottom: 10, display: "grid", gap: 8 } },
+      _h("b", null, ev.status === "quote" ? "Advance to confirm" : "Add payment"),
+      _h("input", { type: "number", min: 1, "data-t": "bq-pay-amt", value: pay.amt, onChange: e => setPay({ ...pay, amt: e.target.value }), placeholder: "Amount ₹" + (c.due ? " (due " + c.due + ")" : ""), style: field }),
+      _h("select", { "data-t": "bq-pay-mode", value: pay.mode, onChange: e => setPay({ ...pay, mode: e.target.value }), style: field }, BQ_PAY_MODES.map(m => _h("option", { key: m }, m))),
+      _h("input", { value: pay.note, onChange: e => setPay({ ...pay, note: e.target.value }), placeholder: "Note (UPI ref, cheque no. …)", style: field }),
+      _h("div", { style: { display: "flex", gap: 6 } }, btn("bq-pay-save", "Save & print receipt", addPay), _h("button", { className: "btn-s", onClick: () => setPay(null), style: { width: "auto" } }, "Cancel"))),
+    fin && _h("div", { className: "card", "data-t": "bq-final-form", style: { padding: 13, marginBottom: 10, display: "grid", gap: 8 } },
+      _h("b", null, "Final bill"),
+      _h("label", { style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Actual guests who came", _h("input", { type: "number", min: 1, "data-t": "bq-actual", value: fin.actualPax, onChange: e => setFin({ ...fin, actualPax: e.target.value }), style: { ...field, marginTop: 3 } })),
+      Number(fin.actualPax) > 0 && Number(fin.actualPax) < c.pax && _h("div", { style: { fontSize: 12, color: "#b45309" } }, "Less than the guaranteed " + c.pax + " — the bill uses " + c.pax + " plates."),
+      _h("div", { style: { fontSize: 12, color: "var(--muted)", fontWeight: 600 } }, "Extra charges on the day (optional)"),
+      (fin.extra || []).map((x, i) => _h("div", { key: i, style: { display: "flex", gap: 6 } },
+        _h("input", { value: x.name, placeholder: "Item", onChange: e => setFin({ ...fin, extra: fin.extra.map((y, j) => j === i ? { ...y, name: e.target.value } : y) }), style: { ...field, flex: 2 } }),
+        _h("input", { type: "number", value: x.amt, placeholder: "₹", onChange: e => setFin({ ...fin, extra: fin.extra.map((y, j) => j === i ? { ...y, amt: e.target.value } : y) }), style: { ...field, flex: 1 } }))),
+      _h("button", { className: "btn-s", onClick: () => setFin({ ...fin, extra: [...(fin.extra || []), { name: "", amt: "" }] }) }, "+ Add extra charge"),
+      _h("div", { style: { fontSize: 13 } }, "Bill total will be ", _h("b", { "data-t": "bq-final-preview" }, fmtMoney(bqCalc({ ...ev, final: { actualPax: fin.actualPax, extra: fin.extra } }, cfg).total))),
+      _h("div", { style: { display: "flex", gap: 6 } }, btn("bq-final-save", "Make final bill", makeBill), _h("button", { className: "btn-s", onClick: () => setFin(null), style: { width: "auto" } }, "Cancel"))),
+    cancel && _h("div", { className: "card", style: { padding: 13, marginBottom: 10, display: "grid", gap: 8 } },
+      _h("input", { "data-t": "bq-cancel-reason", value: cancel.reason, onChange: e => setCancel({ reason: e.target.value }), placeholder: "Reason for cancelling", style: field }),
+      _h("div", { style: { display: "flex", gap: 6 } }, btn("bq-cancel-confirm", "Cancel " + (ev.status === "quote" ? "quotation" : "booking"), doCancel, { background: "#b91c1c" }), _h("button", { className: "btn-s", onClick: () => setCancel(null), style: { width: "auto" } }, "Back"))),
+    !pay && !fin && !cancel && _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+      ev.status === "quote" && btn("bq-confirm", "✅ Confirm booking", confirmBooking),
+      (ev.status === "quote" || ev.status === "booked") && btnS("bq-doc", ev.status === "quote" ? "📄 Quotation (print / share)" : "📄 Booking confirmation", () => doc("quote")),
+      ev.status !== "cancelled" && btnS("bq-add-pay", ev.status === "quote" ? "💵 Take advance" : "💵 Add payment", () => setPay({ amt: "", mode: "Cash", note: "" })),
+      ev.status === "booked" && btn("bq-final", "🧾 Final bill", () => setFin({ actualPax: String(c.pax), extra: [] }), { background: "#15803d" }),
+      ev.status === "done" && btn("bq-bill-doc", "🧾 Bill (print / share)", () => doc("bill")),
+      (ev.status === "quote" || ev.status === "booked") && btnS("bq-edit", "✏️ Edit", onEdit),
+      (ev.status === "quote" || (ev.status === "booked" && boss)) && _h("button", { className: "btn-s", "data-t": "bq-cancel", disabled: busy, onClick: () => setCancel({ reason: "" }), style: { flex: "1 1 130px", color: "#b91c1c" } }, "Cancel " + (ev.status === "quote" ? "quotation" : "booking"))));
 }
 
 // ── RESTAURANT TABLE QR (paid add-on "table_qr") ─────────────────────
@@ -15667,7 +16095,7 @@ function App() {
   };
   const savePermissions = async p0 => {
     const p = { ...(p0 || {}) };
-    Object.keys(p).forEach(r => { if (Array.isArray(p[r]) && p[r].indexOf("qrv1") < 0) p[r] = p[r].concat(["qrv1"]); });
+    Object.keys(p).forEach(r => { if (Array.isArray(p[r]) && p[r].indexOf("qrv1") < 0) p[r] = p[r].concat(["qrv1"]); if (Array.isArray(p[r]) && p[r].indexOf("bqv1") < 0) p[r] = p[r].concat(["bqv1"]); });
     setPermissions(p);
     await WS.set("permissions", p);
     AuditLog.add('ACCESS_CONTROL_CHANGED', user?.u || '');
@@ -16587,6 +17015,9 @@ function App() {
     user: user,
     onAddCharge: handleAddCharge,
     openHtmlBill: bill => setInvoiceView({ kind: "rbill", bill, label: bill.id, html: buildRestaurantBillHTML(bill) })
+  }), view === "banquet" && hasFeature("banquet") && /*#__PURE__*/React.createElement(BanquetView, {
+    user: user,
+    openHtml: (label, html) => setInvoiceView({ kind: "rbill", bill: null, label, html })
   }), view === "drivers" && hasFeature("driver_commission") && /*#__PURE__*/React.createElement(DriversView, {
     user: user
   }), view === "orders" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(RoomOrdersView, {
