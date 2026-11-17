@@ -10275,7 +10275,7 @@ function BookingModal({
   const [coSig, setCoSig] = useState(null);
   const [tabSigned, setTabSigned] = useState(false);
   useEffect(() => {
-    if (!showPayMode || !hasFeature("kiosk") || !b) return;
+    if (!showPayMode || !b) return;
     Kiosk.read(Kiosk.IDX, []).then(l => { const e = (Array.isArray(l) ? l : []).find(x => x.bid === b.id); setTabSigned(!!(e && (e.out || e.outPending))); }).catch(() => {});
   }, [showPayMode]);
   const [payMode, setPayMode] = useState("Cash");
@@ -10596,10 +10596,10 @@ function BookingModal({
       background: payMode === m ? "#fef2f2" : "#fff",
       color: payMode === m ? "#dc2626" : "#333"
     }
-  }, m))), hasFeature("kiosk") && (tabSigned
+  }, m))), (tabSigned
     ? React.createElement("div", { "data-t": "co-sig-done", style: { fontSize: 12.5, color: "#166534", background: "#dcfce7", borderRadius: 8, padding: "7px 10px", marginBottom: 10 } }, "✅ Guest has already signed the check-out (tablet)")
     : React.createElement("div", { "data-t": "co-sig", style: { marginBottom: 10 } },
-      React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 4 } }, "✍️ Guest check-out signature (optional — goes into the KYC copy)"),
+      React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 4 } }, "✍️ Guest check-out signature (optional — saved in the guest's KYC copy)"),
       React.createElement(SignaturePad, { onSign: setCoSig }))), /*#__PURE__*/React.createElement("div", {
     style: { display: "flex", gap: 8 }
   }, /*#__PURE__*/React.createElement("button", {
@@ -10608,7 +10608,7 @@ function BookingModal({
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       const all = canCombine && billScope === "all";
-      if (window.confirm(`Check out ${b.name}${all ? " — all " + grpActive.length + " rooms (" + grpActive.map(m => m.roomId).join(", ") + "), one combined bill" : ""}?\nTotal: ${fmtMoney(payGrand)} (incl. GST)` + (payAdv > 0 ? `\nAdvance: ${fmtMoney(payAdv)}\n${payAdv > payGrand ? "Refund due" : "Balance due"}: ${fmtMoney(Math.abs(payGrand - payAdv))}` : "") + `\nPayment: ${payMode}`)) { if (coSig && hasFeature("kiosk")) kycAddCheckoutSig(b, coSig).catch(e => console.warn("check-out signature:", e.message)); if (all) onGroupCheckOut(b.groupId, payMode); else onCheckOut(b.id, payMode); }
+      if (window.confirm(`Check out ${b.name}${all ? " — all " + grpActive.length + " rooms (" + grpActive.map(m => m.roomId).join(", ") + "), one combined bill" : ""}?\nTotal: ${fmtMoney(payGrand)} (incl. GST)` + (payAdv > 0 ? `\nAdvance: ${fmtMoney(payAdv)}\n${payAdv > payGrand ? "Refund due" : "Balance due"}: ${fmtMoney(Math.abs(payGrand - payAdv))}` : "") + `\nPayment: ${payMode}`)) { if (all) onGroupCheckOut(b.groupId, payMode, coSig); else onCheckOut(b.id, payMode, coSig); }
     },
     style: { flex: 1.5, padding: "10px", borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "✅ Confirm Check Out"))))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
@@ -14208,11 +14208,15 @@ const Kiosk = {
     await this.putIndex({ bid: rec.bid, name: rec.name, room: rec.room, in: rec.in, out: rec.out || null, v: rec.v, img: "pending" });
   },
   async clearKyc(bid, by) { await WS.set(this.kycKey(bid), { bid, cleared: true, savedBy: by || "", at: Date.now() }); },
-  async sendOut(b, sig, at) {
-    await WS.set(this.outKey(b.id), { bid: b.id, sig, at, b: { id: b.id, name: b.name, mobile: b.mobile || "", roomId: b.roomId, adults: b.adults, children: b.children, aadhaar: b.aadhaar || "", docType: b.docType || "", address: b.address || "", createdAt: b.createdAt || "" } });
+  // check-out info waiting for the Owner/Manager device: {sig, sigAt} from the
+  // guest's signature and/or {outAt} from the staff check-out (merged)
+  async sendOut(b, sig, at, outAt) {
+    const old = await this.getOut(b.id).catch(() => null);
+    const m = { sig: sig || (old && old.sig) || null, sigAt: sig ? at : (old && old.sigAt) || null, outAt: outAt || (old && old.outAt) || null };
+    await WS.set(this.outKey(b.id), { bid: b.id, ...m, at: m.outAt || m.sigAt || at, b: { id: b.id, name: b.name, mobile: b.mobile || "", roomId: b.roomId, adults: b.adults, children: b.children, aadhaar: b.aadhaar || "", docType: b.docType || "", address: b.address || "", createdAt: b.createdAt || "" } });
     await this.index(l => { const i = l.findIndex(x => x.bid === b.id); if (i >= 0) l[i] = { ...l[i], outPending: true }; else l.push({ bid: b.id, name: b.name, room: b.roomId, in: new Date(b.createdAt || at).getTime(), out: null, v: 0, outPending: true }); return l; });
   },
-  async getOut(bid) { const v = await this.read(this.outKey(bid), null); return v && v.sig ? v : null; },
+  async getOut(bid) { const v = await this.read(this.outKey(bid), null); return v && !v.cleared && (v.sig || v.outAt) ? v : null; },
   async clearOut(bid) { await WS.set(this.outKey(bid), { bid, cleared: true, at: Date.now() }); }
 };
 // shrink a (masked) photo for the transfer document
@@ -14255,7 +14259,9 @@ async function buildKycImage(b, inAt) {
     [b.docType || "Aadhaar Card", (b.docType && b.docType !== "Aadhaar Card") ? (b.aadhaar || "") : maskAadhaar(b.aadhaar || "")],
     ["Address", String(b.address || "").replace(/\s+/g, " ").slice(0, 110)],
     ["Room / Guests", "Room " + b.roomId + " · " + (b.adults || 1) + " adult(s)" + (Number(b.children) ? ", " + b.children + " child" : "") + (b.purpose ? " · " + b.purpose : "")],
-    ["Booking", b.id + " · check-in " + kycFmt(inAt)]
+    ["Booking", b.id],
+    ["Check-in", kycFmt(inAt)],
+    ["Check-out", "—"]
   ];
   const idH = 250, rowH = idH + 34, sigH = 150;
   const H = 96 + lines.length * 26 + 6 + ids.length * (rowH + 6) + (ids.length ? 0 : 34) + 10 + 22 + sigH + 50;
@@ -14265,8 +14271,8 @@ async function buildKycImage(b, inAt) {
   x.font = "bold 28px Arial"; x.fillText(String(P0.hotelName || HOTEL.name || "").slice(0, 48), P, 40);
   x.font = "15px Arial"; x.fillStyle = "#444"; x.fillText("Guest KYC record · Aadhaar number masked", P, 66);
   x.fillRect(P, 80, W - P * 2, 2);
-  let y = 108; x.fillStyle = "#111";
-  lines.forEach(([k, v]) => { x.font = "bold 15px Arial"; x.fillText(k, P, y); x.font = "15px Arial"; x.fillText(String(v), P + 150, y); y += 26; });
+  let y = 108; x.fillStyle = "#111"; let outLine = null;
+  lines.forEach(([k, v]) => { x.font = "bold 15px Arial"; x.fillText(k, P, y); x.font = "15px Arial"; x.fillText(String(v), P + 150, y); if (k === "Check-out") outLine = { x: P + 150, y }; y += 26; });
   y += 6;
   const fit = (img, bx, by, bw, bh) => {
     x.strokeStyle = "#999"; x.lineWidth = 1; x.strokeRect(bx, by, bw, bh);
@@ -14275,7 +14281,7 @@ async function buildKycImage(b, inAt) {
     x.filter = "grayscale(1)"; x.drawImage(img, bx + (bw - w) / 2, by + (bh - h) / 2, w, h); x.filter = "none";
   };
   ids.forEach(r => {
-    x.font = "bold 14px Arial"; x.fillStyle = "#111"; x.fillText(String(r.label).slice(0, 70), P, y + 16);
+    x.font = "bold 14px Arial"; x.fillStyle = "#111"; x.fillText(String(r.label).slice(0, 50) + " · ID front", P, y + 16); x.fillText("ID back", P * 2 + half, y + 16);
     fit(r.f, P, y + 24, half, idH); fit(r.b, P * 2 + half, y + 24, half, idH);
     y += rowH + 6;
   });
@@ -14288,20 +14294,30 @@ async function buildKycImage(b, inAt) {
   fit(sig, inBox.x, inBox.y, inBox.w, inBox.h);
   x.strokeStyle = "#999"; x.strokeRect(outBox.x, outBox.y, outBox.w, outBox.h);
   x.font = "12px Arial"; x.fillStyle = "#666"; x.fillText("Made by AtithiBook on " + kycFmt(Date.now()), P, H - 16);
-  return { img: kycEncode(c), w: W, h: H, outBox };
+  return { img: kycEncode(c), w: W, h: H, outBox, outLine };
 }
-// add the check-out signature into the reserved box of the saved image
-async function addCheckoutToKyc(rec, sigUrl, at) {
-  const base = await kycLoad(rec.img), sig = await kycLoad(sigUrl);
-  if (!base || !sig) throw new Error("Could not read the signature");
+// write the check-out time and/or the check-out signature into the saved
+// image (old call form: addCheckoutToKyc(rec, sigUrl, at))
+async function addCheckoutToKyc(rec, a, b) {
+  const o_ = (a && typeof a === "object") ? a : { sig: a, sigAt: b };
+  const base = await kycLoad(rec.img), sig = o_.sig ? await kycLoad(o_.sig) : null;
+  if (!base) throw new Error("Could not read the saved copy");
+  if (o_.sig && !sig) throw new Error("Could not read the signature");
   const c = document.createElement("canvas"); c.width = base.width; c.height = base.height;
   const x = c.getContext("2d"); x.drawImage(base, 0, 0);
-  const o = rec.outBox;
-  x.fillStyle = "#fff"; x.fillRect(o.x, o.ty - 16, o.w, 20);
-  x.fillStyle = "#111"; x.font = "bold 14px Arial"; x.fillText("Check-out signature · " + kycFmt(at), o.x, o.ty);
-  x.fillStyle = "#fff"; x.fillRect(o.x + 1, o.y + 1, o.w - 2, o.h - 2);
-  const s = Math.min(o.w / sig.width, o.h / sig.height), w = sig.width * s, h = sig.height * s;
-  x.filter = "grayscale(1)"; x.drawImage(sig, o.x + (o.w - w) / 2, o.y + (o.h - h) / 2, w, h); x.filter = "none";
+  const outAt = o_.outAt || o_.sigAt;
+  if (outAt && rec.outLine) {
+    x.fillStyle = "#fff"; x.fillRect(rec.outLine.x, rec.outLine.y - 16, c.width - rec.outLine.x - 10, 22);
+    x.fillStyle = "#111"; x.font = "15px Arial"; x.fillText(kycFmt(outAt), rec.outLine.x, rec.outLine.y);
+  }
+  if (sig) {
+    const o = rec.outBox;
+    x.fillStyle = "#fff"; x.fillRect(o.x, o.ty - 16, o.w, 20);
+    x.fillStyle = "#111"; x.font = "bold 14px Arial"; x.fillText("Check-out signature · " + kycFmt(o_.sigAt || outAt), o.x, o.ty);
+    x.fillStyle = "#fff"; x.fillRect(o.x + 1, o.y + 1, o.w - 2, o.h - 2);
+    const s = Math.min(o.w / sig.width, o.h / sig.height), w = sig.width * s, h = sig.height * s;
+    x.filter = "grayscale(1)"; x.drawImage(sig, o.x + (o.w - w) / 2, o.y + (o.h - h) / 2, w, h); x.filter = "none";
+  }
   return kycEncode(c);
 }
 // Owner / Manager device: local copies (IndexedDB) + Vault folder
@@ -14355,11 +14371,12 @@ const KycLocal = {
           const k = await buildKycImage({ ...o.b, photoFront: null, photoBack: null, family: [], signature: null }, new Date(o.b.createdAt || o.at).getTime());
           have = { bid: e.bid, name: o.b.name, room: o.b.roomId, in: new Date(o.b.createdAt || o.at).getTime(), out: null, v: 0, ...k };
         }
-        const img = await addCheckoutToKyc(have, o.sig, o.at);
-        const rec = { ...have, img, out: o.at, v: (have.v || 0) + 1 };
+        const outAt = o.outAt || o.sigAt || o.at;
+        const img = await addCheckoutToKyc(have, { sig: o.sig || null, sigAt: o.sigAt || o.at, outAt });
+        const rec = { ...have, img, out: outAt, signedOut: !!(o.sig || have.signedOut), v: (have.v || 0) + 1 };
         await this.put(e.bid, rec); await this.toFolder(rec); n++;
         await Kiosk.clearOut(e.bid);
-        await Kiosk.putIndex({ bid: e.bid, out: o.at, outPending: false, v: rec.v, img: "local" });
+        await Kiosk.putIndex({ bid: e.bid, out: outAt, signed: rec.signedOut, outPending: false, v: rec.v, img: "local" });
       }
     }
     return n;
@@ -14385,26 +14402,26 @@ async function saveKycForBooking(b) {
 // staff check-out (old flow): the guest signs on the staff device.
 // On an Owner/Manager device that holds the copy it is added right here
 // (never goes to the cloud); otherwise it travels like a tablet signature.
-async function kycAddCheckoutSig(b, sigUrl) {
+async function kycCheckout(b, sigUrl) {
   const at = Date.now();
-  const small = await kioskShrink(sigUrl, 600);
-  if (!small) return;
+  const small = sigUrl ? await kioskShrink(sigUrl, 600) : null;
   const boss = CURRENT_USER && (CURRENT_USER.role === "Owner" || CURRENT_USER.role === "Manager");
   if (boss) {
     const have = await KycLocal.get(b.id).catch(() => null);
     if (have) {
-      const img = await addCheckoutToKyc(have, small, at);
-      const rec = { ...have, img, out: at, v: (have.v || 0) + 1 };
+      const img = await addCheckoutToKyc(have, { sig: small, sigAt: at, outAt: at });
+      const rec = { ...have, img, out: at, signedOut: !!(small || have.signedOut), v: (have.v || 0) + 1 };
       await KycLocal.put(b.id, rec); await KycLocal.toFolder(rec);
-      await Kiosk.putIndex({ bid: b.id, out: at, v: rec.v, img: "local" });
-      AuditLog.add("KYC_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId + " · staff device");
+      await Kiosk.putIndex({ bid: b.id, out: at, signed: rec.signedOut, v: rec.v, img: "local" });
+      if (small) AuditLog.add("KYC_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId + " · staff device");
       return;
     }
   }
-  await Kiosk.sendOut(b, small, at);
-  AuditLog.add("KYC_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId + " · staff device");
+  await Kiosk.sendOut(b, small, at, at);
+  if (small) AuditLog.add("KYC_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId + " · staff device");
   if (boss) KycLocal.sync().catch(() => {});
 }
+const kycAddCheckoutSig = (b, sigUrl) => kycCheckout(b, sigUrl);
 
 // ── Tablet screen ────────────────────────────────────────────────────
 function KioskView({ user, rooms, bookings }) {
@@ -14459,7 +14476,7 @@ function KioskCheckout({ bookings, onDone }) {
     try {
       const at = Date.now();
       // only the signature travels; the Owner/Manager device adds it to its own copy
-      await Kiosk.sendOut(b, await kioskShrink(sig, 600), at);
+      await Kiosk.sendOut(b, await kioskShrink(sig, 600), at, null);
       await Kiosk.noteCheckout(b);
       AuditLog.add("KIOSK_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId);
       setDone(true);
@@ -14533,7 +14550,7 @@ function KycCopiesCard({ openHtml }) {
     idx === null ? _h("div", { style: { fontSize: 13, color: "var(--muted)" } }, "Loading…")
       : !list.length ? _h("div", { style: { fontSize: 13, color: "var(--muted)" } }, "No copies yet. They are made at every check-in.")
       : list.map(e => _h("div", { key: e.bid, "data-t": "kyc-row", style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "7px 0", borderTop: "1px solid var(--border)", fontSize: 13 } },
-        _h("span", null, _h("b", null, e.name), " · Room " + e.room, _h("br"), _h("span", { style: { fontSize: 11.5, color: "var(--muted)" } }, "In " + kycFmt(e.in) + (e.out ? " · Out " + kycFmt(e.out) : " · not signed out yet"))),
+        _h("span", null, _h("b", null, e.name), " · Room " + e.room, _h("br"), _h("span", { style: { fontSize: 11.5, color: "var(--muted)" } }, "In " + kycFmt(e.in) + (e.out ? " · Out " + kycFmt(e.out) + (e.signed === false ? " (no signature)" : "") : " · still in the hotel"))),
         _h("button", { className: "btn-s", "data-t": "kyc-view", onClick: () => view(e), style: { width: "auto", padding: "6px 12px" } }, "View"))),
     shown && _h("div", { "data-t": "kyc-viewer", role: "dialog", "aria-label": "KYC copy", style: { position: "fixed", inset: 0, zIndex: 9999, background: "rgba(0,0,0,.75)", display: "flex", flexDirection: "column" } },
       _h("div", { style: { display: "flex", gap: 8, padding: 10, background: "var(--navy)" } },
@@ -16675,11 +16692,9 @@ function App() {
     if (localStorage.getItem("ab_local_folder")) {
       LocalFS.saveCheckIn(nb, _photoF, _photoB).catch(e => console.warn("LocalFS save:", e.message));
     }
-    // Check-in desk add-on: one small masked KYC copy for the stay
-    if (hasFeature("kiosk")) {
-      if (_kioskId) Kiosk.finish(_kioskId).catch(e => console.warn("kiosk finish:", e.message));
-      saveKycForBooking(nb);
-    }
+    // one small masked KYC copy for every stay (kept on the Owner/Manager device)
+    if (_kioskId) Kiosk.finish(_kioskId).catch(e => console.warn("kiosk finish:", e.message));
+    saveKycForBooking(nb);
     setCIR(null);
     setResPrefill(null);
   };
@@ -16879,7 +16894,7 @@ function App() {
   useEffect(() => { CURRENT_USER = user || null; }, [user]);
   // Check-in desk add-on: Owner/Manager devices keep a local copy of every KYC image
   useEffect(() => {
-    if (!user || !hasFeature("kiosk") || (user.role !== "Owner" && user.role !== "Manager")) return;
+    if (!user || (user.role !== "Owner" && user.role !== "Manager")) return;
     const run = () => { if (!document.hidden) KycLocal.sync().catch(e => console.warn("KYC sync:", e.message)); };
     const t0 = setTimeout(run, 4000), iv = setInterval(run, 180000);
     return () => { clearTimeout(t0); clearInterval(iv); };
@@ -17086,7 +17101,7 @@ function App() {
     }
     AuditLog.add(decision === "confirmed" ? "BOOKING_REQUEST_ACCEPTED" : "BOOKING_REQUEST_DECLINED", reqId);
   };
-  const handleCheckOut = async (bid, paymentMode) => {
+  const handleCheckOut = async (bid, paymentMode, coSig) => {
     const b = bookings.find(x => x.id === bid);
     const now = new Date();
     const invoiceNo = await generateInvoiceNumber();
@@ -17098,6 +17113,8 @@ function App() {
       catch (e) { console.warn("driver commission:", e && e.message); }
     }
     rememberBookings([ub]);
+    // KYC copy: check-out time (+ the guest's signature, if taken)
+    kycCheckout(ub, coSig || null).catch(e => console.warn("KYC check-out:", e.message));
     openInvoice(ub, room);
     setModal(null);
   };
@@ -17105,9 +17122,9 @@ function App() {
   // group is settled at once under ONE invoice number. Each room keeps its
   // own frozen record (so revenue/GST reports stay per room); the invoice
   // view merges them (groupBillView).
-  const handleGroupCheckOut = async (groupId, paymentMode) => {
+  const handleGroupCheckOut = async (groupId, paymentMode, coSig) => {
     const members = bookings.filter(x => x.groupId === groupId && x.status === "active");
-    if (members.length < 2) { if (members[0]) return handleCheckOut(members[0].id, paymentMode); return; }
+    if (members.length < 2) { if (members[0]) return handleCheckOut(members[0].id, paymentMode, coSig); return; }
     const now = new Date();
     const invoiceNo = await generateInvoiceNumber();
     const roomsList = members.map(m => m.roomId);
@@ -17124,6 +17141,7 @@ function App() {
     AuditLog.add("GROUP_CHECKOUT", groupId + " " + invoiceNo + " rooms " + roomsList.join(","));
     const all = done.map(d => d.ub);
     rememberBookings(all);
+    (async () => { for (const u of all) await kycCheckout(u, coSig || null).catch(e => console.warn("KYC check-out:", e.message)); })();
     const main = all.find(x => x.id === groupId) || all[0];
     openInvoice(main, done.find(d => d.ub === main).room);
     setModal(null);
@@ -17307,10 +17325,10 @@ function App() {
     style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
   }, /*#__PURE__*/React.createElement(KotPrinterCard, null), user.role === "Owner" && /*#__PURE__*/React.createElement(RestaurantStaffLoginCard, null),
     user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "captain", role: "Captain", title: "🧑‍✈️ Captain login", desc: "sees approved room orders, prints the KOT and marks orders served (Room Orders + Kitchen only)." }),
-    user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "chef", role: "Chef", title: "👨‍🍳 Chef login", desc: "sees only the Kitchen screen and updates the order status." })), hasFeature("kiosk") && (user.role === "Owner" || user.role === "Manager") && React.createElement("div", {
+    user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "chef", role: "Chef", title: "👨‍🍳 Chef login", desc: "sees only the Kitchen screen and updates the order status." })), (user.role === "Owner" || user.role === "Manager") && React.createElement("div", {
     "data-t": "kiosk-settings", style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
   },
-    user.role === "Owner" && React.createElement(StaffLoginCard, { username: "checkin", role: "Kiosk", title: "📲 Check-in desk (tablet) login", desc: "for the reception tablet: guests do check-in (Aadhaar scan + details + signature) and sign at check-out. It cannot see bills, rooms or reports." }),
+    user.role === "Owner" && hasFeature("kiosk") && React.createElement(StaffLoginCard, { username: "checkin", role: "Kiosk", title: "📲 Check-in desk (tablet) login", desc: "for the reception tablet: guests do check-in (Aadhaar scan + details + signature) and sign at check-out. It cannot see bills, rooms or reports." }),
     React.createElement(KycCopiesCard, { openHtml: (label, html) => setInvoiceView({ kind: "rbill", bill: null, label, html }) })));
   // Owner-deleted entries stay only as small stubs (status "deleted") so other
   // devices can't bring them back — every screen works without them.
