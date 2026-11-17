@@ -7038,7 +7038,9 @@ function CheckInView({
   setView,
   prefill,
   reservations,
-  bookings
+  bookings,
+  kiosk,
+  onKioskDone
 }) {
   const _h = React.createElement;
   const empty = rooms.filter(r => r.status === "empty");
@@ -7049,7 +7051,9 @@ function CheckInView({
   // Group / bulk booking (paid add-on "bulk_booking"): more rooms for the
   // SAME guest under the same booking ID. [{ roomId, rate, adults }]
   const [extraRooms, setExtraRooms] = useState([]);
-  const canBulk = hasFeature("bulk_booking") && !prefill;
+  const canBulk = hasFeature("bulk_booking") && !prefill && !kiosk;
+  // guest filled this on the reception tablet (Kiosk add-on)
+  const kReq = prefill && prefill.kiosk ? prefill.kiosk : null;
   // With the group add-on the user first picks Single or Group booking.
   const [ciMode, setCiMode] = useState(""); // "" (not chosen yet) | "single" | "group"
   const isGroup = canBulk && ciMode === "group";
@@ -7995,6 +7999,36 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
   useEffect(() => {
     if (prefill && Number(prefill.rate) > 0) { setUseCustomRate(true); setCustomRate(String(prefill.rate)); }
   }, []);
+  // Tablet request → fill everything the guest entered (masked photos, family, signature)
+  useEffect(() => {
+    if (!kReq) return;
+    const f = kReq.form || {};
+    setForm(x => ({ ...x, ...["name", "mobile", "docType", "aadhaar", "address", "dob", "gender", "fatherName", "adults", "children", "purpose", "isForeigner", "nationality", "visaNumber", "visaType", "arrivalDateIndia"].reduce((o, k) => (f[k] !== undefined ? { ...o, [k]: f[k] } : o), {}) }));
+    if (kReq.photoF) { setPhotoF(kReq.photoF); setPhotoFPreview(kReq.photoF); }
+    if (kReq.photoB) { setPhotoB(kReq.photoB); setPhotoBPreview(kReq.photoB); }
+    if (Array.isArray(kReq.family)) setFamily(kReq.family.map(m => ({ ...m, _id: uid() })));
+    if (kReq.signature) setSignature(kReq.signature);
+    if (kReq.consent) setConsent(true);
+  }, []);
+  // Tablet: send the guest's details to the reception (no room / rate here)
+  const [kBusy, setKBusy] = useState(false);
+  const kioskSubmit = async () => {
+    if (!form.name.trim()) return alert("Please enter your full name");
+    if (String(form.mobile).replace(/\D/g, "").length < 10) return alert("Please enter your 10-digit mobile number");
+    if (!signature) return alert("Please sign in the box and tap Confirm Signature");
+    if (!consent) return alert("Please tick the consent box");
+    setKBusy(true);
+    try {
+      const id = "K" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+      const fam = [];
+      for (const m of family) fam.push({ name: m.name, idNumber: m.idNumber, dob: m.dob, gender: m.gender, relation: m.relation, address: m.address || "", photoFront: await kioskShrink(m.photoFront, 700), photoBack: await kioskShrink(m.photoBack, 700) });
+      const f = {}; ["name", "mobile", "docType", "aadhaar", "address", "dob", "gender", "fatherName", "adults", "children", "purpose", "isForeigner", "nationality", "visaNumber", "visaType", "arrivalDateIndia"].forEach(k => { f[k] = form[k]; });
+      await Kiosk.submitCheckin({ id, at: Date.now(), form: f, photoF: await kioskShrink(photoF, 900), photoB: await kioskShrink(photoB, 900), family: fam, signature: await kioskShrink(signature, 600), consent: true });
+      AuditLog.add("KIOSK_CHECKIN_SENT", id + " · " + form.name);
+      setDone(true);
+      setTimeout(() => { setDone(false); onKioskDone && onKioskDone(); }, 7000);
+    } catch (e) { alert("Could not send. Please ask the reception. (" + e.message + ")"); } finally { setKBusy(false); }
+  };
   const submit = () => {
     if (!form.roomId) return alert("Select a room");
     if (!form.name.trim()) return alert("Enter guest name");
@@ -8066,6 +8100,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       advance: advancesAll.reduce((t, a) => t + (Number(a.amount) || 0), 0),
       ...(driverInfo ? { driver: driverInfo } : {}),
       _resId: prefill?.id || null,
+      _kioskId: kReq ? kReq.id : null,
       _extraRooms: extras.map(x => ({ roomId: x.roomId, roomTotal: Math.round(Number(x.rate) * n), adults: String(Math.max(1, parseInt(x.adults, 10) || 1)) }))
     });
     setDone(true);
@@ -8074,6 +8109,10 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       setView("rooms");
     }, 1400);
   };
+  if (done && kiosk) return React.createElement("div", { "data-t": "kiosk-in-done", style: { height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, padding: 24, textAlign: "center" } },
+    React.createElement("div", { style: { fontSize: 64 } }, "🙏"),
+    React.createElement("div", { style: { fontSize: 24, fontWeight: 800, color: "var(--green)" } }, "Thank you, " + form.name + "!"),
+    React.createElement("div", { style: { fontSize: 16, color: "var(--muted)" } }, "Your details are sent to the reception. Please wait — our staff will give you your room key."));
   if (done) return /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
@@ -8129,7 +8168,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     style: {
       fontSize: 20
     }
-  }, "Guest Check-In"), canBulk && /*#__PURE__*/React.createElement("div", { "data-t": "ci-mode-strip", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: 13 } },
+  }, kiosk ? "Welcome — please fill your details" : "Guest Check-In"), kReq && React.createElement("div", { "data-t": "ci-kiosk-note", style: { fontSize: 12.5, background: "#eef6ff", color: "#1e3a5f", borderRadius: 8, padding: "6px 10px", marginTop: 6 } }, "📲 Filled by the guest on the tablet. Check the details, choose the room and rate, then confirm."), canBulk && /*#__PURE__*/React.createElement("div", { "data-t": "ci-mode-strip", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: 13 } },
     /*#__PURE__*/React.createElement("span", { style: { background: isGroup ? "#dbeafe" : "#f1ebde", color: "var(--navy)", fontWeight: 700, borderRadius: 20, padding: "3px 10px" } }, isGroup ? "🏨 Group booking" : "🛏️ Single booking"),
     /*#__PURE__*/React.createElement("button", { type: "button", "data-t": "ci-mode-change", onClick: () => pickMode(isGroup ? "single" : "group"), style: { background: "none", border: "none", color: "var(--navy)", textDecoration: "underline", cursor: "pointer", fontSize: 12.5, padding: 4 } }, isGroup ? "Switch to single" : "Switch to group"))), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -8138,7 +8177,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
       flexDirection: "column",
       gap: 12
     }
-  }, /*#__PURE__*/React.createElement("div", {
+  }, !kiosk && /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: {
       padding: "14px 16px"
@@ -8294,7 +8333,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     extras_.length > 0 && n > 0 && _h("div", { "data-t": "bulk-total", style: { display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, marginTop: 8, color: "var(--navy)" } },
       _h("span", null, (extras_.length + 1) + " rooms · " + n + " night" + (n > 1 ? "s" : "")),
       _h("span", null, "Total room rent: " + fmtMoney(rt + extras_.reduce((t, x) => t + Math.round((Number(rateOfExtra(x)) || 0) * n), 0)))),
-    _h("div", { style: { fontSize: 10.5, color: "var(--muted)", marginTop: 6 } }, "ID photos are saved once, with the main room. At checkout you can make one combined bill or a separate bill per room.")))), _h("div", { className: "card", "data-t": "advance-card", style: { padding: "14px 16px" } },
+    _h("div", { style: { fontSize: 10.5, color: "var(--muted)", marginTop: 6 } }, "ID photos are saved once, with the main room. At checkout you can make one combined bill or a separate bill per room.")))), !kiosk && _h("div", { className: "card", "data-t": "advance-card", style: { padding: "14px 16px" } },
     _h("div", { className: "st" }, "💵 ADVANCE / DEPOSIT"),
     preAdv > 0 ? _h("div", { style: { fontSize: 12.5, background: "#dcfce7", color: "#166534", borderRadius: 8, padding: "8px 10px", marginBottom: 8, fontWeight: 600 } }, "Advance received at booking: ₹" + preAdv.toLocaleString("en-IN") + " — will be adjusted in the final bill") : null,
     _h("input", { type: "number", inputMode: "numeric", "data-t": "ci-adv", value: advAmt, onChange: e => setAdvAmt(e.target.value), placeholder: preAdv > 0 ? "Additional advance received now? (optional)" : "Advance amount ₹ (optional)" }),
@@ -9055,7 +9094,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     onChange: e => fld("purpose", e.target.value)
   }, ["Leisure", "Business", "Medical", "Pilgrimage", "Family Visit", "Other"].map(p => /*#__PURE__*/React.createElement("option", {
     key: p
-  }, p)))))), hasFeature("ota_import") && /*#__PURE__*/React.createElement("div", {
+  }, p)))))), !kiosk && hasFeature("ota_import") && /*#__PURE__*/React.createElement("div", {
     className: "card",
     style: { padding: "14px 16px", marginTop: 12 }
   }, /*#__PURE__*/React.createElement("label", {
@@ -9076,7 +9115,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     onChange: e => fld("otaReference", e.target.value),
     placeholder: form.bookingSource + " booking/confirmation number",
     style: { marginTop: 8 }
-  })), hasFeature("driver_commission") && /*#__PURE__*/React.createElement(DriverPicker, {
+  })), !kiosk && hasFeature("driver_commission") && /*#__PURE__*/React.createElement(DriverPicker, {
     value: driverPick,
     onChange: setDriverPick
   }), /*#__PURE__*/React.createElement("div", {
@@ -9143,7 +9182,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     tryFamilyQRScan: tryFamilyQRScan,
     openQrLive: openQrLive,
     openCam: openCam
-  }), /*#__PURE__*/React.createElement(SignaturePad, {
+  }), kReq && kReq.signature ? React.createElement("div", { className: "card", "data-t": "ci-kiosk-sig", style: { padding: "12px 14px" } }, React.createElement("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 13, marginBottom: 6 } }, "✍️ Signed by the guest on the tablet"), React.createElement("img", { src: kReq.signature, alt: "Guest signature", style: { maxWidth: "100%", maxHeight: 120, background: "#fff", border: "1px solid var(--border)", borderRadius: 8 } })) : /*#__PURE__*/React.createElement(SignaturePad, {
     onSign: setSignature
   }), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -9196,12 +9235,14 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     }
   }, "Terms"), "."))), /*#__PURE__*/React.createElement("button", {
     className: "btn-n",
-    onClick: submit,
+    "data-t": kiosk ? "kiosk-in-submit" : "ci-submit",
+    disabled: kiosk && kBusy,
+    onClick: kiosk ? kioskSubmit : submit,
     style: {
       marginTop: 4,
       opacity: consent ? 1 : 0.6
     }
-  }, signature ? "✅ Confirm Check-In (Signature Captured)" : "✅ Confirm Check-In")));
+  }, kiosk ? (kBusy ? "Sending…" : "✅ Send to reception") : signature ? "✅ Confirm Check-In (Signature Captured)" : "✅ Confirm Check-In")));
 }
 
 /* ── PROFILE EDIT MODAL (Owner name + Hotel logo/banner) ──────── */
@@ -10230,6 +10271,13 @@ function BookingModal({
   const [advAmt, setAdvAmt] = useState("");
   const [advMode, setAdvMode] = useState("Cash");
   const [showPayMode, setShowPayMode] = useState(false);
+  // Check-in desk add-on: guest's check-out signature on this device
+  const [coSig, setCoSig] = useState(null);
+  const [tabSigned, setTabSigned] = useState(false);
+  useEffect(() => {
+    if (!showPayMode || !hasFeature("kiosk") || !b) return;
+    Kiosk.read(Kiosk.IDX, []).then(l => { const e = (Array.isArray(l) ? l : []).find(x => x.bid === b.id); setTabSigned(!!(e && (e.out || e.outPending))); }).catch(() => {});
+  }, [showPayMode]);
   const [payMode, setPayMode] = useState("Cash");
   const [showExtend, setShowExtend] = useState(false);
   const [newCheckOut, setNewCheckOut] = useState(b.checkOut);
@@ -10548,7 +10596,11 @@ function BookingModal({
       background: payMode === m ? "#fef2f2" : "#fff",
       color: payMode === m ? "#dc2626" : "#333"
     }
-  }, m))), /*#__PURE__*/React.createElement("div", {
+  }, m))), hasFeature("kiosk") && (tabSigned
+    ? React.createElement("div", { "data-t": "co-sig-done", style: { fontSize: 12.5, color: "#166534", background: "#dcfce7", borderRadius: 8, padding: "7px 10px", marginBottom: 10 } }, "✅ Guest has already signed the check-out (tablet)")
+    : React.createElement("div", { "data-t": "co-sig", style: { marginBottom: 10 } },
+      React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: "#991b1b", marginBottom: 4 } }, "✍️ Guest check-out signature (optional — goes into the KYC copy)"),
+      React.createElement(SignaturePad, { onSign: setCoSig }))), /*#__PURE__*/React.createElement("div", {
     style: { display: "flex", gap: 8 }
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowPayMode(false),
@@ -10556,7 +10608,7 @@ function BookingModal({
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       const all = canCombine && billScope === "all";
-      if (window.confirm(`Check out ${b.name}${all ? " — all " + grpActive.length + " rooms (" + grpActive.map(m => m.roomId).join(", ") + "), one combined bill" : ""}?\nTotal: ${fmtMoney(payGrand)} (incl. GST)` + (payAdv > 0 ? `\nAdvance: ${fmtMoney(payAdv)}\n${payAdv > payGrand ? "Refund due" : "Balance due"}: ${fmtMoney(Math.abs(payGrand - payAdv))}` : "") + `\nPayment: ${payMode}`)) { if (all) onGroupCheckOut(b.groupId, payMode); else onCheckOut(b.id, payMode); }
+      if (window.confirm(`Check out ${b.name}${all ? " — all " + grpActive.length + " rooms (" + grpActive.map(m => m.roomId).join(", ") + "), one combined bill" : ""}?\nTotal: ${fmtMoney(payGrand)} (incl. GST)` + (payAdv > 0 ? `\nAdvance: ${fmtMoney(payAdv)}\n${payAdv > payGrand ? "Refund due" : "Balance due"}: ${fmtMoney(Math.abs(payGrand - payAdv))}` : "") + `\nPayment: ${payMode}`)) { if (coSig && hasFeature("kiosk")) kycAddCheckoutSig(b, coSig).catch(e => console.warn("check-out signature:", e.message)); if (all) onGroupCheckOut(b.groupId, payMode); else onCheckOut(b.id, payMode); }
     },
     style: { flex: 1.5, padding: "10px", borderRadius: 8, border: "none", background: "#dc2626", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
   }, "✅ Confirm Check Out"))))))), showC && /*#__PURE__*/React.createElement(ChargesModal, {
@@ -13412,6 +13464,10 @@ function BottomNav({
     icon: "🎉",
     label: "Banquet"
   }, {
+    id: "kiosk",
+    icon: "📲",
+    label: "Check-in Desk"
+  }, {
     id: "orders",
     icon: "🛎️",
     label: "Room Orders"
@@ -13425,8 +13481,9 @@ function BottomNav({
   // apply on top — a hotel without "history" or "storage" enabled on their
   // plan won't see those tabs even if their role would otherwise allow it.
   const isOwner = role === "Owner";
-  const allowed = isOwner ? baseItems.map(i => i.id) : permsFor(permissions, role);
-  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant"), drivers: hasFeature("driver_commission"), orders: hasFeature("qr_any"), kitchen: hasFeature("qr_any"), banquet: hasFeature("banquet") };
+  // the tablet screen belongs only to the fixed "checkin" login
+  const allowed = isOwner ? baseItems.map(i => i.id).filter(v => v !== "kiosk") : permsFor(permissions, role);
+  const planGated = { history: hasFeature("history"), storage: hasFeature("storage"), restaurant: hasFeature("restaurant"), drivers: hasFeature("driver_commission"), orders: hasFeature("qr_any"), kitchen: hasFeature("qr_any"), banquet: hasFeature("banquet"), kiosk: hasFeature("kiosk") };
   let items = baseItems.filter(i => (allowed.includes(i.id) || (i.id === "reserve" && allowed.includes("checkin"))) && (planGated[i.id] === undefined || planGated[i.id]));
   if (isOwner && hasFeature("roles")) {
     items = [...items, { id: "access", icon: "🔐", label: "Access" }];
@@ -13520,6 +13577,7 @@ const DEFAULT_PERMISSIONS = {
   // QR room ordering (paid add-on "qr_ordering")
   Captain: ["orders", "kitchen"],
   Chef: ["kitchen"],
+  Kiosk: ["kiosk"],
   Receptionist: ["dash", "rooms", "checkin", "billing", "restaurant"],
   // Restaurant staff (paid "restaurant" add-on): only the order counter —
   // no room rates, revenue dashboard, guest IDs or registers.
@@ -13540,7 +13598,7 @@ function permsFor(permissions, role) {
   return p;
 }
 // Views that also need a plan feature / paid add-on.
-const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant", drivers: "driver_commission", orders: "qr_any", kitchen: "qr_any", banquet: "banquet" };
+const FEATURE_GATED_VIEWS = { access: "roles", history: "history", storage: "storage", restaurant: "restaurant", drivers: "driver_commission", orders: "qr_any", kitchen: "qr_any", banquet: "banquet", kiosk: "kiosk" };
 const ALL_FEATURES = [
   { id: "dash", label: "Dashboard", icon: "📊" },
   { id: "rooms", label: "Rooms", icon: "🏨" },
@@ -14072,6 +14130,416 @@ function RoomQrCard({ profile, rooms, onSaveToken }) {
           _h("button", { className: "btn-s", onClick: () => { const r = (rooms || [])[0]; if (r) window.open(link(r.id), "_blank"); }, style: { flex: "1 1 120px" } }, "👀 Preview guest page"))),
     msg && !msg.ok && _h("div", { role: "alert", style: { fontSize: 12, color: "#b91c1c", marginTop: 8 } }, msg.reason === "permission-denied" ? "Could not turn on: the Firebase rules for room ordering are not published yet. Please publish the new firestore.rules in the Firebase Console, then try again." : "Could not turn on: " + msg.detail),
     msg && msg.ok && _h("div", { role: "status", style: { fontSize: 12, color: "#166534", marginTop: 8 } }, "✅ QR ordering is on. Print the QR codes for the rooms."));
+}
+
+// ── CHECK-IN DESK / KIOSK (paid add-on "kiosk") ──────────────────────
+// A tablet at reception logged in as the fixed "checkin" user (role
+// "Kiosk"). Guests fill the SAME check-in form (Aadhaar scan with the
+// number masked, details, family, signature) and send it to reception;
+// staff assign the room + rate and finish the check-in on their own
+// device. At departure the guest signs again on the tablet.
+// Every check-in (when the add-on is on) makes ONE small greyscale JPEG
+// "KYC copy": masked Aadhaar front/back + family IDs + check-in signature
+// (+ check-out signature later). v5.33: the JPEG is kept ONLY on the
+// Owner/Manager device (IndexedDB + the Vault folder when one is set).
+// The cloud is used just to carry it there: a check-in done on another
+// device (or a tablet check-out signature) waits in the cloud until an
+// Owner/Manager device saves it, then the image is wiped from the cloud.
+// Only a list (name, room, dates) stays in the cloud.
+// Cloud docs used (all under hotels/<KEY>/data, no rules change):
+//   kiosk_queue      [{id, kind:"in"|"out", at, name, mobile, room, bid}]
+//   kiosk_req_<id>   the guest's form + masked photos (cleared when used)
+//   kyc_index        [{bid, name, room, in, out, v, img:"pending"|"local", outPending}]
+//   kyc_<bid>        {img…} only until an Owner/Manager device saves it, then {cleared}
+//   kyc_out_<bid>    {sig, at, b} tablet check-out signature, same idea
+// who is logged in on this device (set by App) — decides where a KYC copy is kept
+let CURRENT_USER = null;
+const Kiosk = {
+  Q: "kiosk_queue", IDX: "kyc_index",
+  reqKey: id => "kiosk_req_" + id,
+  kycKey: bid => "kyc_" + String(bid).replace(/[^A-Za-z0-9_-]/g, ""),
+  async read(k, dflt) {
+    try { const v = await WS.get(k, true); if (v != null) return v; } catch (e) {}
+    return dflt;
+  },
+  // transaction on a list document
+  async txList(k, fn) {
+    if (window._db) {
+      try {
+        const ref = WS._ref(k);
+        return await window._db.runTransaction(async t => {
+          const sn = await t.get(ref);
+          const cur = (sn.exists && Array.isArray(sn.data().value)) ? sn.data().value : [];
+          const n = fn(cur.slice());
+          t.set(ref, { value: cloudSafe(n), ts: Date.now() });
+          return n;
+        });
+      } catch (e) { console.warn("kiosk transaction failed, saving via normal sync:", e.message); }
+    }
+    const cur = await this.read(k, []);
+    const n = fn(Array.isArray(cur) ? cur.slice() : []);
+    await WS.set(k, n);
+    return n;
+  },
+  async queue() { const v = await this.read(this.Q, []); return Array.isArray(v) ? v : []; },
+  async submitCheckin(p) {
+    await WS.set(this.reqKey(p.id), p);
+    await this.txList(this.Q, q => q.filter(x => x.id !== p.id).concat([{ id: p.id, kind: "in", at: p.at, name: p.form.name, mobile: p.form.mobile, adults: p.form.adults }]));
+  },
+  async takeCheckin(id) { const v = await this.read(this.reqKey(id), null); return v && v.form ? v : null; },
+  // cloud docs cannot be deleted from the app, so a used request is emptied
+  async finish(id) {
+    if (String(id).indexOf("out_") !== 0) { try { await WS.set(this.reqKey(id), { used: true, at: Date.now() }); } catch (e) {} }
+    await this.txList(this.Q, q => q.filter(x => x.id !== id));
+  },
+  async noteCheckout(b) {
+    await this.txList(this.Q, q => q.filter(x => x.id !== "out_" + b.id).concat([{ id: "out_" + b.id, kind: "out", at: Date.now(), name: b.name, room: b.roomId, bid: b.id }]));
+  },
+  outKey: bid => "kyc_out_" + String(bid).replace(/[^A-Za-z0-9_-]/g, ""),
+  async getKyc(bid) { const v = await this.read(this.kycKey(bid), null); return v && v.img ? v : null; },
+  async index(fn) { return this.txList(this.IDX, l => fn(l).slice(-3000)); },
+  // list entry only (no image)
+  async putIndex(e) {
+    await this.index(l => { const i = l.findIndex(x => x.bid === e.bid); if (i >= 0) l[i] = { ...l[i], ...e }; else l.push(e); return l; });
+  },
+  // image waits in the cloud for an Owner/Manager device
+  async sendKyc(rec) {
+    await WS.set(this.kycKey(rec.bid), rec);
+    await this.putIndex({ bid: rec.bid, name: rec.name, room: rec.room, in: rec.in, out: rec.out || null, v: rec.v, img: "pending" });
+  },
+  async clearKyc(bid, by) { await WS.set(this.kycKey(bid), { bid, cleared: true, savedBy: by || "", at: Date.now() }); },
+  async sendOut(b, sig, at) {
+    await WS.set(this.outKey(b.id), { bid: b.id, sig, at, b: { id: b.id, name: b.name, mobile: b.mobile || "", roomId: b.roomId, adults: b.adults, children: b.children, aadhaar: b.aadhaar || "", docType: b.docType || "", address: b.address || "", createdAt: b.createdAt || "" } });
+    await this.index(l => { const i = l.findIndex(x => x.bid === b.id); if (i >= 0) l[i] = { ...l[i], outPending: true }; else l.push({ bid: b.id, name: b.name, room: b.roomId, in: new Date(b.createdAt || at).getTime(), out: null, v: 0, outPending: true }); return l; });
+  },
+  async getOut(bid) { const v = await this.read(this.outKey(bid), null); return v && v.sig ? v : null; },
+  async clearOut(bid) { await WS.set(this.outKey(bid), { bid, cleared: true, at: Date.now() }); }
+};
+// shrink a (masked) photo for the transfer document
+function kioskShrink(dataUrl, maxW) {
+  return new Promise(res => {
+    if (!dataUrl || !/^data:image\//.test(dataUrl)) return res(null);
+    const img = new Image();
+    img.onload = () => {
+      const s = Math.min(1, (maxW || 900) / img.width), c = document.createElement("canvas");
+      c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+      const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height); x.drawImage(img, 0, 0, c.width, c.height);
+      res(c.toDataURL("image/jpeg", 0.7));
+    };
+    img.onerror = () => res(null);
+    img.src = dataUrl;
+  });
+}
+const kycLoad = src => new Promise(res => { if (!src) return res(null); const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
+const kycFmt = t => { try { const d = new Date(t); return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) + " " + d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }); } catch (e) { return ""; } };
+// encode small: greyscale JPEG, quality steps down until under ~180 KB
+function kycEncode(c) {
+  let q = 0.6, out = c.toDataURL("image/jpeg", q);
+  while (out.length > 240000 && q > 0.3) { q -= 0.1; out = c.toDataURL("image/jpeg", q); }
+  return out;
+}
+// ONE image per stay: details + masked IDs + check-in / check-out signature
+async function buildKycImage(b, inAt) {
+  const W = 900, P = 24, half = (W - P * 3) / 2;
+  const P0 = CURRENT_PROFILE || {};
+  const ids = [];
+  const pf = await kycLoad(b.photoFront), pb = await kycLoad(b.photoBack);
+  if (pf || pb) ids.push({ label: b.name + " (guest)", f: pf, b: pb });
+  for (const m of (b.family || [])) {
+    const f = await kycLoad(m.photoFront), bk = await kycLoad(m.photoBack);
+    if (f || bk) ids.push({ label: (m.name || "Member") + (m.relation ? " (" + m.relation + ")" : ""), f, b: bk });
+  }
+  const sig = await kycLoad(b.signature);
+  const lines = [
+    ["Guest", b.name || ""], ["Mobile", b.mobile || ""],
+    [b.docType || "Aadhaar Card", (b.docType && b.docType !== "Aadhaar Card") ? (b.aadhaar || "") : maskAadhaar(b.aadhaar || "")],
+    ["Address", String(b.address || "").replace(/\s+/g, " ").slice(0, 110)],
+    ["Room / Guests", "Room " + b.roomId + " · " + (b.adults || 1) + " adult(s)" + (Number(b.children) ? ", " + b.children + " child" : "") + (b.purpose ? " · " + b.purpose : "")],
+    ["Booking", b.id + " · check-in " + kycFmt(inAt)]
+  ];
+  const idH = 250, rowH = idH + 34, sigH = 150;
+  const H = 96 + lines.length * 26 + 6 + ids.length * (rowH + 6) + (ids.length ? 0 : 34) + 10 + 22 + sigH + 50;
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const x = c.getContext("2d");
+  x.fillStyle = "#fff"; x.fillRect(0, 0, W, H); x.fillStyle = "#111";
+  x.font = "bold 28px Arial"; x.fillText(String(P0.hotelName || HOTEL.name || "").slice(0, 48), P, 40);
+  x.font = "15px Arial"; x.fillStyle = "#444"; x.fillText("Guest KYC record · Aadhaar number masked", P, 66);
+  x.fillRect(P, 80, W - P * 2, 2);
+  let y = 108; x.fillStyle = "#111";
+  lines.forEach(([k, v]) => { x.font = "bold 15px Arial"; x.fillText(k, P, y); x.font = "15px Arial"; x.fillText(String(v), P + 150, y); y += 26; });
+  y += 6;
+  const fit = (img, bx, by, bw, bh) => {
+    x.strokeStyle = "#999"; x.lineWidth = 1; x.strokeRect(bx, by, bw, bh);
+    if (!img) { x.fillStyle = "#999"; x.font = "14px Arial"; x.fillText("—", bx + bw / 2 - 4, by + bh / 2); x.fillStyle = "#111"; return; }
+    const s = Math.min(bw / img.width, bh / img.height), w = img.width * s, h = img.height * s;
+    x.filter = "grayscale(1)"; x.drawImage(img, bx + (bw - w) / 2, by + (bh - h) / 2, w, h); x.filter = "none";
+  };
+  ids.forEach(r => {
+    x.font = "bold 14px Arial"; x.fillStyle = "#111"; x.fillText(String(r.label).slice(0, 70), P, y + 16);
+    fit(r.f, P, y + 24, half, idH); fit(r.b, P * 2 + half, y + 24, half, idH);
+    y += rowH + 6;
+  });
+  if (!ids.length) { x.font = "14px Arial"; x.fillStyle = "#b45309"; x.fillText("No ID photo was saved for this stay (check the hotel's Aadhaar photo setting).", P, y + 16); x.fillStyle = "#111"; y += 34; }
+  y += 10;
+  x.font = "bold 14px Arial";
+  x.fillText("Check-in signature · " + kycFmt(inAt), P, y + 14);
+  x.fillText("Check-out signature", P * 2 + half, y + 14);
+  const inBox = { x: P, y: y + 22, w: half, h: sigH }, outBox = { x: P * 2 + half, y: y + 22, w: half, h: sigH, ty: y + 14 };
+  fit(sig, inBox.x, inBox.y, inBox.w, inBox.h);
+  x.strokeStyle = "#999"; x.strokeRect(outBox.x, outBox.y, outBox.w, outBox.h);
+  x.font = "12px Arial"; x.fillStyle = "#666"; x.fillText("Made by AtithiBook on " + kycFmt(Date.now()), P, H - 16);
+  return { img: kycEncode(c), w: W, h: H, outBox };
+}
+// add the check-out signature into the reserved box of the saved image
+async function addCheckoutToKyc(rec, sigUrl, at) {
+  const base = await kycLoad(rec.img), sig = await kycLoad(sigUrl);
+  if (!base || !sig) throw new Error("Could not read the signature");
+  const c = document.createElement("canvas"); c.width = base.width; c.height = base.height;
+  const x = c.getContext("2d"); x.drawImage(base, 0, 0);
+  const o = rec.outBox;
+  x.fillStyle = "#fff"; x.fillRect(o.x, o.ty - 16, o.w, 20);
+  x.fillStyle = "#111"; x.font = "bold 14px Arial"; x.fillText("Check-out signature · " + kycFmt(at), o.x, o.ty);
+  x.fillStyle = "#fff"; x.fillRect(o.x + 1, o.y + 1, o.w - 2, o.h - 2);
+  const s = Math.min(o.w / sig.width, o.h / sig.height), w = sig.width * s, h = sig.height * s;
+  x.filter = "grayscale(1)"; x.drawImage(sig, o.x + (o.w - w) / 2, o.y + (o.h - h) / 2, w, h); x.filter = "none";
+  return kycEncode(c);
+}
+// Owner / Manager device: local copies (IndexedDB) + Vault folder
+const KycLocal = {
+  _db: null,
+  open() {
+    if (this._db) return this._db;
+    this._db = new Promise((res, rej) => {
+      if (!window.indexedDB) return rej(new Error("IndexedDB not available"));
+      const r = indexedDB.open("atithibook_kyc", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("files");
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    return this._db;
+  },
+  async get(bid) { const db = await this.open(); return new Promise(res => { const q = db.transaction("files").objectStore("files").get(bid); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); }); },
+  async put(bid, rec) { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction("files", "readwrite"); t.objectStore("files").put(rec, bid); t.oncomplete = () => res(true); t.onerror = () => rej(t.error); }); },
+  async toFolder(rec) {
+    try {
+      if (!localStorage.getItem("ab_local_folder") || !LocalFS || !(await LocalFS.restoreHandle())) return false;
+      const root = LocalFS._dirHandle;
+      const dir = await (await root.getDirectoryHandle("KYC", { create: true })).getDirectoryHandle(String(rec.in ? new Date(rec.in).toISOString().slice(0, 7) : "misc"), { create: true });
+      const fh = await dir.getFileHandle(rec.bid + "_" + String(rec.name || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 20) + ".jpg", { create: true });
+      const w = await fh.createWritable(); await w.write(dataURLtoBlob(rec.img)); await w.close();
+      return true;
+    } catch (e) { console.warn("KYC folder save:", e.message); return false; }
+  },
+  // Owner/Manager device: take every waiting image / check-out signature,
+  // keep it here, then wipe it from the cloud
+  async sync() {
+    const idx = await Kiosk.read(Kiosk.IDX, []);
+    const by = (CURRENT_USER && (CURRENT_USER.name || CURRENT_USER.u)) || "";
+    let n = 0;
+    for (const e of (Array.isArray(idx) ? idx : []).slice(-500)) {
+      if (e.img === "pending") {
+        const rec = await Kiosk.getKyc(e.bid);
+        if (rec) {
+          const have = await this.get(e.bid).catch(() => null);
+          if (!have || (have.v || 0) < rec.v) { await this.put(e.bid, rec); await this.toFolder(rec); n++; }
+          await Kiosk.clearKyc(e.bid, by);
+        }
+        await Kiosk.putIndex({ bid: e.bid, img: "local" });
+      }
+      if (e.outPending) {
+        const o = await Kiosk.getOut(e.bid); if (!o) { await Kiosk.putIndex({ bid: e.bid, outPending: false }); continue; }
+        let have = await this.get(e.bid).catch(() => null);
+        // the image is on another Owner/Manager device — that one adds the signature
+        if (!have && e.img) continue;
+        if (!have) {
+          // stay began before the tablet was set up: make the copy now
+          const k = await buildKycImage({ ...o.b, photoFront: null, photoBack: null, family: [], signature: null }, new Date(o.b.createdAt || o.at).getTime());
+          have = { bid: e.bid, name: o.b.name, room: o.b.roomId, in: new Date(o.b.createdAt || o.at).getTime(), out: null, v: 0, ...k };
+        }
+        const img = await addCheckoutToKyc(have, o.sig, o.at);
+        const rec = { ...have, img, out: o.at, v: (have.v || 0) + 1 };
+        await this.put(e.bid, rec); await this.toFolder(rec); n++;
+        await Kiosk.clearOut(e.bid);
+        await Kiosk.putIndex({ bid: e.bid, out: o.at, outPending: false, v: rec.v, img: "local" });
+      }
+    }
+    return n;
+  }
+};
+// staff device: make / store the KYC copy right after the check-in
+async function saveKycForBooking(b) {
+  try {
+    const at = Date.now();
+    const k = await buildKycImage(b, at);
+    const rec = { bid: b.id, name: b.name, room: b.roomId, in: at, out: null, v: 1, ...k };
+    const boss = CURRENT_USER && (CURRENT_USER.role === "Owner" || CURRENT_USER.role === "Manager");
+    let local = false;
+    if (boss) { try { await KycLocal.put(b.id, rec); await KycLocal.toFolder(rec); local = true; } catch (e) {} }
+    // Owner/Manager device: never goes to the cloud; other devices: waits there until one saves it
+    if (local) await Kiosk.putIndex({ bid: b.id, name: b.name, room: b.roomId, in: at, out: null, v: 1, img: "local" });
+    else await Kiosk.sendKyc(rec);
+    AuditLog.add("KYC_SAVED", b.id + " · " + Math.round(k.img.length * 0.75 / 1024) + " KB");
+    return rec;
+  } catch (e) { console.warn("KYC copy:", e.message); return null; }
+}
+
+// staff check-out (old flow): the guest signs on the staff device.
+// On an Owner/Manager device that holds the copy it is added right here
+// (never goes to the cloud); otherwise it travels like a tablet signature.
+async function kycAddCheckoutSig(b, sigUrl) {
+  const at = Date.now();
+  const small = await kioskShrink(sigUrl, 600);
+  if (!small) return;
+  const boss = CURRENT_USER && (CURRENT_USER.role === "Owner" || CURRENT_USER.role === "Manager");
+  if (boss) {
+    const have = await KycLocal.get(b.id).catch(() => null);
+    if (have) {
+      const img = await addCheckoutToKyc(have, small, at);
+      const rec = { ...have, img, out: at, v: (have.v || 0) + 1 };
+      await KycLocal.put(b.id, rec); await KycLocal.toFolder(rec);
+      await Kiosk.putIndex({ bid: b.id, out: at, v: rec.v, img: "local" });
+      AuditLog.add("KYC_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId + " · staff device");
+      return;
+    }
+  }
+  await Kiosk.sendOut(b, small, at);
+  AuditLog.add("KYC_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId + " · staff device");
+  if (boss) KycLocal.sync().catch(() => {});
+}
+
+// ── Tablet screen ────────────────────────────────────────────────────
+function KioskView({ user, rooms, bookings }) {
+  const _h = React.createElement;
+  const [mode, setMode] = useState("home"); // home | in | out
+  const [round, setRound] = useState(0);
+  const P = CURRENT_PROFILE || {};
+  const home = () => { setMode("home"); setRound(r => r + 1); window.scrollTo && window.scrollTo(0, 0); };
+  // nobody touches the tablet for 3 minutes → back to the start
+  useEffect(() => {
+    if (mode === "home") return;
+    let t; const reset = () => { clearTimeout(t); t = setTimeout(home, 180000); };
+    reset(); ["pointerdown", "keydown"].forEach(ev => window.addEventListener(ev, reset));
+    return () => { clearTimeout(t); ["pointerdown", "keydown"].forEach(ev => window.removeEventListener(ev, reset)); };
+  }, [mode]);
+  if (mode === "in") return _h("div", { "data-t": "kiosk-in", style: { height: "100%" } },
+    _h(CheckInView, { key: "k" + round, kiosk: true, onKioskDone: home, user, rooms: [], checkInRoom: null, onCheckIn: () => {}, setView: () => home(), prefill: null, reservations: [], bookings: [] }));
+  if (mode === "out") return _h(KioskCheckout, { key: "o" + round, bookings, onDone: home });
+  const big = (t, icon, title, sub, on) => _h("button", { "data-t": t, onClick: on, style: { display: "flex", alignItems: "center", gap: 18, width: "100%", padding: "26px 22px", borderRadius: 20, border: "2px solid var(--border)", background: "#fff", cursor: "pointer", textAlign: "left", boxShadow: "0 6px 18px rgba(30,58,95,.08)" } },
+    _h("span", { style: { fontSize: 46 }, "aria-hidden": "true" }, icon),
+    _h("span", null, _h("span", { style: { display: "block", fontSize: 24, fontWeight: 800, color: "var(--navy)" } }, title), _h("span", { style: { display: "block", fontSize: 15, color: "var(--muted)", marginTop: 4 } }, sub)));
+  return _h("div", { "data-t": "kiosk-home", className: "scrollable hs", style: { height: "100%", overflowY: "auto", padding: "28px 18px", boxSizing: "border-box", maxWidth: 620, margin: "0 auto" } },
+    _h("div", { style: { textAlign: "center", marginBottom: 26 } },
+      _h("div", { style: { fontSize: 30, fontWeight: 800, color: "var(--navy)", fontFamily: "'Josefin Sans',sans-serif" } }, "Welcome to " + (P.hotelName || HOTEL.name || "our hotel")),
+      _h("div", { style: { fontSize: 15, color: "var(--muted)", marginTop: 6 } }, "Please choose. Our staff will help you if needed.")),
+    _h("div", { style: { display: "grid", gap: 16 } },
+      big("kiosk-start-in", "🛎️", "Check-in", "Scan your Aadhaar, fill your details and sign", () => setMode("in")),
+      big("kiosk-start-out", "🧳", "Check-out", "Sign before you leave · payment at the reception", () => setMode("out"))),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", textAlign: "center", marginTop: 26 } }, "🔒 Your Aadhaar number is masked before anything is saved."));
+}
+function KioskCheckout({ bookings, onDone }) {
+  const _h = React.createElement;
+  const [room, setRoom] = useState("");
+  const [ph4, setPh4] = useState("");
+  const [b, setB] = useState(null);
+  const [sig, setSig] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => { if (!done) return; const t = setTimeout(onDone, 7000); return () => clearTimeout(t); }, [done]);
+  const find = () => {
+    setErr("");
+    const r = String(room).trim().toLowerCase(), d = String(ph4).replace(/\D/g, "");
+    if (!r || d.length !== 4) { setErr("Enter your room number and the last 4 digits of your mobile number."); return; }
+    const hit = (bookings || []).find(x => x.status === "active" && String(x.roomId).toLowerCase() === r && String(x.mobile || "").replace(/\D/g, "").slice(-4) === d);
+    if (!hit) { setErr("We could not find this stay. Please check the room number and mobile digits, or ask the reception."); return; }
+    setB(hit);
+  };
+  const submit = async () => {
+    if (!sig) { alert("Please sign and tap Confirm Signature first."); return; }
+    setBusy(true);
+    try {
+      const at = Date.now();
+      // only the signature travels; the Owner/Manager device adds it to its own copy
+      await Kiosk.sendOut(b, await kioskShrink(sig, 600), at);
+      await Kiosk.noteCheckout(b);
+      AuditLog.add("KIOSK_CHECKOUT_SIGNED", b.id + " · Room " + b.roomId);
+      setDone(true);
+    } catch (e) { alert("Could not save. Please ask the reception. (" + e.message + ")"); } finally { setBusy(false); }
+  };
+  const wrap = (...kids) => _h("div", { "data-t": "kiosk-out", className: "scrollable hs", style: { height: "100%", overflowY: "auto", padding: "22px 16px", boxSizing: "border-box", maxWidth: 620, margin: "0 auto" } },
+    _h("button", { className: "btn-s", onClick: onDone, style: { width: "auto", marginBottom: 14 } }, "‹ Start again"), ...kids);
+  const field = { width: "100%", boxSizing: "border-box", padding: "14px 16px", borderRadius: 12, border: "1.5px solid var(--border)", fontSize: 20 };
+  if (done) return wrap(_h("div", { "data-t": "kiosk-out-done", style: { textAlign: "center", padding: "40px 10px" } }, _h("div", { style: { fontSize: 64 } }, "🙏"), _h("div", { style: { fontSize: 24, fontWeight: 800, color: "var(--green)" } }, "Thank you, " + b.name + "!"), _h("div", { style: { fontSize: 16, color: "var(--muted)", marginTop: 8 } }, "Please hand over the key and settle the bill at the reception. Have a safe journey.")));
+  if (!b) return wrap(
+    _h("h2", { style: { fontSize: 24, color: "var(--navy)", margin: "0 0 14px" } }, "🧳 Check-out"),
+    _h("label", { style: { display: "block", fontSize: 14, fontWeight: 700, color: "var(--muted)", marginBottom: 12 } }, "Room number", _h("input", { "data-t": "kiosk-room", value: room, onChange: e => setRoom(e.target.value), style: { ...field, marginTop: 6 } })),
+    _h("label", { style: { display: "block", fontSize: 14, fontWeight: 700, color: "var(--muted)", marginBottom: 12 } }, "Last 4 digits of your mobile number", _h("input", { "data-t": "kiosk-ph4", inputMode: "numeric", maxLength: 4, value: ph4, onChange: e => setPh4(e.target.value), style: { ...field, marginTop: 6, letterSpacing: 6 } })),
+    err && _h("div", { role: "alert", style: { color: "#b91c1c", fontSize: 14, marginBottom: 10 } }, err),
+    _h("button", { className: "btn-p", "data-t": "kiosk-find", onClick: find, style: { width: "100%", fontSize: 18, padding: 16 } }, "Continue"));
+  const room_ = (CURRENT_ROOMS || []).find(r => r.id === b.roomId);
+  let G = null; try { G = calcBillGST(b, room_, CURRENT_ROOMS); } catch (e) {}
+  const adv = bkAdvance(b), total = G ? G.grandTotal : 0;
+  return wrap(
+    _h("h2", { style: { fontSize: 22, color: "var(--navy)", margin: "0 0 10px" } }, "Namaste, " + b.name),
+    _h("div", { className: "card", "data-t": "kiosk-bill", style: { padding: 16, marginBottom: 12, fontSize: 16, lineHeight: 1.8 } },
+      _h("div", null, "Room " + b.roomId + " · since " + fmtDate(b.checkIn)),
+      G && _h("div", { style: { display: "flex", justifyContent: "space-between" } }, _h("span", null, "Bill total"), _h("b", null, fmtMoney(total))),
+      adv > 0 && _h("div", { style: { display: "flex", justifyContent: "space-between" } }, _h("span", null, "Advance paid"), _h("span", null, fmtMoney(adv))),
+      G && _h("div", { style: { display: "flex", justifyContent: "space-between", fontWeight: 800, color: "var(--navy)", fontSize: 18 } }, _h("span", null, "To pay at reception"), _h("span", null, fmtMoney(Math.max(0, total - adv)))),
+      _h("div", { style: { fontSize: 12.5, color: "var(--muted)" } }, "The final bill is made at the reception.")),
+    _h(SignaturePad, { onSign: setSig }),
+    _h("button", { className: "btn-n", "data-t": "kiosk-out-submit", disabled: busy, onClick: submit, style: { marginTop: 8, fontSize: 18, padding: 16, opacity: sig ? 1 : 0.6 } }, busy ? "Saving…" : "✅ Confirm check-out signature"));
+}
+// staff: guests waiting from the tablet (shown on top of Check-In)
+function KioskQueueBar({ onStart }) {
+  const _h = React.createElement;
+  const [q, setQ] = useState([]);
+  const [busy, setBusy] = useState("");
+  const load = () => Kiosk.queue().then(setQ).catch(() => {});
+  useEffect(() => { load(); const iv = setInterval(() => { if (!document.hidden) load(); }, 10000); return () => clearInterval(iv); }, []);
+  if (!q.length) return null;
+  const start = async it => { setBusy(it.id); try { const r = await Kiosk.takeCheckin(it.id); if (!r) { alert("This request is no longer available."); await Kiosk.finish(it.id); load(); return; } onStart(r); } finally { setBusy(""); } };
+  return _h("div", { "data-t": "kiosk-queue", style: { margin: "10px 14px 0", padding: "10px 12px", borderRadius: 12, background: "#eef6ff", border: "1.5px solid #bfdbfe" } },
+    _h("div", { style: { fontWeight: 700, color: "var(--navy)", fontSize: 13.5, marginBottom: 6 } }, "📲 From the reception tablet"),
+    q.sort((a, b) => a.at - b.at).map(it => _h("div", { key: it.id, "data-t": "kiosk-q-" + it.kind, style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "6px 0", borderTop: "1px solid #dbeafe", fontSize: 13 } },
+      it.kind === "in" ? _h("span", null, _h("b", null, it.name), " · " + it.mobile + " · " + (it.adults || 1) + " adult(s) · " + roTimeAgo(it.at)) : _h("span", null, "🧳 ", _h("b", null, it.name), " (Room " + it.room + ") signed check-out · collect payment · " + roTimeAgo(it.at)),
+      it.kind === "in" ? _h("button", { className: "btn-p", "data-t": "kiosk-q-start", disabled: busy === it.id, onClick: () => start(it), style: { width: "auto", padding: "6px 12px", fontSize: 12.5 } }, busy === it.id ? "…" : "Assign room")
+        : _h("button", { className: "btn-s", "data-t": "kiosk-q-ok", onClick: () => Kiosk.finish(it.id).then(load), style: { width: "auto", padding: "6px 12px", fontSize: 12.5 } }, "OK"))));
+}
+// Owner / Manager: list + view the KYC copies
+function KycCopiesCard({ openHtml }) {
+  const _h = React.createElement;
+  const [idx, setIdx] = useState(null);
+  const [q, setQ] = useState("");
+  const [msg, setMsg] = useState("");
+  const [shown, setShown] = useState(null);
+  const load = () => Kiosk.read(Kiosk.IDX, []).then(v => setIdx(Array.isArray(v) ? v.slice().reverse() : [])).catch(() => setIdx([]));
+  useEffect(() => { load(); }, []);
+  const view = async e => {
+    if (e.img === "pending" || e.outPending) { try { await KycLocal.sync(); } catch (er) {} }
+    const rec = await KycLocal.get(e.bid).catch(() => null);
+    if (!rec) { alert("This copy is saved on another Owner/Manager device, not on this one."); return; }
+    setShown({ bid: e.bid, name: e.name, img: rec.img });
+  };
+  const syncNow = async () => { setMsg("Saving…"); try { const n = await KycLocal.sync(); setMsg("✅ " + n + " new cop" + (n === 1 ? "y" : "ies") + " saved on this device"); load(); } catch (e) { setMsg("❌ " + e.message); } };
+  const list = (idx || []).filter(e => !q || (e.name + " " + e.room + " " + e.bid).toLowerCase().indexOf(q.toLowerCase()) >= 0).slice(0, 60);
+  return _h("div", { "data-t": "kyc-card", style: { background: "var(--card)", borderRadius: 16, padding: 18, border: "1px solid var(--border)", marginTop: 14 } },
+    _h("div", { style: { fontWeight: 700, fontSize: 16, color: "var(--navy)", marginBottom: 4 } }, "🪪 Guest KYC copies"),
+    _h("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 10 } }, "One small JPEG per stay: masked Aadhaar (front + back), family IDs, check-in and check-out signature. Kept only on the Owner/Manager device (also in the Vault folder, if one is set) — never stored in the cloud."),
+    ((CURRENT_PROFILE && CURRENT_PROFILE.aadhaarPhotoPolicy) || "none") === "none" && _h("div", { role: "alert", "data-t": "kyc-policy-warn", style: { fontSize: 12.5, color: "#92400e", background: "#fef3c7", borderRadius: 8, padding: "8px 10px", marginBottom: 8 } }, "⚠️ The Aadhaar photo setting is \"Don't save\", so the copies have details and signatures but no Aadhaar image. Change it to the masked option in Settings to include the masked Aadhaar."),
+    _h("div", { style: { display: "flex", gap: 8, marginBottom: 8 } },
+      _h("input", { value: q, onChange: e => setQ(e.target.value), placeholder: "Search name / room / booking", style: { flex: 1, minWidth: 0 } }),
+      _h("button", { className: "btn-s", "data-t": "kyc-sync", onClick: syncNow, style: { width: "auto" } }, "⬇️ Save new")),
+    msg && _h("div", { role: "status", style: { fontSize: 12.5, marginBottom: 6 } }, msg),
+    idx === null ? _h("div", { style: { fontSize: 13, color: "var(--muted)" } }, "Loading…")
+      : !list.length ? _h("div", { style: { fontSize: 13, color: "var(--muted)" } }, "No copies yet. They are made at every check-in.")
+      : list.map(e => _h("div", { key: e.bid, "data-t": "kyc-row", style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "7px 0", borderTop: "1px solid var(--border)", fontSize: 13 } },
+        _h("span", null, _h("b", null, e.name), " · Room " + e.room, _h("br"), _h("span", { style: { fontSize: 11.5, color: "var(--muted)" } }, "In " + kycFmt(e.in) + (e.out ? " · Out " + kycFmt(e.out) : " · not signed out yet"))),
+        _h("button", { className: "btn-s", "data-t": "kyc-view", onClick: () => view(e), style: { width: "auto", padding: "6px 12px" } }, "View"))),
+    shown && _h("div", { "data-t": "kyc-viewer", role: "dialog", "aria-label": "KYC copy", style: { position: "fixed", inset: 0, zIndex: 9999, background: "rgba(0,0,0,.75)", display: "flex", flexDirection: "column" } },
+      _h("div", { style: { display: "flex", gap: 8, padding: 10, background: "var(--navy)" } },
+        _h("button", { className: "btn-s", onClick: () => setShown(null), style: { width: "auto" } }, "← Back"),
+        _h("a", { className: "btn-s", download: shown.bid + "_" + String(shown.name || "").replace(/[^A-Za-z0-9]/g, "") + "_KYC.jpg", href: shown.img, style: { width: "auto", textDecoration: "none" } }, "⬇️ Download JPEG")),
+      _h("div", { style: { flex: 1, overflow: "auto", textAlign: "center", padding: 10 } }, _h("img", { src: shown.img, alt: "KYC copy " + shown.name, style: { maxWidth: "100%", background: "#fff" } }))));
 }
 
 // ── BANQUET (paid add-on "banquet") ──────────────────────────────────
@@ -16136,6 +16604,7 @@ function App() {
       _photoB,
       _resId,
       _extraRooms,
+      _kioskId,
       ...clean
     } = form;
     const nb = {
@@ -16205,6 +16674,11 @@ function App() {
     // the local folder even though guest_details.json test files did.
     if (localStorage.getItem("ab_local_folder")) {
       LocalFS.saveCheckIn(nb, _photoF, _photoB).catch(e => console.warn("LocalFS save:", e.message));
+    }
+    // Check-in desk add-on: one small masked KYC copy for the stay
+    if (hasFeature("kiosk")) {
+      if (_kioskId) Kiosk.finish(_kioskId).catch(e => console.warn("kiosk finish:", e.message));
+      saveKycForBooking(nb);
     }
     setCIR(null);
     setResPrefill(null);
@@ -16402,6 +16876,14 @@ function App() {
   }, [roToken, profile.hotelName, JSON.stringify(profile.restaurantTables || []), rooms, menuTick, user && user.u, enabledFeatures]);
   // Approve = re-price from the hotel's own menu (never the guest's copy),
   // mark the order approved, then add it to the room bill.
+  useEffect(() => { CURRENT_USER = user || null; }, [user]);
+  // Check-in desk add-on: Owner/Manager devices keep a local copy of every KYC image
+  useEffect(() => {
+    if (!user || !hasFeature("kiosk") || (user.role !== "Owner" && user.role !== "Manager")) return;
+    const run = () => { if (!document.hidden) KycLocal.sync().catch(e => console.warn("KYC sync:", e.message)); };
+    const t0 = setTimeout(run, 4000), iv = setInterval(run, 180000);
+    return () => { clearTimeout(t0); clearInterval(iv); };
+  }, [user && user.u, enabledFeatures]);
   const handleRoomOrderApprove = async o => {
     if (roIsTable(o.room)) {
       const table = String(o.room).slice(2);
@@ -16825,7 +17307,11 @@ function App() {
     style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
   }, /*#__PURE__*/React.createElement(KotPrinterCard, null), user.role === "Owner" && /*#__PURE__*/React.createElement(RestaurantStaffLoginCard, null),
     user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "captain", role: "Captain", title: "🧑‍✈️ Captain login", desc: "sees approved room orders, prints the KOT and marks orders served (Room Orders + Kitchen only)." }),
-    user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "chef", role: "Chef", title: "👨‍🍳 Chef login", desc: "sees only the Kitchen screen and updates the order status." })));
+    user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "chef", role: "Chef", title: "👨‍🍳 Chef login", desc: "sees only the Kitchen screen and updates the order status." })), hasFeature("kiosk") && (user.role === "Owner" || user.role === "Manager") && React.createElement("div", {
+    "data-t": "kiosk-settings", style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
+  },
+    user.role === "Owner" && React.createElement(StaffLoginCard, { username: "checkin", role: "Kiosk", title: "📲 Check-in desk (tablet) login", desc: "for the reception tablet: guests do check-in (Aadhaar scan + details + signature) and sign at check-out. It cannot see bills, rooms or reports." }),
+    React.createElement(KycCopiesCard, { openHtml: (label, html) => setInvoiceView({ kind: "rbill", bill: null, label, html }) })));
   // Owner-deleted entries stay only as small stubs (status "deleted") so other
   // devices can't bring them back — every screen works without them.
   const viewBookings = bookings.filter(b => b && b.status !== "deleted");
@@ -16919,7 +17405,7 @@ function App() {
       alignItems: "center",
       gap: 10
     }
-  }, /*#__PURE__*/React.createElement("button", {
+  }, user.role !== "Kiosk" && /*#__PURE__*/React.createElement("button", {
     onClick: () => setUpdatePwd(true),
     "aria-label": "Settings",
     title: "Settings — password, KOT printer, staff login",
@@ -16975,8 +17461,10 @@ function App() {
     setView: setView,
     setCheckInRoom: setCIR,
     onReleaseRoom: handleReleaseStuckRoom
+  }), view === "checkin" && hasFeature("kiosk") && user.role !== "Kiosk" && React.createElement(KioskQueueBar, {
+    onStart: r => { setResPrefill({ name: r.form.name, mobile: r.form.mobile, adults: r.form.adults, children: r.form.children, kiosk: r }); }
   }), view === "checkin" && /*#__PURE__*/React.createElement(CheckInView, {
-    key: resPrefill?.id || "walkin",
+    key: resPrefill?.kiosk ? "k" + resPrefill.kiosk.id : resPrefill?.id || "walkin",
     user: user,
     rooms: rooms,
     checkInRoom: checkInRoom,
@@ -17015,6 +17503,8 @@ function App() {
     user: user,
     onAddCharge: handleAddCharge,
     openHtmlBill: bill => setInvoiceView({ kind: "rbill", bill, label: bill.id, html: buildRestaurantBillHTML(bill) })
+  }), view === "kiosk" && hasFeature("kiosk") && user.role === "Kiosk" && React.createElement(KioskView, {
+    user: user, rooms: rooms, bookings: viewBookings
   }), view === "banquet" && hasFeature("banquet") && /*#__PURE__*/React.createElement(BanquetView, {
     user: user,
     openHtml: (label, html) => setInvoiceView({ kind: "rbill", bill: null, label, html })
