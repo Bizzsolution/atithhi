@@ -1830,6 +1830,7 @@ const LocalFS = {
       const perm = await handle.queryPermission({ mode: "readwrite" });
       if (perm === "granted") {
         this._dirHandle = handle;
+        setTimeout(() => this.flushQueue().catch(() => {}), 50);
         return true;
       }
       // Not yet granted for this session — caller can show a button that
@@ -1840,6 +1841,48 @@ const LocalFS = {
       console.warn("Restore handle:", e.message);
       return false;
     }
+  },
+  // ── waiting queue: a save that could not run (folder access paused by
+  // the browser) waits on this device and is written as soon as access
+  // is back — so no document is missed any more.
+  _qKey: "ab_fs_queue",
+  queueList() { try { const v = JSON.parse(localStorage.getItem(this._qKey) || "[]"); return Array.isArray(v) ? v : []; } catch (e) { return []; } },
+  _qSave(l) { try { localStorage.setItem(this._qKey, JSON.stringify(l.slice(-500))); } catch (e) {} window.dispatchEvent(new Event("ab-fs-queue")); },
+  async queueCheckIn(booking, photoF, photoB) {
+    try { await ImgDB.put("fsq_" + booking.id, { booking, photoF: photoF || null, photoB: photoB || null }); } catch (e) { console.warn("folder queue:", e.message); }
+    this._qSave(this.queueList().filter(x => x !== "ci:" + booking.id).concat(["ci:" + booking.id]));
+  },
+  queueKyc(bid) { this._qSave(this.queueList().filter(x => x !== "kyc:" + bid).concat(["kyc:" + bid])); },
+  async saveOrQueue(booking, photoF, photoB) {
+    let ok = false;
+    try { ok = await this.saveCheckIn(booking, photoF, photoB); } catch (e) { ok = false; }
+    if (!ok) await this.queueCheckIn(booking, photoF, photoB);
+    else this.flushQueue().catch(() => {});
+    return ok;
+  },
+  _flushing: false,
+  async flushQueue() {
+    if (this._flushing || !localStorage.getItem("ab_local_folder")) return 0;
+    const list = this.queueList(); if (!list.length) return 0;
+    if (!(await this.restoreHandle())) return 0;
+    this._flushing = true; let n = 0;
+    try {
+      for (const it of list) {
+        let ok = false;
+        if (it.indexOf("ci:") === 0) {
+          const job = await ImgDB.get("fsq_" + it.slice(3)).catch(() => null);
+          if (!job) ok = true; // nothing left to save
+          else { ok = await this.saveCheckIn(job.booking, job.photoF, job.photoB).catch(() => false); if (ok) await ImgDB.del("fsq_" + it.slice(3)).catch(() => {}); }
+        } else if (it.indexOf("kyc:") === 0) {
+          const rec = await KycLocal.get(it.slice(4)).catch(() => null);
+          ok = !rec || await KycLocal.toFolder(rec, true);
+        } else ok = true;
+        if (ok) { n++; this._qSave(this.queueList().filter(x => x !== it)); }
+        else break; // access went away again — keep the rest waiting
+      }
+    } finally { this._flushing = false; }
+    if (n) AuditLog.add("LOCAL_FOLDER_CATCHUP", n + " waiting document(s) saved");
+    return n;
   },
   // Must be called directly from a click handler (real user gesture) —
   // re-requests permission on the handle restored from IndexedDB, WITHOUT
@@ -1852,6 +1895,8 @@ const LocalFS = {
       if (perm === "granted") {
         this._dirHandle = handle;
         this._pendingHandle = null;
+        window.dispatchEvent(new Event("ab-fs-queue"));
+        setTimeout(() => this.flushQueue().catch(() => {}), 50);
         return true;
       }
       return false;
@@ -2061,13 +2106,17 @@ const AuditLog = {
 let AUDIT_USER = "";
 const Session = {
   TIMEOUT: 8 * 60 * 60 * 1000,
+  // Owner setting (profile.autoLogoutHours): 0 = only when someone taps Exit
+  hours() { const h = CURRENT_PROFILE && CURRENT_PROFILE.autoLogoutHours; return h === 0 || h === "0" ? 0 : (Number(h) > 0 ? Number(h) : 8); },
   touch() {
     try { localStorage.setItem("ab_sess", Date.now().toString()); } catch (e) { console.warn("Session touch:", e.message); }
   },
   valid() {
     let t = 0;
     try { t = +localStorage.getItem("ab_sess") || 0; } catch {}
-    return Date.now() - t < this.TIMEOUT;
+    const h = this.hours();
+    if (h === 0) return true;
+    return Date.now() - t < h * 60 * 60 * 1000;
   },
   clear() {
     try { localStorage.removeItem("ab_sess"); } catch {}
@@ -5483,7 +5532,7 @@ function LoginScreen({
               n.slice(0, 5) + " " + n.slice(5))))),
         _h("div", { style: { borderTop: "1px solid #22324d", paddingTop: 14, display: "flex", alignItems: "center", gap: 10, fontSize: 12.5, color: "#a9b7cc" } },
           _h("span", { "aria-hidden": "true", style: { width: 8, height: 8, borderRadius: "50%", background: "#34d399", display: "inline-block", flexShrink: 0 } }),
-          "Device verified · Automatic logout after 8 hours"))));
+          "Device verified · " + (Session.hours() === 0 ? "Stays logged in until you tap Exit" : "Automatic logout after " + (Session.hours() >= 24 ? (Session.hours() / 24) + (Session.hours() === 24 ? " day" : " days") : Session.hours() + " hours") + " without use")))));
 }
 function StatCard({
   emoji,
@@ -8236,10 +8285,7 @@ Return one box for EVERY place the 12-digit number appears (there may be more th
     style: { width: 16, height: 16 }
   }), "💰 Use a different rate for this booking (season/negotiated)"), useCustomRate && /*#__PURE__*/React.createElement("div", {
     style: { marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }
-  }, /*#__PURE__*/React.createElement("select", {
-    value: RATE_PRESETS.includes(Number(customRate)) ? customRate : (customRate ? "custom" : ""),
-    onChange: e => setCustomRate(e.target.value === "custom" ? "" : e.target.value)
-  }, /*#__PURE__*/React.createElement("option", { value: "" }, "-- Select rate --"), RATE_PRESETS.map(p => /*#__PURE__*/React.createElement("option", { key: p, value: p }, "₹", p, "/night")), /*#__PURE__*/React.createElement("option", { value: "custom" }, "✏️ Custom Amount...")), (customRate === "" || !RATE_PRESETS.includes(Number(customRate))) && /*#__PURE__*/React.createElement("input", {
+  }, /*#__PURE__*/React.createElement("input", {
     type: "number",
     min: "0",
     placeholder: "Custom rate per night (₹)",
@@ -12136,7 +12182,7 @@ function StorageSettingsView({
       flexDirection: "column",
       gap: 8
     }
-  }, "⚠️ Access needs to be re-confirmed after page reload (browser security) — click below, no need to re-select the folder.", /*#__PURE__*/React.createElement("button", {
+  }, "⚠️ The browser pauses folder access when the app is closed. Nothing is lost: new documents wait on this device and are saved here as soon as you tap below." + (LocalFS.queueList().length ? " (" + LocalFS.queueList().length + " waiting)" : "") + " To stop this for good: when Chrome asks, choose “Allow on every visit”, or install the app (⋮ menu → Install app / Add to Home screen).", /*#__PURE__*/React.createElement("button", {
     onClick: reEnableAccess,
     style: {
       padding: "9px",
@@ -14335,15 +14381,16 @@ const KycLocal = {
   },
   async get(bid) { const db = await this.open(); return new Promise(res => { const q = db.transaction("files").objectStore("files").get(bid); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); }); },
   async put(bid, rec) { const db = await this.open(); return new Promise((res, rej) => { const t = db.transaction("files", "readwrite"); t.objectStore("files").put(rec, bid); t.oncomplete = () => res(true); t.onerror = () => rej(t.error); }); },
-  async toFolder(rec) {
+  async toFolder(rec, fromQueue) {
+    if (!localStorage.getItem("ab_local_folder")) return false;
     try {
-      if (!localStorage.getItem("ab_local_folder") || !LocalFS || !(await LocalFS.restoreHandle())) return false;
+      if (!(await LocalFS.restoreHandle())) { if (!fromQueue) LocalFS.queueKyc(rec.bid); return false; }
       const root = LocalFS._dirHandle;
       const dir = await (await root.getDirectoryHandle("KYC", { create: true })).getDirectoryHandle(String(rec.in ? new Date(rec.in).toISOString().slice(0, 7) : "misc"), { create: true });
       const fh = await dir.getFileHandle(rec.bid + "_" + String(rec.name || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 20) + ".jpg", { create: true });
       const w = await fh.createWritable(); await w.write(dataURLtoBlob(rec.img)); await w.close();
       return true;
-    } catch (e) { console.warn("KYC folder save:", e.message); return false; }
+    } catch (e) { console.warn("KYC folder save:", e.message); if (!fromQueue) LocalFS.queueKyc(rec.bid); return false; }
   },
   // Owner/Manager device: take every waiting image / check-out signature,
   // keep it here, then wipe it from the cloud
@@ -14422,6 +14469,31 @@ async function kycCheckout(b, sigUrl) {
   if (boss) KycLocal.sync().catch(() => {});
 }
 const kycAddCheckoutSig = (b, sigUrl) => kycCheckout(b, sigUrl);
+
+// Shown on every screen while the browser has paused the local folder:
+// one tap gives access back and writes everything that was waiting.
+function FolderPausedBar() {
+  const _h = React.createElement;
+  const [st, setSt] = useState({ paused: false, n: 0 });
+  const [busy, setBusy] = useState(false);
+  const check = async () => {
+    if (!localStorage.getItem("ab_local_folder") || !LocalFS.isSupported()) { setSt({ paused: false, n: 0 }); return; }
+    const ok = !!LocalFS._dirHandle || await LocalFS.restoreHandle().catch(() => false);
+    setSt({ paused: !ok, n: LocalFS.queueList().length });
+  };
+  useEffect(() => {
+    check();
+    const f = () => check();
+    window.addEventListener("ab-fs-queue", f); document.addEventListener("visibilitychange", f);
+    const iv = setInterval(f, 30000);
+    return () => { window.removeEventListener("ab-fs-queue", f); document.removeEventListener("visibilitychange", f); clearInterval(iv); };
+  }, []);
+  if (!st.paused) return null;
+  const resume = async () => { setBusy(true); try { const ok = await LocalFS.requestPermissionOnClick(); if (ok) { await LocalFS.flushQueue(); } } finally { setBusy(false); check(); } };
+  return _h("div", { "data-t": "fs-paused", role: "status", style: { position: "fixed", left: 10, right: 10, bottom: 86, zIndex: 900, maxWidth: 520, margin: "0 auto", background: "#7c2d12", color: "#fff", borderRadius: 14, padding: "10px 12px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 8px 22px rgba(0,0,0,.25)", fontSize: 13 } },
+    _h("span", { style: { flex: 1, lineHeight: 1.35 } }, "📁 Local folder paused by the browser", st.n ? " — " + st.n + " document" + (st.n === 1 ? "" : "s") + " waiting (safe on this device)" : ""),
+    _h("button", { "data-t": "fs-resume", onClick: resume, disabled: busy, style: { flex: "0 0 auto", border: 0, borderRadius: 10, padding: "9px 14px", background: "#fde68a", color: "#7c2d12", fontWeight: 800, fontSize: 13, cursor: "pointer" } }, busy ? "…" : "Resume"));
+}
 
 // ── Tablet screen ────────────────────────────────────────────────────
 function KioskView({ user, rooms, bookings }) {
@@ -15528,12 +15600,13 @@ function App() {
     }, 60000);
     // Track activity
     const touch = () => Session.touch();
-    window.addEventListener("click", touch);
-    window.addEventListener("keydown", touch);
+    const vis = () => { if (!document.hidden && Session.valid()) Session.touch(); };
+    ["click", "keydown", "touchstart", "scroll"].forEach(ev => window.addEventListener(ev, touch, { passive: true }));
+    document.addEventListener("visibilitychange", vis);
     return () => {
       clearInterval(iv);
-      window.removeEventListener("click", touch);
-      window.removeEventListener("keydown", touch);
+      ["click", "keydown", "touchstart", "scroll"].forEach(ev => window.removeEventListener(ev, touch));
+      document.removeEventListener("visibilitychange", vis);
     };
   }, [user]);
   const [licenseSet, setLicenseSet] = useState(() => !!localStorage.getItem("ab_license_key"));
@@ -16690,7 +16763,7 @@ function App() {
     // button — real check-ins never triggered it, so photos never reached
     // the local folder even though guest_details.json test files did.
     if (localStorage.getItem("ab_local_folder")) {
-      LocalFS.saveCheckIn(nb, _photoF, _photoB).catch(e => console.warn("LocalFS save:", e.message));
+      LocalFS.saveOrQueue(nb, _photoF, _photoB).catch(e => console.warn("LocalFS save:", e.message));
     }
     // one small masked KYC copy for every stay (kept on the Owner/Manager device)
     if (_kioskId) Kiosk.finish(_kioskId).catch(e => console.warn("kiosk finish:", e.message));
@@ -17328,6 +17401,12 @@ function App() {
     user.role === "Owner" && hasFeature("qr_any") && /*#__PURE__*/React.createElement(StaffLoginCard, { username: "chef", role: "Chef", title: "👨‍🍳 Chef login", desc: "sees only the Kitchen screen and updates the order status." })), (user.role === "Owner" || user.role === "Manager") && React.createElement("div", {
     "data-t": "kiosk-settings", style: { padding: "0 16px 32px", maxWidth: 400, margin: "0 auto" }
   },
+    user.role === "Owner" && React.createElement("div", { "data-t": "auto-logout-card", style: { background: "var(--card)", borderRadius: 16, padding: 18, border: "1px solid var(--border)", marginTop: 14 } },
+      React.createElement("div", { style: { fontWeight: 700, fontSize: 16, color: "var(--navy)", marginBottom: 4 } }, "🔐 Auto logout"),
+      React.createElement("div", { style: { fontSize: 12, color: "var(--muted)", marginBottom: 10 } }, "When should staff be logged out on their own? Any tap or scroll counts as use. Applies to every device of this hotel."),
+      React.createElement("select", { "data-t": "auto-logout", "aria-label": "Auto logout", value: String(Session.hours()), onChange: async e => { const h = Number(e.target.value); await saveProfile({ ...profile, autoLogoutHours: h }); Session.touch(); AuditLog.add("AUTO_LOGOUT_SETTING", h === 0 ? "never" : h + "h"); }, style: { width: "100%", padding: "10px 12px", borderRadius: 10, border: "1.5px solid var(--border)", fontSize: 14 } },
+        [[0, "Never — only when someone taps Exit"], [8, "After 8 hours without use"], [24, "After 1 day without use"], [72, "After 3 days without use"], [168, "After 7 days without use"]].map(([v, l]) => React.createElement("option", { key: v, value: String(v) }, l))),
+      Session.hours() === 0 && React.createElement("div", { style: { fontSize: 11.5, color: "#92400e", marginTop: 6 } }, "Keep shared phones locked — anyone holding them can use the app.")),
     user.role === "Owner" && hasFeature("kiosk") && React.createElement(StaffLoginCard, { username: "checkin", role: "Kiosk", title: "📲 Check-in desk (tablet) login", desc: "for the reception tablet: guests do check-in (Aadhaar scan + details + signature) and sign at check-out. It cannot see bills, rooms or reports." }),
     React.createElement(KycCopiesCard, { openHtml: (label, html) => setInvoiceView({ kind: "rbill", bill: null, label, html }) })));
   // Owner-deleted entries stay only as small stubs (status "deleted") so other
@@ -17589,7 +17668,7 @@ function App() {
     style: {
       flexShrink: 0
     }
-  }, /*#__PURE__*/React.createElement(BottomNav, {
+  }, user.role !== "Kiosk" && React.createElement(FolderPausedBar, null), /*#__PURE__*/React.createElement(BottomNav, {
     view: view,
     setView: setView,
     role: user?.role,
