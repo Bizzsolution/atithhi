@@ -109,6 +109,45 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 .radio-pill{padding:10px;border:1.5px solid #263248;border-radius:10px;text-align:center;font-size:12px;font-weight:700;cursor:pointer;color:#94a3b8;transition:.15s}
 .radio-pill.selected{border-color:#3b82f6;background:#152238;color:#93c5fd}
 @media(max-width:600px){.stats{grid-template-columns:1fr 1fr}.gen-row{flex-direction:column}.tabbar{flex-wrap:wrap}}
+
+/* ── v5.39 sidebar layout ── */
+#app .main{max-width:1100px;margin:0 0 0 240px;padding:22px 28px 40px}
+.sb{position:fixed;left:0;top:0;bottom:0;width:240px;background:#0f172a;border-right:1px solid #1e293b;display:flex;flex-direction:column;z-index:50}
+.sb-logo{display:flex;align-items:center;gap:10px;padding:18px 18px 14px;border-bottom:1px solid #1e293b}
+.sb-nav{flex:1;overflow-y:auto;padding:10px 10px}
+.sb-item{display:flex;align-items:center;gap:12px;width:100%;padding:11px 14px;margin:2px 0;border:0;border-radius:10px;background:transparent;color:#cbd5e1;font-size:14px;font-weight:600;cursor:pointer;text-align:left}
+.sb-item:hover{background:#1e293b}
+.sb-item.active{background:linear-gradient(90deg,#1d3a2a,#1e293b);color:#fbbf24;box-shadow:inset -3px 0 0 #fbbf24}
+.sb-item .ic{width:22px;text-align:center;font-size:17px}
+.sb-sep{font-size:10.5px;color:#475569;font-weight:700;letter-spacing:.5px;margin:12px 14px 4px}
+.sb-foot{padding:12px 14px;border-top:1px solid #1e293b}
+.sb-scrim{display:none}
+.topbar{display:none}
+.page-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:18px}
+.page-title{font-size:24px;margin:0;color:#f8fafc}
+.ds-cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:10px}
+.ds-card{background:linear-gradient(160deg,#1e3a5f,#172554);border:1px solid #1e40af;border-radius:16px;padding:18px 16px;text-align:left;cursor:pointer;color:#e2e8f0}
+.ds-card:hover{border-color:#60a5fa}
+.ds-num{font-size:28px;font-weight:800;color:#60a5fa;line-height:1.1}
+.ds-lbl{font-size:12.5px;color:#cbd5e1;margin-top:6px;font-weight:600}
+.ds-note{font-size:11px;color:#64748b;margin:0 0 16px}
+.ds-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:11px 4px;border-bottom:1px solid #1e293b}
+.ds-row:last-child{border-bottom:0}
+.ds-act{display:flex;gap:10px;padding:8px 4px;border-bottom:1px solid #1e293b;font-size:13px}
+.ds-act time{color:#64748b;font-size:11.5px;min-width:78px}
+.hp-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;background:#0b1220;border:1px solid #1e293b;border-radius:10px;margin-bottom:8px}
+@media (max-width:1100px){.ds-cards{grid-template-columns:repeat(3,1fr)}}
+@media (max-width:900px){
+  #app .main{margin:0;padding:16px 14px 40px}
+  .sb{transform:translateX(-100%);transition:transform .2s;box-shadow:0 0 30px rgba(0,0,0,.5)}
+  .sb.open{transform:none}
+  .sb-scrim.open{display:block;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:40}
+  .topbar{display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:30;background:#0f172a;padding:10px 14px;border-bottom:1px solid #1e293b}
+  .sb-burger{background:#1e293b;border:0;color:#e2e8f0;font-size:18px;border-radius:8px;width:40px;height:40px;cursor:pointer}
+  .ds-cards{grid-template-columns:repeat(2,1fr)}
+  .page-title{font-size:20px}
+}
+@media (prefers-reduced-motion:reduce){.sb{transition:none}}
 </style>
 </head>
 <body>
@@ -128,40 +167,38 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 
 <!-- DASHBOARD -->
 <div id="app">
-  <div class="header">
-    <div class="logo">
-      <div class="logo-icon">🏨</div>
-      <div>
-        <div class="logo-name">AtithiBook</div>
-        <div class="logo-sub">Admin Panel</div>
-      </div>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px">
+  <!-- v5.39: BillBlitz-style sidebar (same features, easier control) -->
+  <aside class="sb" id="sb" aria-label="Admin menu">
+    <div class="sb-logo"><div class="logo-icon">🏨</div><div><div class="logo-name">AtithiBook</div><div class="logo-sub">Admin Panel</div></div></div>
+    <nav class="sb-nav" id="sbNav"></nav>
+    <div class="sb-foot">
       <span id="cloudSyncStatus" style="font-size:11px;color:#64748b">☁️ —</span>
-      <button class="btn btn-danger" style="width:auto;padding:8px 16px" onclick="logout()">Logout</button>
+      <button class="btn btn-danger" style="width:100%;padding:9px 12px;margin-top:8px" onclick="logout()">🚪 Logout</button>
     </div>
-  </div>
-  
+  </aside>
+  <div class="sb-scrim" id="sbScrim" onclick="sbToggle(false)"></div>
+  <div class="topbar"><button class="sb-burger" aria-label="Menu" onclick="sbToggle(true)">☰</button><div class="logo-name" style="font-size:15px">AtithiBook Admin</div></div>
+
   <div class="main">
-    <div class="tabbar">
-      <button class="tab active" id="tab-dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
-      <button class="tab" id="tab-billing" onclick="switchTab('billing')">🧾 Billing</button>
-      <button class="tab" id="tab-settings" onclick="switchTab('settings')">⚙️ Settings</button>
-      <button class="tab" id="tab-guide" onclick="switchTab('guide')">📖 Guide</button>
-    </div>
+    <div class="page-head"><h1 class="page-title" id="pageTitle">📊 Dashboard</h1><button class="btn btn-success" id="pageAction" style="width:auto;padding:9px 16px" onclick="switchTab('keys')">➕ New Key</button></div>
 
     <!-- ═══ TAB: DASHBOARD ═══ -->
     <div class="tabpanel active" id="panel-dashboard">
-      <!-- Stats -->
-      <div class="stats">
-        <div class="stat"><div class="stat-num" id="totalLic">-</div><div class="stat-label">Total Licenses</div></div>
-        <div class="stat"><div class="stat-num" id="trialLic" style="color:#818cf8">-</div><div class="stat-label">Trial Keys</div></div>
-        <div class="stat"><div class="stat-num" id="paidLic" style="color:#34d399">-</div><div class="stat-label">Paid Keys</div></div>
+      <div class="ds-cards">
+        <button class="ds-card" onclick="switchTab('clients')"><div class="ds-num" id="dsTotal">-</div><div class="ds-lbl">Total Clients</div></button>
+        <button class="ds-card" onclick="switchTab('clients')"><div class="ds-num" id="dsPaid" style="color:#34d399">-</div><div class="ds-lbl">Active Paid</div></button>
+        <button class="ds-card" onclick="switchTab('clients')"><div class="ds-num" id="dsTrial" style="color:#818cf8">-</div><div class="ds-lbl">On Trial</div></button>
+        <button class="ds-card" onclick="switchTab('clients')"><div class="ds-num" id="dsExpired" style="color:#f87171">-</div><div class="ds-lbl">Expired</div></button>
+        <button class="ds-card" onclick="switchTab('revenue')"><div class="ds-num" id="dsRevenue" style="color:#fbbf24">-</div><div class="ds-lbl">Total Revenue</div></button>
       </div>
-      <div style="font-size:11px;color:#64748b;margin:-8px 0 14px;text-align:center">
-        Counts reflect the hotels currently loaded below (200 at a time) — use "Load More" or "Find by Key" to look beyond that, this is not a platform-wide total.
-      </div>
+      <div class="ds-note">Ginti abhi load hue hotels ki hai (200 ek baar me) — Clients me "Load More" se aur dikhte hain.</div>
+      <div class="section"><div class="section-title">🔴 Expiring Soon (Next 7 days)</div><div id="dsExpiring"></div></div>
+      <div class="section"><div class="section-title">🕒 Recent Activity</div><div id="dsActivity"></div></div>
+      <div style="display:none"><span id="totalLic"></span><span id="trialLic"></span><span id="paidLic"></span></div>
+    </div>
 
+    <!-- ═══ CLIENTS ═══ -->
+    <div class="tabpanel" id="panel-clients">
       <!-- Admin Vault — shown until the admin confirms it's backed up.
            See the ADMIN VAULT comment in the script for why it exists. -->
       <div id="vaultCard" class="section" style="display:none;border:1px solid #1d4ed8">
@@ -179,6 +216,30 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
         </div>
       </div>
 
+      <!-- Active Licenses -->
+      <div class="section">
+        <div class="section-title">📋 Active Licenses</div>
+        <input id="searchBox" oninput="debouncedRender()" placeholder="🔍 Search by name, phone, hotel or key (only within loaded list)..."
+          style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #263248;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px;margin-bottom:10px"/>
+        <div style="display:flex;gap:8px;margin-bottom:10px">
+          <input id="findKeyBox" placeholder="Find ANY hotel instantly by exact key..."
+            style="flex:1;box-sizing:border-box;background:#0b1220;border:1px solid #fbbf24;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px"/>
+          <button class="btn-outline btn" style="width:auto;white-space:nowrap;padding:0 16px"
+            onclick="findLicenseByKey(document.getElementById('findKeyBox').value).then(f=>showMsg(f?('✅ Found: '+(f.hotel||f.key)):'❌ Not found (checked new + old storage)', f?'success':'error'))">🔎 Find</button>
+        </div>
+        <button class="btn-outline btn" onclick="syncLicensesNow(true)"
+          style="width:100%;margin-bottom:8px">🔄 Sync licenses from cloud (other devices)</button>
+        <button class="btn-outline btn" style="width:100%;margin-bottom:14px;border-color:#fbbf24;color:#fbbf24"
+          onclick="if(confirm('Purani storage ke jo hotels abhi naye system mein nahi hain, sirf unhe copy karein? Jo hotel pehle se naye system mein hai uska data (features, plan) bilkul nahi badlega. Kuch delete nahi hota.')){showMsg('⏳ Migrating...','success');LicenseCloud.migrateOldArrayToNew().then(r=>{if(r.ok){showMsg('✅ '+r.migrated+' naye hotel copy hue · '+r.skipped+' pehle se the (unka naya data safe rakha)','success');syncLicensesNow(false);}else{showMsg('⚠️ Migration failed: '+r.error,'error');}})}">🔄 Migrate to Scalable Storage (one-time)</button>
+        <div id="msg" class="msg"></div>
+        <div id="licenseList">Loading...</div>
+        <button id="loadMoreBtn" class="btn-outline btn" style="width:100%;margin-top:10px;display:none" onclick="loadMoreLicenses()">⬇️ Load More Hotels</button>
+
+      </div>
+    </div>
+
+    <!-- ═══ LICENSE KEYS ═══ -->
+    <div class="tabpanel" id="panel-keys">
       <!-- Generate New Key -->
       <div class="section">
         <div class="section-title">🔑 Generate New License Key</div>
@@ -214,33 +275,32 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
         </div>
       </div>
 
-      <!-- Active Licenses -->
       <div class="section">
-        <div class="section-title">📋 Active Licenses</div>
-        <input id="searchBox" oninput="debouncedRender()" placeholder="🔍 Search by name, phone, hotel or key (only within loaded list)..."
-          style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #263248;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px;margin-bottom:10px"/>
-        <div style="display:flex;gap:8px;margin-bottom:10px">
-          <input id="findKeyBox" placeholder="Find ANY hotel instantly by exact key..."
-            style="flex:1;box-sizing:border-box;background:#0b1220;border:1px solid #fbbf24;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px"/>
-          <button class="btn-outline btn" style="width:auto;white-space:nowrap;padding:0 16px"
-            onclick="findLicenseByKey(document.getElementById('findKeyBox').value).then(f=>showMsg(f?('✅ Found: '+(f.hotel||f.key)):'❌ Not found (checked new + old storage)', f?'success':'error'))">🔎 Find</button>
-        </div>
-        <button class="btn-outline btn" onclick="syncLicensesNow(true)"
-          style="width:100%;margin-bottom:8px">🔄 Sync licenses from cloud (other devices)</button>
-        <button class="btn-outline btn" style="width:100%;margin-bottom:14px;border-color:#fbbf24;color:#fbbf24"
-          onclick="if(confirm('Purani storage ke jo hotels abhi naye system mein nahi hain, sirf unhe copy karein? Jo hotel pehle se naye system mein hai uska data (features, plan) bilkul nahi badlega. Kuch delete nahi hota.')){showMsg('⏳ Migrating...','success');LicenseCloud.migrateOldArrayToNew().then(r=>{if(r.ok){showMsg('✅ '+r.migrated+' naye hotel copy hue · '+r.skipped+' pehle se the (unka naya data safe rakha)','success');syncLicensesNow(false);}else{showMsg('⚠️ Migration failed: '+r.error,'error');}})}">🔄 Migrate to Scalable Storage (one-time)</button>
-        <div id="msg" class="msg"></div>
-        <div id="licenseList">Loading...</div>
-        <button id="loadMoreBtn" class="btn-outline btn" style="width:100%;margin-top:10px;display:none" onclick="loadMoreLicenses()">⬇️ Load More Hotels</button>
-
         <!-- Update Netlify Instructions -->
-        <div style="margin-top:20px;border-top:1px solid #1e293b;padding-top:16px">
+        <div>
           <div style="font-size:13px;font-weight:700;color:#f8fafc;margin-bottom:8px">⚠️ After adding/removing keys, update Netlify:</div>
           <div style="font-size:12px;color:#64748b;margin-bottom:8px">Copy the string below → Netlify Dashboard → Environment Variables → VALID_LICENSES → Paste → Save → Deploy</div>
           <div class="netlify-box" id="validLicString">Loading...</div>
           <button class="copy-all-btn" onclick="copyValidLicenses()">📋 Copy VALID_LICENSES String</button>
         </div>
       </div>
+    </div>
+
+    <!-- ═══ PER-HOTEL TOOLS (Features / Rooms / Menu / QR / Bill Settings / Data) ═══ -->
+    <div class="tabpanel" id="panel-hotel">
+      <div class="section">
+        <div id="hpHint" style="font-size:12.5px;color:#94a3b8;margin-bottom:10px"></div>
+        <input id="hpSearch" oninput="renderHotelPage()" placeholder="🔍 Hotel, owner, phone ya key se dhundho..." style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #263248;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px;margin-bottom:10px"/>
+        <div id="hpList"></div>
+      </div>
+    </div>
+
+    <!-- ═══ REVENUE ═══ -->
+    <div class="tabpanel" id="panel-revenue">
+      <div class="ds-cards" id="rvCards"></div>
+      <div class="section"><div class="section-title">📅 Month-wise (paid invoices)</div><div id="rvMonths"></div></div>
+      <div class="section"><div class="section-title">📦 Plan-wise (active clients)</div><div id="rvPlans"></div></div>
+      <div class="ds-note">Revenue 🧾 Billing ke invoices se banta hai (cancelled chhod ke). Naya invoice Billing me banao.</div>
     </div>
 
 
@@ -524,13 +584,109 @@ function escHtml(s){
 }
 
 // ── TAB NAVIGATION ──────────────────────────────
+// ── v5.39: sidebar pages ─────────────────────────────────────────────
+const ADMIN_PAGES = [
+  ["dashboard", "📊", "Dashboard"], ["clients", "🏨", "Clients"], ["keys", "🔑", "License Keys"],
+  "HOTEL TOOLS",
+  ["h:features", "🎛️", "Features"], ["h:rooms", "🛏️", "Rooms"], ["h:menu", "🍽️", "Menu Updater"], ["h:qr", "📲", "QR / Tables / Banquet"], ["h:billset", "🧾", "Bill Settings"], ["h:data", "🗂️", "Data"],
+  "BUSINESS",
+  ["revenue", "💰", "Revenue"], ["billing", "🧾", "Billing"], ["settings", "⚙️", "Settings"], ["guide", "📖", "Guide"]
+];
+const HOTEL_TOOLS = {
+  features: ["🎛️ Features", "Hotel chuno → uske features / add-ons ON-OFF karo.", "openFeatureControl", "🎛️ Features"],
+  rooms: ["🛏️ Rooms", "Hotel chuno → rooms add / edit / delete karo.", "openRoomManager", "🛏️ Rooms"],
+  menu: ["🍽️ Menu Updater", "Hotel chuno → restaurant menu import / update karo.", "openMenuImport", "🍽️ Menu"],
+  qr: ["📲 QR / Tables / Banquet", "Hotel chuno → QR link, room / table QR print, tables, banquet halls aur QR logo.", "openQrManager", "📲 Open"],
+  billset: ["🧾 Bill Settings", "Hotel chuno → bill design, stamp, GST options.", "openBillSettings", "🧾 Open"],
+  data: ["🗂️ Data", "Hotel chuno → hotel ka data dekho / sudhaaro.", "openDataManager", "🗂️ Open"]
+};
+let currentPage = "dashboard", hotelTool = "features";
+function renderSidebar() {
+  const nav = document.getElementById("sbNav"); if (!nav) return;
+  nav.innerHTML = ADMIN_PAGES.map(p => typeof p === "string" ? `<div class="sb-sep">${p}</div>` :
+    `<button class="sb-item${(p[0] === currentPage || p[0] === "h:" + hotelTool && currentPage === "hotel") ? " active" : ""}" data-page="${p[0]}" onclick="${p[0].indexOf("h:") === 0 ? `openHotelPage('${p[0].slice(2)}')` : `switchTab('${p[0]}')`}"><span class="ic">${p[1]}</span>${p[2]}</button>`).join("");
+}
+function sbToggle(open) { document.getElementById("sb").classList.toggle("open", !!open); document.getElementById("sbScrim").classList.toggle("open", !!open); }
 function switchTab(name){
-  ["dashboard","billing","settings","guide"].forEach(t => {
-    document.getElementById("tab-"+t).classList.toggle("active", t===name);
-    document.getElementById("panel-"+t).classList.toggle("active", t===name);
-  });
+  const panels = ["dashboard","clients","keys","hotel","revenue","billing","settings","guide"];
+  if (panels.indexOf(name) < 0) name = "dashboard";
+  currentPage = name;
+  panels.forEach(t => { const el = document.getElementById("panel-"+t); if (el) el.classList.toggle("active", t===name); });
+  const pg = ADMIN_PAGES.find(p => typeof p !== "string" && p[0] === name);
+  document.getElementById("pageTitle").textContent = name === "hotel" ? HOTEL_TOOLS[hotelTool][0] : pg ? pg[1] + " " + pg[2] : "";
+  const act = document.getElementById("pageAction"); if (act) act.style.display = (name === "dashboard" || name === "clients") ? "" : "none";
+  renderSidebar(); sbToggle(false);
+  try { window.scrollTo(0, 0); } catch (e) {}
   if (name === "billing" && typeof billingInit === "function") billingInit();
   if (name === "settings" && typeof renderSettingsVaultId === "function") renderSettingsVaultId();
+  if (name === "dashboard") { if (typeof billingInit === "function" && !blInited) { try { billingInit(); } catch (e) {} } renderAdminHome(); }
+  if (name === "revenue") { if (typeof billingInit === "function" && !blInited) { try { billingInit(); } catch (e) {} } renderRevenue(); }
+}
+function openHotelPage(kind) {
+  hotelTool = HOTEL_TOOLS[kind] ? kind : "features";
+  switchTab("hotel");
+  document.getElementById("hpHint").textContent = HOTEL_TOOLS[hotelTool][1];
+  renderHotelPage();
+}
+function renderHotelPage() {
+  const box = document.getElementById("hpList"); if (!box) return;
+  const t = HOTEL_TOOLS[hotelTool];
+  const q = (document.getElementById("hpSearch").value || "").trim().toLowerCase();
+  const list = licenses.map((l, i) => ({ l, i })).filter(({ l }) => !q || [l.hotel, l.owner, l.phone, l.key].some(x => String(x || "").toLowerCase().includes(q)));
+  box.innerHTML = list.map(({ l, i }) => `<div class="hp-row" style="${l.active ? "" : "opacity:.45"}">
+      <div style="min-width:0"><div style="font-weight:700;font-size:14px">${escHtml(l.hotel || "—")}</div>
+      <div style="font-size:11.5px;color:#64748b">${escHtml(l.key)}${l.owner ? " · " + escHtml(l.owner) : ""}${l.active ? "" : " · revoked"}</div></div>
+      <button class="btn" data-t="hp-open" style="width:auto;background:#1e3a5f;color:#bae6fd;white-space:nowrap" onclick="${t[2]}(${i})">${t[3]}</button></div>`).join("")
+    || `<div style="color:#64748b;text-align:center;padding:16px">${q ? "Koi hotel nahi mila" : "Abhi koi hotel nahi"}</div>`;
+}
+function dsToday() { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+// same formula as the badge in the Clients list, so both always show the same number
+function dsDaysLeft(l) { return l.expiry ? Math.ceil((new Date(l.expiry) - new Date()) / 86400000) : null; }
+function dsInvoices() { try { return (typeof Billing !== "undefined" && Array.isArray(Billing.invoices) ? Billing.invoices : []).filter(i => i && i.status !== "cancelled"); } catch (e) { return []; } }
+function dsMoney(n) { return "₹" + Math.round(Number(n) || 0).toLocaleString("en-IN"); }
+function renderAdminHome() {
+  if (!document.getElementById("dsTotal")) return;
+  const act = licenses.filter(l => l.active);
+  const expired = act.filter(l => { const d = dsDaysLeft(l); return d !== null && d < 0; });
+  const live = act.filter(l => expired.indexOf(l) < 0);
+  document.getElementById("dsTotal").textContent = act.length;
+  document.getElementById("dsPaid").textContent = live.filter(l => l.plan !== "TRIAL").length;
+  document.getElementById("dsTrial").textContent = live.filter(l => l.plan === "TRIAL").length;
+  document.getElementById("dsExpired").textContent = expired.length;
+  const inv = dsInvoices();
+  document.getElementById("dsRevenue").textContent = dsMoney(inv.filter(i => i.status === "paid").reduce((t, i) => t + ((i.totals && i.totals.total) || 0), 0));
+  // expiring in the next 7 days (+ expired in the last 7 days)
+  const soon = act.map(l => ({ l, d: dsDaysLeft(l) })).filter(x => x.d !== null && x.d <= 7 && x.d >= -7).sort((a, b) => a.d - b.d);
+  document.getElementById("dsExpiring").innerHTML = soon.map(({ l, d }) => { const i = licenses.indexOf(l); const ph = String(l.phone || "").split(",")[0].replace(/\D/g, "");
+    return `<div class="ds-row" data-t="ds-expiring"><div style="min-width:0"><div style="font-weight:700">${escHtml(l.hotel || l.key)}</div><div style="font-size:12px;color:#94a3b8">${[l.phone, l.plan].filter(Boolean).map(escHtml).join(" · ")}</div></div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end"><b style="color:${d < 0 ? "#f87171" : "#fbbf24"};white-space:nowrap">${d < 0 ? "Expired " + (-d) + "d" : d === 0 ? "Aaj" : d + "d left"}</b>
+      ${ph ? `<a class="btn" style="width:auto;background:#052e16;color:#4ade80;text-decoration:none" target="_blank" rel="noopener noreferrer" href="https://wa.me/91${escHtml(ph.slice(-10))}?text=${encodeURIComponent("Namaste " + (l.owner || "") + ", aapka AtithiBook plan " + (l.expiry || "") + " ko khatam " + (d < 0 ? "ho gaya hai" : "ho raha hai") + ". Renew karne ke liye reply karein. 🙏")}">💬</a>` : ""}
+      <button class="btn" data-t="ds-renew" style="width:auto;background:#fbbf24;color:#1f2937" onclick="openEditHotelModal(${i})">Renew</button></div></div>`; }).join("")
+    || `<div style="color:#64748b;font-size:13px;padding:6px 4px">Agle 7 din me koi plan khatam nahi ho raha. 🎉</div>`;
+  // recent activity: new clients + invoices
+  const evs = [];
+  licenses.forEach(l => { if (l.date) evs.push({ t: l.date, txt: "🔑 Naya client: " + (l.hotel || l.key) + " (" + (l.plan || "") + ")" }); });
+  inv.forEach(i => { evs.push({ t: i.date || "", txt: "🧾 Invoice " + i.number + " — " + ((i.client && i.client.name) || "") + " — " + dsMoney(i.totals && i.totals.total) + (i.status === "paid" ? " ✅ paid" : " · due") });
+    if (i.status === "paid" && i.payment && i.payment.date) evs.push({ t: i.payment.date, txt: "💰 Payment mila: " + i.number + " — " + dsMoney(i.totals && i.totals.total) + (i.payment.mode ? " (" + i.payment.mode + ")" : "") }); });
+  evs.sort((a, b) => String(b.t).localeCompare(String(a.t)));
+  document.getElementById("dsActivity").innerHTML = evs.slice(0, 12).map(e => `<div class="ds-act"><time>${escHtml(e.t)}</time><span>${escHtml(e.txt)}</span></div>`).join("")
+    || `<div style="color:#64748b;font-size:13px;padding:6px 4px">Abhi koi activity nahi.</div>`;
+}
+function renderRevenue() {
+  const inv = dsInvoices(), paid = inv.filter(i => i.status === "paid"), due = inv.filter(i => i.status === "unpaid");
+  const tot = a => a.reduce((t, i) => t + ((i.totals && i.totals.total) || 0), 0);
+  const ym = dsToday().slice(0, 7);
+  const monthOf = i => String((i.payment && i.payment.date) || i.date || "").slice(0, 7);
+  const prices = { BASIC: 499, PRO: 999, PREM: 1499 };
+  const act = licenses.filter(l => l.active && !(dsDaysLeft(l) !== null && dsDaysLeft(l) < 0));
+  const mrr = act.reduce((t, l) => t + (prices[l.plan] || 0), 0);
+  const card = (n, l, c) => `<div class="ds-card" style="cursor:default"><div class="ds-num" style="color:${c}">${n}</div><div class="ds-lbl">${l}</div></div>`;
+  document.getElementById("rvCards").innerHTML = card(dsMoney(tot(paid)), "Total received", "#fbbf24") + card(dsMoney(tot(paid.filter(i => monthOf(i) === ym))), "Is mahine", "#34d399") + card(dsMoney(tot(due)), "Due (unpaid)", "#f87171") + card(dsMoney(mrr), "Monthly plan value", "#60a5fa") + card(paid.length, "Paid invoices", "#818cf8");
+  const m = {}; paid.forEach(i => { const k = monthOf(i); if (k) m[k] = (m[k] || 0) + ((i.totals && i.totals.total) || 0); });
+  const keys = Object.keys(m).sort().reverse().slice(0, 12);
+  document.getElementById("rvMonths").innerHTML = keys.map(k => `<div class="ds-row"><span>${escHtml(new Date(k + "-01T00:00:00").toLocaleDateString("en-IN", { month: "long", year: "numeric" }))}</span><b>${dsMoney(m[k])}</b></div>`).join("") || `<div style="color:#64748b;font-size:13px">Abhi koi paid invoice nahi.</div>`;
+  const plans = ["TRIAL", "BASIC", "PRO", "PREM"];
+  document.getElementById("rvPlans").innerHTML = plans.map(pl => { const n = act.filter(l => l.plan === pl).length; return `<div class="ds-row"><span>${pl === "PREM" ? "Premium" : pl.charAt(0) + pl.slice(1).toLowerCase()} ${prices[pl] ? "(₹" + prices[pl] + "/mo)" : ""}</span><b>${n} client${n === 1 ? "" : "s"}${prices[pl] ? " · " + dsMoney(n * prices[pl]) + "/mo" : ""}</b></div>`; }).join("");
 }
 
 // ── SECURITY: Brute-force lockout for admin login ──
@@ -1241,6 +1397,7 @@ async function doLogin() {
     errEl.style.display = "none";
     document.getElementById("loginPage").style.display = "none";
     document.getElementById("app").style.display = "block";
+    try { renderSidebar(); switchTab(currentPage || "dashboard"); } catch (e) {}
     // Instant first paint from this device's cache (no writes), then
     // replace it with the live cloud list.
     renderDashboard();
@@ -1334,6 +1491,7 @@ function renderDashboard() {
   // Update valid licenses string
   const validStr = licenses.filter(l => l.active).map(l => l.key).join(",");
   document.getElementById("validLicString").textContent = validStr;
+  try { renderAdminHome(); if (currentPage === "hotel") renderHotelPage(); if (currentPage === "revenue") renderRevenue(); } catch (e) { console.warn("admin home:", e.message); }
 }
 
 // ── FEATURE CATALOG — every gateable premium feature in AtithiBook.
@@ -3195,6 +3353,7 @@ async function billingSyncCloud(showResult) {
   if (r.ok) {
     note.style.display = "none";
     billingRenderSettings(); billingRenderRegister(); billingRecalc();
+    try { renderAdminHome(); if (currentPage === "revenue") renderRevenue(); } catch (e) {}
     if (showResult) blMsg("☁️ Invoices cloud se sync ho gaye", "success");
   } else {
     note.style.display = "block";
