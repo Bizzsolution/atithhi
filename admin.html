@@ -139,6 +139,33 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
 .ds-act{display:flex;gap:10px;padding:8px 4px;border-bottom:1px solid #1e293b;font-size:13px}
 .ds-act time{color:#64748b;font-size:11.5px;min-width:78px}
 .hp-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;background:#0b1220;border:1px solid #1e293b;border-radius:10px;margin-bottom:8px}
+.qt-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0 10px}
+.qt-grid label{font-size:11px;color:#94a3b8;font-weight:600}
+.qt-grid input,.qt-grid select{margin-top:4px}
+.qt-status{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.qt-chip{display:inline-flex;align-items:center;font-size:12px;padding:6px 10px;border-radius:999px;background:#1e293b;color:#cbd5e1;border:1px solid #334155}
+.qt-chip.on{background:#052e16;color:#4ade80;border-color:#166534}.qt-chip.off{background:#2a1215;color:#fca5a5;border-color:#7f1d1d}
+.qt-hint{font-size:11.5px;color:#fcd34d;margin-top:8px}
+.qt-empty{color:#64748b;text-align:center;padding:16px;font-size:13px}
+.qt-bar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.qt-count{font-size:15px;font-weight:700;color:#f8fafc}
+.qt-fs{display:flex;gap:4px;background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:3px}
+.qt-f{background:none;border:0;color:#94a3b8;font-size:12.5px;padding:6px 12px;border-radius:8px;cursor:pointer}.qt-f.on{background:#1e3a5f;color:#e0f2fe}
+.qt-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+.qt-tools .btn{width:auto;padding:9px 14px}.qt-tools select{width:auto;margin:0;padding:9px 12px;font-size:13px}
+.qt-tools .qt-del{background:#450a0a;color:#fca5a5}
+.qt-tools .btn:disabled,.qt-act button:disabled{opacity:.45;cursor:not-allowed}
+.qt-row{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0b1220;border:1px solid #1e293b;border-radius:10px;margin-bottom:6px}
+.qt-row.on{border-color:#2563eb;background:#0c1a33}
+.qt-ck{display:flex;align-items:center;gap:10px;cursor:pointer;min-width:0;flex:0 0 auto}
+.qt-ck input{width:18px;height:18px;margin:0;accent-color:#3b82f6}
+.qt-ck b{font-size:15px;color:#f8fafc}
+.qt-tag{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:6px}.qt-tag.table{background:#3b2a07;color:#fcd34d}.qt-tag.room{background:#0c2d48;color:#7dd3fc}
+.qt-sub{flex:1;font-size:12px;color:#94a3b8;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qt-open{margin-left:8px;font-size:10.5px;background:#422006;color:#fcd34d;padding:2px 6px;border-radius:6px}
+.qt-act{display:flex;gap:4px}.qt-act button{background:#1e293b;border:0;border-radius:8px;width:34px;height:34px;cursor:pointer;font-size:14px}
+.qt-edit{padding:12px;background:#1e293b;border:1px solid #3b82f6;border-radius:10px;margin-bottom:6px}
+@media (max-width:600px){.qt-row{flex-wrap:wrap}.qt-sub{flex-basis:100%;order:3;padding-left:28px;white-space:normal}.qt-act{margin-left:auto}.qt-tools .btn,.qt-tools select{flex:1 1 45%}}
 @media (max-width:1100px){.ds-cards{grid-template-columns:repeat(3,1fr)}}
 @media (max-width:900px){
   #app .main{margin:0;padding:16px 14px 40px}
@@ -295,6 +322,45 @@ input:focus,select:focus,textarea:focus{border-color:#3b82f6}
         <div id="hpHint" style="font-size:12.5px;color:#94a3b8;margin-bottom:10px"></div>
         <input id="hpSearch" oninput="renderHotelPage()" placeholder="🔍 Hotel, owner, phone ya key se dhundho..." style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #263248;border-radius:10px;padding:11px 14px;color:#f8fafc;font-size:13px;margin-bottom:10px"/>
         <div id="hpList"></div>
+      </div>
+    </div>
+
+    <!-- ═══ QR TABLES (v5.40) ═══ -->
+    <div class="tabpanel" id="panel-qrt">
+      <div class="section">
+        <div class="section-title">🏨 Customer</div>
+        <select id="qtHotel" data-t="qt-hotel" onchange="qtPick(this.value)"></select>
+        <div id="qtTop"></div>
+        <div id="qtMsg" style="display:none;padding:10px 12px;border-radius:8px;font-size:12.5px;margin:10px 0 0"></div>
+      </div>
+      <div class="section">
+        <div class="section-title">➕ Ek saath banao</div>
+        <div class="qt-grid">
+          <label>Naam ka shuru<input id="qtPrefix" maxlength="9" value="T" placeholder="jaise T ya A" oninput="this.dataset.touched=1;qtPreview()"></label>
+          <label>Se<input id="qtFrom" type="number" min="0" value="1" oninput="qtPreview()"></label>
+          <label>Tak<input id="qtTo" type="number" min="0" value="10" oninput="qtPreview()"></label>
+          <label data-qt-for="table">Section<input id="qtSection" maxlength="20" value="Indoor" placeholder="Indoor / Rooftop"></label>
+          <label data-qt-for="table">Capacity<input id="qtCap" type="number" min="1" max="50" value="4"></label>
+          <label data-qt-for="room">Floor<input id="qtFloor" type="number" min="0" max="99" placeholder="auto (101 → 1)"></label>
+          <label data-qt-for="room">Room type<select id="qtRType"><option>Standard</option><option>AC Std</option><option>Deluxe</option><option>Suite</option></select></label>
+          <label data-qt-for="room">Rate ₹/night<input id="qtRate" type="number" min="1" value="1500"></label>
+          <label>Type<select id="qtType" data-t="qt-type" onchange="qtKind()"><option value="table">Table</option><option value="room">Room</option></select></label>
+        </div>
+        <div id="qtPreview" style="font-size:12px;color:#94a3b8;margin:-4px 0 10px"></div>
+        <button class="btn btn-success" id="qtCreateBtn" data-t="qt-create" onclick="qtCreate()" disabled>✨ Banao</button>
+        <div style="font-size:11px;color:#64748b;margin-top:8px">Bante hi neeche list me select ho jaate hain — seedha 🖨️ Print selected dabao. Pehle se bane naam chhod diye jaate hain.</div>
+      </div>
+      <div class="section" id="qtList" style="display:none">
+        <div class="qt-bar"><div class="qt-count" id="qtCount" data-t="qt-count"></div>
+          <div class="qt-fs"><button class="qt-f" data-f="all" data-t="qt-filter-all" onclick="qtSetFilter('all')">Sab</button><button class="qt-f" data-f="table" data-t="qt-filter-table" onclick="qtSetFilter('table')">Tables</button><button class="qt-f" data-f="room" data-t="qt-filter-room" onclick="qtSetFilter('room')">Rooms</button></div></div>
+        <div class="qt-tools">
+          <button class="btn" data-t="qt-all" onclick="qtSelAll(true)">☑️ Sab chuno</button>
+          <button class="btn" data-t="qt-none" onclick="qtSelAll(false)">⬜ Sab hatao</button>
+          <select id="qtSize" data-t="qt-size" onchange="qtSize()"></select>
+          <button class="btn qt-del" id="qtDelSel" data-t="qt-del-sel" onclick="qtDeleteSel()" disabled>🗑️ Delete selected</button>
+          <button class="btn btn-success" id="qtPrintSel" data-t="qt-print-sel" onclick="qtPrintSel()" disabled>🖨️ Print selected</button>
+        </div>
+        <div id="qtRows"></div>
       </div>
     </div>
 
@@ -591,7 +657,7 @@ function escHtml(s){
 const ADMIN_PAGES = [
   ["dashboard", "📊", "Dashboard"], ["clients", "🏨", "Clients"], ["keys", "🔑", "License Keys"],
   "HOTEL TOOLS",
-  ["h:features", "🎛️", "Features"], ["h:rooms", "🛏️", "Rooms"], ["h:menu", "🍽️", "Menu Updater"], ["h:qr", "📲", "QR / Tables / Banquet"], ["h:billset", "🧾", "Bill Settings"], ["h:data", "🗂️", "Data"],
+  ["h:features", "🎛️", "Features"], ["h:rooms", "🛏️", "Rooms"], ["h:menu", "🍽️", "Menu Updater"], ["qrt", "🔳", "QR Tables"], ["h:qr", "📲", "QR / Tables / Banquet"], ["h:billset", "🧾", "Bill Settings"], ["h:data", "🗂️", "Data"],
   "BUSINESS",
   ["revenue", "💰", "Revenue"], ["billing", "🧾", "Billing"], ["settings", "⚙️", "Settings"], ["guide", "📖", "Guide"]
 ];
@@ -611,7 +677,7 @@ function renderSidebar() {
 }
 function sbToggle(open) { document.getElementById("sb").classList.toggle("open", !!open); document.getElementById("sbScrim").classList.toggle("open", !!open); }
 function switchTab(name){
-  const panels = ["dashboard","clients","keys","hotel","revenue","billing","settings","guide"];
+  const panels = ["dashboard","clients","keys","hotel","qrt","revenue","billing","settings","guide"];
   if (panels.indexOf(name) < 0) name = "dashboard";
   currentPage = name;
   panels.forEach(t => { const el = document.getElementById("panel-"+t); if (el) el.classList.toggle("active", t===name); });
@@ -623,6 +689,7 @@ function switchTab(name){
   if (name === "billing" && typeof billingInit === "function") billingInit();
   if (name === "settings" && typeof renderSettingsVaultId === "function") renderSettingsVaultId();
   if (name === "dashboard") { if (typeof billingInit === "function" && !blInited) { try { billingInit(); } catch (e) {} } renderAdminHome(); }
+  if (name === "qrt") qtInit();
   if (name === "revenue") { if (typeof billingInit === "function" && !blInited) { try { billingInit(); } catch (e) {} } renderRevenue(); }
 }
 function openHotelPage(kind) {
@@ -2129,11 +2196,25 @@ function qrValidLogo(p) { const l = (p && p.qrLogo) || (p && p.hotelLogo); retur
 async function qrPrintIds(kind, ids, tok, hotelName, lg) {
   if (!tok) return "Pehle QR link banao.";
   if (!ids.length) return kind === "room" ? "Koi room nahi mila." : "Pehle tables add karo.";
+  return qrSheet(ids.map(id => ({ kind, id })), tok, hotelName, lg, "a4-9");
+}
+// items: [{kind:"room"|"table", id, sub?}] · size: a4-9 (3×3) | a4-4 (2×2) | a5-1 (1 card per A5 page)
+const QR_SHEET_CSS = {
+  "a4-9": { page: "", body: "margin:10mm", cols: 3, gap: "8mm", q: "42mm", pad: "6mm", h: 13, r: 20, t: 11 },
+  "a4-4": { page: "@page{size:A4;margin:12mm}", body: "margin:0", cols: 2, gap: "10mm", q: "68mm", pad: "8mm", h: 17, r: 30, t: 13 },
+  "a5-1": { page: "@page{size:A5;margin:10mm}", body: "margin:0", cols: 1, gap: "0", q: "92mm", pad: "10mm", h: 22, r: 40, t: 16, one: true }
+};
+async function qrSheet(items, tok, hotelName, lg, size) {
+  if (!tok) return "Pehle QR link banao.";
+  if (!items.length) return "Koi QR nahi chuna.";
+  const z = QR_SHEET_CSS[size] || QR_SHEET_CSS["a4-9"];
   const qr = await qrLoadMaker();
   const name = escHtml(hotelName || "");
-  const link = id => qmBase() + "?order=" + tok + "&" + kind + "=" + encodeURIComponent(id);
-  const cards = ids.map(id => { const q = qr(0, lg ? "H" : "M"); q.addData(link(id)); q.make(); const svg = q.createSvgTag(5, 2); return "<div class=c><div class=h>" + name + "</div>" + (lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div><div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
-  const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + (kind === "room" ? "Room" : "Table") + " QR codes</title><style>" + (lg ? ".q{position:relative;display:inline-block;width:42mm;height:42mm}.q svg{width:100%!important;height:100%!important;display:block}.lg{position:absolute;left:50%;top:50%;width:11mm;height:11mm;transform:translate(-50%,-50%);background:#fff url('" + lg + "') center/8.6mm 8.6mm no-repeat;border-radius:2mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}" : "") + "body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+  const link = (kind, id) => qmBase() + "?order=" + tok + "&" + kind + "=" + encodeURIComponent(id);
+  const cards = items.map(({ kind, id, sub }) => { const q = qr(0, lg ? "H" : "M"); q.addData(link(kind, id)); q.make(); const svg = q.createSvgTag(5, 2); return "<div class=c><div class=h>" + name + "</div>" + (lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div>" + (sub ? "<div class=s>" + escHtml(sub) + "</div>" : "") + "<div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
+  const kinds = items.map(i => i.kind).filter((k, i, a) => a.indexOf(k) === i);
+  const title = kinds.length > 1 ? "Room + Table" : kinds[0] === "room" ? "Room" : "Table";
+  const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + title + " QR codes</title><style>" + z.page + (lg ? ".q{position:relative;display:inline-block;width:" + z.q + ";height:" + z.q + "}.q svg{width:100%!important;height:100%!important;display:block}.lg{position:absolute;left:50%;top:50%;width:26%;height:26%;transform:translate(-50%,-50%);background:#fff url('" + lg + "') center/78% 78% no-repeat;border-radius:2mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}" : "") + "body{font-family:Arial,sans-serif;" + z.body + "}.g{display:grid;grid-template-columns:repeat(" + z.cols + ",1fr);gap:" + z.gap + "}.c{border:1.5px dashed #999;border-radius:6px;padding:" + z.pad + ";text-align:center;page-break-inside:avoid;break-inside:avoid}" + (z.one ? ".c{page-break-after:always;break-after:page;border:0}.c:last-child{page-break-after:auto;break-after:auto}" : "") + ".c svg{width:" + z.q + ";height:" + z.q + "}.h{font-weight:700;font-size:" + z.h + "px}.r{font-size:" + z.r + "px;font-weight:800;margin-top:2mm}.s{font-size:" + z.t + "px;color:#333;font-weight:600}.t{font-size:" + z.t + "px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
   const w = window.open("", "_blank");
   if (!w) return "Pop-up allow karo, phir dobara Print dabao.";
   w.document.write(html); w.document.close();
@@ -2188,6 +2269,327 @@ function qmDeleteTable(idx) {
   if (!confirm("Table " + t + " delete karna hai? Iska QR kaam karna band kar dega.")) return;
   cur.splice(idx, 1);
   return qmSaveTables(cur, "Table " + t + " delete hui");
+}
+// ── v5.40: 🔳 QR Tables page — hotel chuno → ek saath kai tables / rooms banao → select → print ──
+const QT = { key: null, i: -1, hotel: "", features: [], profile: {}, rooms: [], bookings: [], reservations: [], tabs: {}, roomsExist: false, loaded: false, busy: false, sel: new Set(), edit: null, filter: "all" };
+const QT_SIZES = [["a4-9", "A4 — 9 card/page (chhote)"], ["a4-4", "A4 — 4 card/page"], ["a5-1", "A5 — 1 card/page (bade)"]];
+function qtRef(id) { return window._db.collection("hotels").doc(QT.key).collection("data").doc(id); }
+function qtLS(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+function qtMsg(text, type) {
+  const el = document.getElementById("qtMsg"); if (!el) return;
+  if (!text) { el.style.display = "none"; return; }
+  el.style.display = "block"; el.textContent = text;
+  el.style.background = type === "bad" ? "#450a0a" : type === "ok" ? "#052e16" : type === "warn" ? "#422006" : "#1e293b";
+  el.style.color = type === "bad" ? "#fca5a5" : type === "ok" ? "#4ade80" : type === "warn" ? "#fcd34d" : "#cbd5e1";
+}
+function qtHas(f) { return QT.features.indexOf(f) >= 0; }
+function qtInit() {
+  const sel = document.getElementById("qtHotel"); if (!sel) return;
+  const cur = QT.key || qtLS("ab_qt_hotel") || "";
+  const list = licenses.map(l => ({ l, key: String(l.key || "").toUpperCase() })).filter(x => /^ATITHI-[A-Z0-9]+$/.test(x.key));
+  sel.innerHTML = `<option value="">— Customer (hotel) chuno —</option>` + list.map(({ l, key }) => `<option value="${escHtml(key)}"${key === cur ? " selected" : ""}>${escHtml(l.hotel || "—")} · ${escHtml(key)}${l.active ? "" : " (revoked)"}</option>`).join("");
+  const sz = document.getElementById("qtSize"); if (sz && !sz.dataset.ok) { sz.innerHTML = QT_SIZES.map(s => `<option value="${s[0]}">${s[1]}</option>`).join(""); sz.value = qtLS("ab_qt_size") || "a4-9"; if (!sz.value) sz.value = "a4-9"; sz.dataset.ok = "1"; }
+  qtKind(); qtPreview();
+  if (cur && !QT.loaded && list.some(x => x.key === cur)) qtPick(cur); else qtRender();
+}
+function qtPick(key) {
+  key = String(key || "");
+  const i = licenses.findIndex(l => String(l.key || "").toUpperCase() === key);
+  if (i < 0) { Object.assign(QT, { key: null, i: -1, loaded: false }); qtRender(); return; }
+  const l = licenses[i];
+  qtLS("ab_qt_hotel", key);
+  Object.assign(QT, { key, i, hotel: l.hotel || "", features: Array.isArray(l.features) ? l.features.slice() : [...(PLAN_DEFAULT_FEATURES[l.plan] || [])], profile: {}, rooms: [], bookings: [], reservations: [], tabs: {}, roomsExist: false, loaded: false, sel: new Set(), edit: null });
+  qtLoad();
+}
+async function qtLoad() {
+  if (!QT.key) return;
+  if (!window._db) { qtMsg("❌ Firebase connected nahi hai.", "bad"); return; }
+  qtMsg("⏳ Load ho raha hai...", "inf"); qtRender();
+  try {
+    const [p, r, b, s, t] = await Promise.all(["profile", "rooms", "bookings", "reservations", "table_tabs"].map(d => qtRef(d).get()));
+    const pv = p.exists && p.data().value;
+    QT.profile = pv && typeof pv === "object" && !Array.isArray(pv) ? pv : {};
+    QT.roomsExist = r.exists && Array.isArray(r.data().value);
+    QT.rooms = QT.roomsExist ? r.data().value : [];
+    QT.bookings = b.exists && Array.isArray(b.data().value) ? b.data().value : [];
+    QT.reservations = s.exists && Array.isArray(s.data().value) ? s.data().value : [];
+    QT.tabs = (t.exists && t.data().value && t.data().value.tabs) || {};
+    QT.loaded = true;
+    qtMsg("", "");
+  } catch (e) { qtMsg("❌ Load nahi hua: " + (e && e.message || e), "bad"); }
+  qtRender();
+}
+function qtTables() { return Array.isArray(QT.profile.restaurantTables) ? QT.profile.restaurantTables.map(String) : []; }
+function qtMeta() { const m = QT.profile.tableMeta; return m && typeof m === "object" && !Array.isArray(m) ? m : {}; }
+function qtItems() {
+  const meta = qtMeta();
+  const tables = qtTables().map(id => ({ k: "t:" + id, kind: "table", id, sec: (meta[id] && meta[id].s) || "", cap: (meta[id] && meta[id].c) || 0 }));
+  const rooms = QT.rooms.slice().sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true })).map(r => ({ k: "r:" + r.id, kind: "room", id: String(r.id), room: r }));
+  return tables.concat(rooms);
+}
+function qtVisible() { return qtItems().filter(x => QT.filter === "all" || (QT.filter === "table" ? x.kind === "table" : x.kind === "room")); }
+async function qtRun(fn) { if (QT.busy) return; QT.busy = true; qtRender(); try { await fn(); } catch (e) { qtMsg("❌ " + (e && e.message || e), "bad"); } finally { QT.busy = false; qtRender(); } }
+// profile me sirf diye gaye fields (latest copy pe, transaction me)
+async function qtSaveProfile(mutate) {
+  let out = null, err = null;
+  await window._db.runTransaction(async tx => {
+    const ps = await tx.get(qtRef("profile"));
+    const has = ps.exists && ps.data().value && typeof ps.data().value === "object" && !Array.isArray(ps.data().value);
+    const cur = has ? ps.data().value : {};
+    const patch = mutate(cur);
+    if (patch.error) { err = patch.error; return; }
+    out = Object.assign({}, cur, patch);
+    tx.set(qtRef("profile"), Object.assign({}, has ? ps.data() : {}, { value: out, ts: Date.now() }));
+  });
+  if (err) throw new Error(err);
+  QT.profile = out;
+  return out;
+}
+async function qtPushTables(list) {
+  const tok = QT.profile.roomOrderToken; if (!tok) return;
+  try { await window._db.collection("room_order").doc(tok).update({ tables: qtHas("table_qr") ? list.map(t => "T:" + t) : [], updatedAt: Date.now() }); } catch (e) { console.warn("public tables:", e.message); }
+}
+async function qtRoomTx(mutate) {
+  let out = null;
+  await window._db.runTransaction(async tx => {
+    const rs = await tx.get(qtRef("rooms"));
+    if (!rs.exists || !Array.isArray(rs.data().value)) { out = { error: "Hotel ke rooms cloud me nahi mile — hotel app ek baar kholo, phir 🔄 Refresh." }; return; }
+    const [bs, ss] = [await tx.get(qtRef("bookings")), await tx.get(qtRef("reservations"))];
+    const bookings = bs.exists && Array.isArray(bs.data().value) ? bs.data().value : [];
+    const reservations = ss.exists && Array.isArray(ss.data().value) ? ss.data().value : [];
+    out = mutate(rs.data().value, bookings, reservations);
+    if (out.error) return;
+    tx.set(qtRef("rooms"), Object.assign({}, rs.data(), { value: out.rooms, ts: Date.now() }));
+    out.bookings = bookings; out.reservations = reservations;
+  });
+  if (out && out.rooms) { QT.rooms = out.rooms; QT.bookings = out.bookings; QT.reservations = out.reservations; }
+  return out || { error: "Save nahi hua" };
+}
+function qtGenToken() {
+  return qtRun(async () => {
+    const tok = qmToken();
+    const tables = qtTables().map(t => "T:" + qmClean(t)).filter(t => t.length > 2).slice(0, 200);
+    const b = window._db.batch();
+    b.set(window._db.collection("room_order_owner").doc(tok), { hotelId: QT.key, createdAt: Date.now() });
+    b.set(window._db.collection("room_order").doc(tok), { hotelName: String(QT.profile.hotelName || QT.hotel || "").slice(0, 200), items: [], occupied: [], tables: qtHas("table_qr") ? tables : [], open: true, updatedAt: Date.now() });
+    await b.commit();
+    await qtSaveProfile(() => ({ roomOrderToken: tok }));
+    qtMsg("✅ QR link ban gaya. Ab neeche se QR print kar sakte ho.", "ok");
+  });
+}
+// ── create form ──
+function qtKind() {
+  const k = (document.getElementById("qtType") || {}).value || "table";
+  document.querySelectorAll("[data-qt-for]").forEach(el => { el.style.display = el.getAttribute("data-qt-for") === k ? "" : "none"; });
+  const p = document.getElementById("qtPrefix");
+  if (p && !p.dataset.touched) p.value = k === "room" ? "" : "T";
+  qtPreview();
+}
+function qtNames() {
+  const pre = qmClean(document.getElementById("qtPrefix").value);
+  const a = parseInt(document.getElementById("qtFrom").value, 10), b = parseInt(document.getElementById("qtTo").value, 10);
+  if (!(a >= 0) || !(b >= 0) || a > 99999 || b > 99999) return { error: "\"Se\" aur \"Tak\" me number daalo (0 – 99999)." };
+  if (b < a) return { error: "\"Tak\" ka number \"Se\" se chhota nahi ho sakta." };
+  if (b - a + 1 > 100) return { error: "Ek baar me 100 tak hi ban sakte hain." };
+  const names = []; for (let n = a; n <= b; n++) names.push(pre + n);
+  if (names.some(x => x.length > 10)) return { error: "Naam 10 akshar se lamba ho raha hai — chhota shuru likho (jaise T ya A)." };
+  return { names };
+}
+function qtPreview() {
+  const el = document.getElementById("qtPreview"); if (!el || !document.getElementById("qtPrefix")) return;
+  const r = qtNames();
+  if (r.error) { el.textContent = "⚠️ " + r.error; el.style.color = "#fca5a5"; return; }
+  const n = r.names; el.style.color = "#94a3b8";
+  el.textContent = "Banenge: " + (n.length > 6 ? n.slice(0, 3).join(", ") + " … " + n.slice(-2).join(", ") : n.join(", ")) + " (" + n.length + ")";
+}
+function qtCreate() {
+  if (!QT.loaded) { qtMsg("Pehle upar customer (hotel) chuno.", "bad"); return; }
+  const r = qtNames(); if (r.error) { qtMsg("❌ " + r.error, "bad"); return; }
+  const kind = document.getElementById("qtType").value;
+  if (kind === "room") return qtCreateRooms(r.names);
+  const sec = String(document.getElementById("qtSection").value || "").trim().replace(/[<>]/g, "").slice(0, 20);
+  const cap = Math.round(Number(document.getElementById("qtCap").value) || 0);
+  if (cap && !(cap >= 1 && cap <= 50)) { qtMsg("❌ Capacity 1 se 50 ke beech daalo.", "bad"); return; }
+  return qtRun(async () => {
+    let made = [], skipped = [];
+    const out = await qtSaveProfile(cur => {
+      const list = Array.isArray(cur.restaurantTables) ? cur.restaurantTables.map(String) : [];
+      const low = list.map(x => x.toLowerCase());
+      made = []; skipped = [];
+      r.names.forEach(n => { if (low.indexOf(n.toLowerCase()) >= 0) skipped.push(n); else { made.push(n); low.push(n.toLowerCase()); } });
+      if (!made.length) return { error: "Ye sab tables pehle se hain: " + skipped.join(", ") };
+      if (list.length + made.length > 200) return { error: "Ek hotel me 200 tables tak hi ho sakti hain (abhi " + list.length + " hain)." };
+      const meta = Object.assign({}, cur.tableMeta && typeof cur.tableMeta === "object" && !Array.isArray(cur.tableMeta) ? cur.tableMeta : {});
+      made.forEach(n => { const m = {}; if (sec) m.s = sec; if (cap) m.c = cap; if (sec || cap) meta[n] = m; });
+      return { restaurantTables: list.concat(made), tableMeta: meta };
+    });
+    await qtPushTables(out.restaurantTables);
+    QT.sel = new Set(made.map(n => "t:" + n)); QT.filter = "all";
+    qtMsg("✅ " + made.length + " table ban gayi (" + made[0] + (made.length > 1 ? " – " + made[made.length - 1] : "") + ")" + (skipped.length ? " · pehle se thi: " + skipped.join(", ") : "") + ". Neeche select ho gayi hain — 🖨️ Print selected dabao." + (qtHas("table_qr") ? "" : " ⚠️ Is hotel me \"Restaurant Table QR\" add-on OFF hai — 🎛️ Features me ON karo, tabhi table QR se order hoga."), qtHas("table_qr") ? "ok" : "warn");
+  });
+}
+function qtCreateRooms(names) {
+  if (!QT.roomsExist) { qtMsg("❌ Hotel ke rooms cloud me nahi mile — hotel app ek baar kholo, phir 🔄 Refresh.", "bad"); return; }
+  const type = document.getElementById("qtRType").value;
+  const rate = Math.round(Number(document.getElementById("qtRate").value));
+  const flIn = String(document.getElementById("qtFloor").value || "").trim();
+  if (!RM_TYPES.includes(type)) { qtMsg("❌ Room type galat hai.", "bad"); return; }
+  if (!(rate >= 1 && rate <= 1000000)) { qtMsg("❌ Rate ₹1 se ₹10,00,000 ke beech daalo.", "bad"); return; }
+  const flFix = flIn === "" ? null : parseInt(flIn, 10);
+  if (flFix !== null && !(flFix >= 0 && flFix <= 99)) { qtMsg("❌ Floor 0 se 99 ke beech daalo (khaali chhodo to number se apne-aap: 101 → floor 1).", "bad"); return; }
+  return qtRun(async () => {
+    let made = [], skipped = [];
+    const res = await qtRoomTx(rooms => {
+      const low = rooms.map(x => String(x.id).toLowerCase());
+      made = []; skipped = [];
+      names.forEach(n => { if (low.indexOf(n.toLowerCase()) >= 0) skipped.push(n); else { made.push(n); low.push(n.toLowerCase()); } });
+      if (!made.length) return { error: "Ye sab rooms pehle se hain: " + skipped.join(", ") };
+      if (rooms.length + made.length > 300) return { error: "Ek hotel me 300 rooms tak hi ho sakte hain." };
+      return { rooms: rooms.concat(made.map(id => { const num = parseInt(String(id).replace(/\D/g, ""), 10) || 0; const fl = flFix !== null ? flFix : Math.min(99, num >= 100 ? Math.floor(num / 100) : 0); return { id, fl, type, rate, status: "empty", bookingId: null, photos: [] }; })) };
+    });
+    if (res.error) { qtMsg("❌ " + res.error, "bad"); return; }
+    QT.sel = new Set(made.map(n => "r:" + n)); QT.filter = "all";
+    qtMsg("✅ " + made.length + " room ban gaye (" + made[0] + (made.length > 1 ? " – " + made[made.length - 1] : "") + ")" + (skipped.length ? " · pehle se the: " + skipped.join(", ") : "") + ". Hotel app me turant dikhenge. Neeche select ho gaye hain — 🖨️ Print selected dabao." + (qtHas("qr_ordering") ? "" : " ⚠️ \"Room QR Ordering\" add-on OFF hai — 🎛️ Features me ON karo, tabhi room QR se order hoga."), qtHas("qr_ordering") ? "ok" : "warn");
+  });
+}
+// ── list actions ──
+function qtToggle(k, on) { if (on) QT.sel.add(k); else QT.sel.delete(k); qtRender(); }
+function qtSelAll(on) { if (on) qtVisible().forEach(x => QT.sel.add(x.k)); else QT.sel.clear(); qtRender(); }
+function qtSetFilter(f) { QT.filter = f; qtRender(); }
+function qtSize() { const v = (document.getElementById("qtSize") || {}).value || "a4-9"; qtLS("ab_qt_size", v); return v; }
+async function qtPrint(keys) {
+  const items = qtItems().filter(x => keys.indexOf(x.k) >= 0);
+  if (!items.length) { qtMsg("Pehle list me tick karke QR chuno.", "bad"); return; }
+  const tok = QT.profile.roomOrderToken;
+  if (!tok) { qtMsg("Pehle \"🔗 QR link banao\" dabao.", "bad"); return; }
+  const warn = [];
+  if (items.some(x => x.kind === "table") && !qtHas("table_qr")) warn.push("Restaurant Table QR");
+  if (items.some(x => x.kind === "room") && !qtHas("qr_ordering")) warn.push("Room QR Ordering");
+  if (warn.length && !confirm("Is hotel me \"" + warn.join("\" aur \"") + "\" add-on OFF hai — QR scan to hoga par order nahi hoga.\n\nPhir bhi print karna hai?")) return;
+  try {
+    const err = await qrSheet(items.map(x => ({ kind: x.kind, id: x.id, sub: x.kind === "table" ? x.sec : "" })), tok, QT.profile.hotelName || QT.hotel, qmLogoOn() ? qrValidLogo(QT.profile) : "", qtSize());
+    if (err) { qtMsg(err, "bad"); return; }
+    const rids = items.filter(x => x.kind === "room").map(x => x.id); if (rids.length) qrPrintedAdd(QT.key, rids);
+    qtMsg("🖨️ " + items.length + " QR print ke liye khul gaye.", "ok");
+  } catch (e) { qtMsg("❌ " + e.message, "bad"); }
+}
+function qtPrintSel() { return qtPrint(qtItems().map(x => x.k).filter(k => QT.sel.has(k))); }
+function qtDelete(keys) {
+  const items = qtItems().filter(x => keys.indexOf(x.k) >= 0);
+  if (!items.length) { qtMsg("Pehle list me tick karke chuno.", "bad"); return; }
+  const tbl = items.filter(x => x.kind === "table").map(x => x.id), rms = items.filter(x => x.kind === "room").map(x => x.id);
+  if (!confirm("Delete karna hai?\n\n" + (tbl.length ? "Tables: " + tbl.join(", ") + "\n" : "") + (rms.length ? "Rooms: " + rms.join(", ") + "\n" : "") + "\nInke QR kaam karna band kar denge. Purane bills / history par asar nahi padega.")) return;
+  return qtRun(async () => {
+    const done = [], kept = [];
+    if (tbl.length) {
+      const out = await qtSaveProfile(cur => {
+        const list = Array.isArray(cur.restaurantTables) ? cur.restaurantTables.map(String) : [];
+        const meta = Object.assign({}, cur.tableMeta && typeof cur.tableMeta === "object" && !Array.isArray(cur.tableMeta) ? cur.tableMeta : {});
+        const rm = tbl.filter(t => { if (QT.tabs[t]) { kept.push("Table " + t + " (bill khula hai)"); return false; } return list.indexOf(t) >= 0; });
+        if (!rm.length) return {};
+        rm.forEach(t => { delete meta[t]; done.push("Table " + t); });
+        return { restaurantTables: list.filter(t => rm.indexOf(t) < 0), tableMeta: meta };
+      });
+      await qtPushTables(qtTables());
+      void out;
+    }
+    if (rms.length) {
+      const res = await qtRoomTx((rooms, bookings, reservations) => {
+        const rm = [];
+        rms.forEach(id => { const cur = rooms.find(r => String(r.id) === id); if (!cur) return; const why = rmBlockReason(cur, bookings, reservations); if (why) kept.push("Room " + id + " (" + why + ")"); else rm.push(id); });
+        return { rooms: rooms.filter(r => rm.indexOf(String(r.id)) < 0), _rm: rm };
+      });
+      if (res.error) kept.push(res.error); else (res._rm || []).forEach(id => done.push("Room " + id));
+    }
+    items.forEach(x => QT.sel.delete(x.k));
+    qtMsg((done.length ? "✅ Delete hue: " + done.join(", ") + "." : "Kuch delete nahi hua.") + (kept.length ? " ⚠️ Nahi hue: " + kept.join("; ") + "." : ""), kept.length ? "warn" : "ok");
+  });
+}
+function qtDeleteSel() { return qtDelete(qtItems().map(x => x.k).filter(k => QT.sel.has(k))); }
+function qtStartEdit(k) { if (QT.busy) return; QT.edit = k; qtRender(); }
+function qtCancelEdit() { QT.edit = null; qtRender(); }
+function qtSaveEdit() {
+  const it = qtItems().find(x => x.k === QT.edit); if (!it) { QT.edit = null; qtRender(); return; }
+  if (it.kind === "table") {
+    const nn = qmClean(document.getElementById("qtEdName").value);
+    const sec = String(document.getElementById("qtEdSec").value || "").trim().replace(/[<>]/g, "").slice(0, 20);
+    const cap = Math.round(Number(document.getElementById("qtEdCap").value) || 0);
+    if (!nn) { qtMsg("❌ Table ka naam likho (letters, numbers, - · max 10).", "bad"); return; }
+    if (cap && !(cap >= 1 && cap <= 50)) { qtMsg("❌ Capacity 1 se 50 ke beech daalo.", "bad"); return; }
+    if (nn !== it.id && QT.tabs[it.id]) { qtMsg("❌ Table " + it.id + " ka bill abhi khula hai — pehle hotel app me bill banao, phir naam badlo.", "bad"); return; }
+    return qtRun(async () => {
+      const out = await qtSaveProfile(cur => {
+        const list = Array.isArray(cur.restaurantTables) ? cur.restaurantTables.map(String) : [];
+        const idx = list.indexOf(it.id); if (idx < 0) return { error: "Table " + it.id + " ab list me nahi hai — 🔄 Refresh karo." };
+        if (nn !== it.id && list.some(t => t.toLowerCase() === nn.toLowerCase())) return { error: "Table " + nn + " pehle se hai." };
+        const meta = Object.assign({}, cur.tableMeta && typeof cur.tableMeta === "object" && !Array.isArray(cur.tableMeta) ? cur.tableMeta : {});
+        delete meta[it.id]; if (sec || cap) { const m = {}; if (sec) m.s = sec; if (cap) m.c = cap; meta[nn] = m; }
+        list[idx] = nn;
+        return { restaurantTables: list, tableMeta: meta };
+      });
+      if (nn !== it.id) await qtPushTables(out.restaurantTables);
+      if (QT.sel.has(it.k)) { QT.sel.delete(it.k); QT.sel.add("t:" + nn); }
+      QT.edit = null;
+      qtMsg("✅ Table " + (nn !== it.id ? it.id + " → " + nn + " (naam badla — iska naya QR print karna hoga)" : nn + " update hui"), "ok");
+    });
+  }
+  const fl = parseInt(document.getElementById("qtEdFl").value, 10);
+  const type = document.getElementById("qtEdType").value;
+  const rate = Math.round(Number(document.getElementById("qtEdRate").value));
+  if (!(fl >= 0 && fl <= 99)) { qtMsg("❌ Floor 0 se 99 ke beech daalo.", "bad"); return; }
+  if (!RM_TYPES.includes(type)) { qtMsg("❌ Room type galat hai.", "bad"); return; }
+  if (!(rate >= 1 && rate <= 1000000)) { qtMsg("❌ Rate ₹1 se ₹10,00,000 ke beech daalo.", "bad"); return; }
+  return qtRun(async () => {
+    const res = await qtRoomTx(rooms => {
+      if (!rooms.some(r => String(r.id) === it.id)) return { error: "Room " + it.id + " ab list me nahi hai — 🔄 Refresh karo." };
+      return { rooms: rooms.map(r => String(r.id) === it.id ? Object.assign({}, r, { fl, type, rate }) : r) };
+    });
+    if (res.error) { qtMsg("❌ " + res.error, "bad"); return; }
+    QT.edit = null;
+    qtMsg("✅ Room " + it.id + " update hua — hotel app me turant dikhega.", "ok");
+  });
+}
+function qtRowHtml(x) {
+  const k = escHtml(x.k), on = QT.sel.has(x.k), dis = QT.busy ? " disabled" : "";
+  if (QT.edit === x.k) {
+    const f = x.kind === "table"
+      ? `<label>Naam<input id="qtEdName" maxlength="10" value="${escHtml(x.id)}"></label><label>Section<input id="qtEdSec" maxlength="20" value="${escHtml(x.sec)}" placeholder="Indoor"></label><label>Capacity<input id="qtEdCap" type="number" min="1" max="50" value="${x.cap || ""}"></label>`
+      : `<label>Floor<input id="qtEdFl" type="number" min="0" max="99" value="${escHtml(x.room.fl)}"></label><label>Type<select id="qtEdType">${RM_TYPES.map(t => `<option${t === x.room.type ? " selected" : ""}>${escHtml(t)}</option>`).join("")}</select></label><label>Rate ₹<input id="qtEdRate" type="number" min="1" value="${escHtml(x.room.rate)}"></label>`;
+    return `<div class="qt-edit" data-t="qt-edit"><div style="font-weight:700;font-size:13px;margin-bottom:8px">✏️ ${x.kind === "table" ? "Table" : "Room"} ${escHtml(x.id)}${x.kind === "room" ? ` <span style="font-weight:400;color:#94a3b8;font-size:11px">(room number hotel app se badlo — bookings usi se judi hain)</span>` : ""}</div><div class="qt-grid">${f}</div>
+      <div style="display:flex;gap:8px"><button class="btn btn-success" data-t="qt-ed-save" onclick="qtSaveEdit()" style="flex:1"${dis}>💾 Save</button><button class="btn" onclick="qtCancelEdit()" style="flex:1;background:#334155;color:#e2e8f0">Cancel</button></div></div>`;
+  }
+  const sub = x.kind === "table"
+    ? escHtml([x.sec, x.cap ? "👥" + x.cap : ""].filter(Boolean).join(" · ")) + (QT.tabs[x.id] ? `<span class="qt-open">bill khula</span>` : "")
+    : "Floor " + escHtml(x.room.fl) + " · " + escHtml(x.room.type || "") + " · ₹" + escHtml(x.room.rate) + (x.room.status && x.room.status !== "empty" ? `<span class="qt-open">${escHtml(x.room.status)}</span>` : "");
+  return `<div class="qt-row${on ? " on" : ""}" data-t="qt-row" data-k="${k}">
+    <label class="qt-ck"><input type="checkbox" data-t="qt-ck"${on ? " checked" : ""} onchange="qtToggle('${k}', this.checked)"><span class="qt-tag ${x.kind}">${x.kind === "table" ? "Table" : "Room"}</span><b>${escHtml(x.id)}</b></label>
+    <span class="qt-sub">${sub}</span>
+    <span class="qt-act"><button title="QR print" data-t="qt-one-print" onclick="qtPrint(['${k}'])"${dis}>🖨️</button><button title="Edit" data-t="qt-one-edit" onclick="qtStartEdit('${k}')"${dis}>✏️</button><button title="Delete" data-t="qt-one-del" onclick="qtDelete(['${k}'])"${dis}>🗑️</button></span></div>`;
+}
+function qtRender() {
+  const top = document.getElementById("qtTop"), box = document.getElementById("qtList"); if (!top || !box) return;
+  const formBtn = document.getElementById("qtCreateBtn"); if (formBtn) formBtn.disabled = QT.busy || !QT.loaded;
+  box.style.display = QT.loaded ? "" : "none";
+  if (!QT.key) { top.innerHTML = `<div class="qt-empty">👆 Upar se customer (hotel) chuno — phir uske tables / rooms ke QR yahin banao aur print karo.</div>`; return; }
+  if (!QT.loaded) { top.innerHTML = `<div class="qt-empty">⏳ ${escHtml(QT.hotel)} load ho raha hai...</div>`; return; }
+  const tok = QT.profile.roomOrderToken;
+  const chip = (on, name) => `<span class="qt-chip ${on ? "on" : "off"}">${on ? "✅" : "⛔"} ${name}</span>`;
+  const lg = qrValidLogo(QT.profile);
+  top.innerHTML = `<div class="qt-status">
+      ${tok ? `<span class="qt-chip on" data-t="qt-link-ok">🔗 QR link ready</span>` : `<button class="btn btn-success" data-t="qt-gen" onclick="qtGenToken()" style="width:auto;padding:8px 14px"${QT.busy ? " disabled" : ""}>🔗 QR link banao</button>`}
+      ${chip(qtHas("table_qr"), "Table QR add-on")} ${chip(qtHas("qr_ordering"), "Room QR add-on")}
+      ${lg ? `<label class="qt-chip" style="cursor:pointer"><input type="checkbox" data-t="qt-logo" style="width:auto;margin:0 6px 0 0" ${qmLogoOn() ? "checked" : ""} onchange="qmSetLogo(this.checked)">QR ke beech logo</label>` : `<span class="qt-chip">Logo nahi — 📲 QR / Tables / Banquet se lagao</span>`}
+      <button class="btn" onclick="qtLoad()" style="width:auto;padding:7px 12px;background:#1e293b;color:#cbd5e1;margin-left:auto"${QT.busy ? " disabled" : ""}>🔄 Refresh</button>
+    </div>${(!qtHas("table_qr") || !qtHas("qr_ordering")) ? `<div class="qt-hint">Jo add-on ⛔ OFF hai, uske QR scan to honge par order nahi hoga — 🎛️ Features me ON karo.</div>` : ""}`;
+  const all = qtItems(), vis = qtVisible();
+  const nT = all.filter(x => x.kind === "table").length, nR = all.length - nT;
+  const selN = all.filter(x => QT.sel.has(x.k)).length;
+  document.getElementById("qtCount").textContent = "Tables: " + nT + " • Rooms: " + nR;
+  document.querySelectorAll("#qtList .qt-f").forEach(b => b.classList.toggle("on", b.getAttribute("data-f") === QT.filter));
+  const ds = document.getElementById("qtDelSel"), ps = document.getElementById("qtPrintSel");
+  ds.disabled = ps.disabled = QT.busy || !selN;
+  ps.textContent = "🖨️ Print selected" + (selN ? " (" + selN + ")" : "");
+  document.getElementById("qtRows").innerHTML = vis.length ? vis.map(qtRowHtml).join("") : `<div class="qt-empty">${all.length ? "Is filter me kuch nahi." : "Abhi koi table / room nahi — upar form se banao."}</div>`;
 }
 // ── banquet ──
 function qmHallUse(id) { const today = new Date().toISOString().slice(0, 10); return QM.events.filter(e => e && e.hallId === id && (e.status === "booked" || e.status === "quote") && String(e.date) >= today).length; }
