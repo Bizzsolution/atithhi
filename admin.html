@@ -16,7 +16,10 @@
      rendered by the third-party api.qrserver.com, which received every
      UPI ID, amount and invoice number and fully controlled the QR image a
      customer scans to pay BizzSathi. -->
-<script src="/qrcode.js"></script>
+<script src="qrcode.js"></script>
+<!-- v5.39.2: relative path works on Netlify AND in a sub-folder (GitHub Pages);
+     if it still did not load, try the other places once the page is up. -->
+<script>window.addEventListener("load", function () { if (!window.qrcode && typeof qrLoadMaker === "function") qrLoadMaker().catch(function () {}); });</script>
 <script>
   window._db = null;
   try {
@@ -1980,7 +1983,27 @@ const QM_BQ_DEFAULT = { halls: [], gstRate: 0.18, inclusive: false, sac: "996334
 function qmRef(id) { return window._db.collection("hotels").doc(QM.key).collection("data").doc(id); }
 function qmClean(t) { return String(t || "").trim().replace(/[^A-Za-z0-9-]/g, "").slice(0, 10); }
 function qmToken() { const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let s = "RO"; const r = new Uint32Array(16); crypto.getRandomValues(r); for (let k = 0; k < 16; k++) s += A[r[k] % A.length]; return s; }
-function qmBase() { return window.location.origin + "/"; }
+// The guest QR must open the HOTEL APP, wherever this admin page is opened
+// from (Netlify, GitHub Pages, a saved file …). Only a local test server
+// uses its own address.
+const HOTEL_APP_URL = "https://atithhi.netlify.app/";
+function qmBase() { return /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? location.origin + "/" : HOTEL_APP_URL; }
+// QR maker: already on the page, else this folder, else the hotel app site
+function qrLoadMaker() {
+  if (window.qrcode) return Promise.resolve(window.qrcode);
+  const urls = ["qrcode.js", "/qrcode.js", HOTEL_APP_URL + "qrcode.js"];
+  return new Promise((res, rej) => {
+    const next = i => {
+      if (window.qrcode) return res(window.qrcode);
+      if (i >= urls.length) return rej(new Error("QR maker load nahi hua — internet check karo, phir dobara dabao."));
+      const s = document.createElement("script"); s.src = urls[i];
+      s.onload = () => window.qrcode ? res(window.qrcode) : next(i + 1);
+      s.onerror = () => { s.remove(); next(i + 1); };
+      document.head.appendChild(s);
+    };
+    next(0);
+  });
+}
 // QR ke beech hotel logo (logo ho to QR "H" level pe — 30% tak dhaka bhi scan hota hai)
 function qmLogo() { const l = (QM.profile && QM.profile.qrLogo) || (QM.profile && QM.profile.hotelLogo); return /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$/.test(l || "") ? l : ""; }
 function qmLogoOn() { try { return localStorage.getItem("ab_qm_logo") !== "0"; } catch (e) { return true; } }
@@ -2106,7 +2129,7 @@ function qrValidLogo(p) { const l = (p && p.qrLogo) || (p && p.hotelLogo); retur
 async function qrPrintIds(kind, ids, tok, hotelName, lg) {
   if (!tok) return "Pehle QR link banao.";
   if (!ids.length) return kind === "room" ? "Koi room nahi mila." : "Pehle tables add karo.";
-  const qr = await new Promise((res, rej) => { if (window.qrcode) return res(window.qrcode); const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("QR maker load nahi hua")); document.head.appendChild(s); });
+  const qr = await qrLoadMaker();
   const name = escHtml(hotelName || "");
   const link = id => qmBase() + "?order=" + tok + "&" + kind + "=" + encodeURIComponent(id);
   const cards = ids.map(id => { const q = qr(0, lg ? "H" : "M"); q.addData(link(id)); q.make(); const svg = q.createSvgTag(5, 2); return "<div class=c><div class=h>" + name + "</div>" + (lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div><div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
