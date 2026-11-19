@@ -1705,6 +1705,7 @@ function rmEnsureModal() {
         </div>
         <button id="rmAddBtn" class="btn btn-success" onclick="rmAdd()" style="margin-top:10px;width:100%;padding:10px">➕ Room Add karo</button>
       </div>
+      <div id="rmQrBox" style="background:#1e293b;border-radius:10px;padding:12px;margin:12px 0"></div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin:4px 0 8px">
         <div id="rmCount" style="font-size:12px;font-weight:700;color:#94a3b8"></div>
         <button class="btn" onclick="rmLoad()" style="background:#1e293b;color:#93c5fd">🔄 Refresh</button>
@@ -1720,7 +1721,7 @@ async function openRoomManager(i) {
   const key = String(l.key || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
   if (!/^ATITHI-[A-Z0-9]+$/.test(key)) { showMsg("❌ Is license ki key format galat hai.", "error"); return; }
   rmEnsureModal();
-  Object.assign(RM, { key, hotel: l.hotel || "", rooms: [], bookings: [], reservations: [], exists: false, floorNames: {} });
+  Object.assign(RM, { key, hotel: l.hotel || "", rooms: [], bookings: [], reservations: [], exists: false, floorNames: {}, prof: {}, features: Array.isArray(l.features) ? l.features.slice() : [...(PLAN_DEFAULT_FEATURES[l.plan] || [])] });
   RM_EDIT = null;
   document.getElementById("rmTitle").textContent = "🛏️ Rooms — " + (l.hotel || "Hotel");
   document.getElementById("rmSub").textContent = key + (l.owner ? " · " + l.owner : "");
@@ -1739,6 +1740,7 @@ async function rmLoad() {
     RM.bookings = b.exists && Array.isArray(b.data().value) ? b.data().value : [];
     RM.reservations = s.exists && Array.isArray(s.data().value) ? s.data().value : [];
     try { RM.floorNames = (await acfgLoad(RM.key)).floorNames || {}; } catch (e) { RM.floorNames = {}; }
+    try { const ps = await rmRef("profile").get(); RM.prof = ps.exists && ps.data().value && typeof ps.data().value === "object" ? ps.data().value : {}; } catch (e) { RM.prof = {}; }
     rmMsg(RM.exists ? "" : "⚠️ Is hotel ke rooms abhi cloud me save nahi hue hain (hotel app ne abhi tak koi room/check-in save nahi kiya). Pehle hotel app ek baar kholke koi room save/check-in karwao, tab yahan se add/delete karo.", RM.exists ? "" : "bad");
   } catch (e) {
     rmMsg("❌ Load nahi hua: " + (e && e.message || e), "bad");
@@ -1765,11 +1767,65 @@ function rmRender() {
       <div style="font-size:16px;font-weight:700;min-width:54px">${escHtml(r.id)}</div>
       <div style="flex:1;min-width:0;font-size:12px;color:#94a3b8">Floor ${escHtml(r.fl)} · ${escHtml(r.type || "")} · ₹${escHtml(r.rate)}/night${r.name ? " · " + escHtml(r.name) : ""}
         <div style="color:${block ? "#fbbf24" : "#4ade80"};margin-top:2px">${block ? "🔒 " + escHtml(block) : (r.status === "occupied" ? "Occupied" : "Khali")}</div></div>
+      ${RM.prof && RM.prof.roomOrderToken ? `<button class="btn" ${RM.busy ? "disabled" : ""} data-t="rm-qr-one" title="Is room ka QR print karo" onclick="rmPrintQrIdx(${idx})" style="background:${qrPrintedGet(RM.key).indexOf(String(r.id)) < 0 ? "#14532d;color:#bbf7d0" : "#1e293b;color:#94a3b8"}">🖨️ QR</button>` : ""}
       <button class="btn" ${RM.busy ? "disabled" : ""} onclick="rmStartEdit(${idx})" style="background:#1e3a5f;color:#bae6fd">✏️ Edit</button>
       <button class="btn btn-danger" ${block || RM.busy ? "disabled" : ""} title="${block ? "Delete nahi ho sakta — " + escHtml(block) : "Room delete karo"}" onclick="rmDelete(${idx})" style="${block ? "opacity:.4;cursor:not-allowed" : ""}">🗑️ Delete</button>
     </div>`;
   }).join("") || `<div style="color:#64748b;text-align:center;padding:16px;font-size:13px">Koi room nahi</div>`;
   list.innerHTML += RM.exists ? rmFloorBox() : "";
+  rmRenderQr();
+}
+// ── room QR inside 🛏️ Rooms ──
+function rmNewQrIds() { const done = qrPrintedGet(RM.key); return RM.rooms.map(r => String(r.id)).filter(id => done.indexOf(id) < 0); }
+function rmRenderQr() {
+  const box = document.getElementById("rmQrBox"); if (!box) return;
+  const tok = RM.prof && RM.prof.roomOrderToken, dis = RM.busy ? "disabled" : "", lg = qrValidLogo(RM.prof);
+  const fresh = rmNewQrIds().length;
+  box.innerHTML = `<div style="font-size:12px;font-weight:700;color:#fbbf24;margin-bottom:8px">📲 ROOM QR</div>` +
+    (RM.features.indexOf("qr_ordering") < 0 ? `<div style="font-size:11.5px;color:#fbbf24;margin-bottom:8px">⚠️ Room QR add-on OFF hai — QR print ho jayega, par guest order tab kar payega jab 🎛️ Features me "QR Room Ordering" ON karoge.</div>` : "") +
+    (!tok ? `<div style="font-size:12px;color:#94a3b8;margin-bottom:8px">Abhi QR link nahi bana. Ek baar banao — phir har room ka QR print kar sakte ho.</div>
+       <button class="btn btn-success" ${dis} data-t="rm-qr-gen" onclick="rmMakeQrLink()" style="width:100%;padding:10px">➕ QR link banao</button>`
+    : `<div style="display:flex;gap:8px;flex-wrap:wrap">
+         <button class="btn" ${dis} data-t="rm-qr-all" onclick="rmPrintQr('all')" style="background:#1e3a5f;color:#bae6fd;flex:1 1 180px">🖨️ Sab rooms ka QR (${RM.rooms.length})</button>
+         <button class="btn" ${dis || !fresh ? "disabled" : ""} data-t="rm-qr-new" onclick="rmPrintQr('new')" style="background:${fresh ? "#14532d" : "#1e293b"};color:${fresh ? "#bbf7d0" : "#64748b"};flex:1 1 180px">🆕 Sirf naye rooms ka QR (${fresh})</button>
+       </div>
+       <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-top:8px;color:${lg ? "#e2e8f0" : "#64748b"}"><input type="checkbox" data-t="rm-qr-logo" ${lg ? "" : "disabled"} ${lg && qmLogoOn() ? "checked" : ""} onchange="qmSetLogo(this.checked)" style="width:16px;height:16px;flex:0 0 auto;margin:0"><span>${lg ? "QR ke beech logo lagao" : "QR me logo — 📲 QR / Tables page se logo upload karo"}</span></label>
+       <div style="font-size:11px;color:#64748b;margin-top:6px">"Naye rooms" = jinka QR is device se abhi tak print nahi hua. Har room ke saamne 🖨️ se ek-ek QR bhi nikal sakte ho.</div>`);
+}
+async function rmMakeQrLink() {
+  if (RM.busy) return;
+  RM.busy = true; rmRender();
+  try {
+    const tok = qmToken();
+    const b = window._db.batch();
+    b.set(window._db.collection("room_order_owner").doc(tok), { hotelId: RM.key, createdAt: Date.now() });
+    b.set(window._db.collection("room_order").doc(tok), { hotelName: String(RM.prof.hotelName || RM.hotel || "").slice(0, 200), items: [], occupied: [], tables: RM.features.indexOf("table_qr") >= 0 ? (RM.prof.restaurantTables || []).map(t => "T:" + qmClean(t)).filter(t => t.length > 2).slice(0, 200) : [], open: true, updatedAt: Date.now() });
+    await b.commit();
+    let out = null;
+    await window._db.runTransaction(async tx => {
+      const ps = await tx.get(rmRef("profile"));
+      const has = ps.exists && ps.data().value && typeof ps.data().value === "object" && !Array.isArray(ps.data().value);
+      // another admin may have made one just now — keep theirs
+      if (has && ps.data().value.roomOrderToken) { out = ps.data().value; return; }
+      out = Object.assign({}, has ? ps.data().value : {}, { roomOrderToken: tok });
+      tx.set(rmRef("profile"), Object.assign({}, has ? ps.data() : {}, { value: out, ts: Date.now() }));
+    });
+    RM.prof = out;
+    rmMsg("✅ QR link ready — ab \"Sab rooms ka QR\" dabao. Menu hotel app khulte hi live hoga.", "ok");
+  } catch (e) { rmMsg("❌ QR link nahi bana: " + (e && e.message || e), "bad"); }
+  finally { RM.busy = false; rmRender(); }
+}
+function rmPrintQrIdx(i) { const r = RM.rooms[i]; if (r) rmPrintQr({ one: String(r.id) }); }
+async function rmPrintQr(which) {
+  const all = RM.rooms.slice().sort((a, b) => (Number(a.fl) || 0) - (Number(b.fl) || 0) || String(a.id).localeCompare(String(b.id), undefined, { numeric: true })).map(r => String(r.id));
+  const ids = which === "all" ? all : which === "new" ? all.filter(id => rmNewQrIds().indexOf(id) >= 0) : [String(which.one)];
+  try {
+    const err = await qrPrintIds("room", ids, RM.prof && RM.prof.roomOrderToken, RM.prof.hotelName || RM.hotel, qmLogoOn() ? qrValidLogo(RM.prof) : "");
+    if (err) { rmMsg(err, "bad"); return; }
+    qrPrintedAdd(RM.key, ids);
+    rmMsg("🖨️ " + ids.length + " room QR print ke liye khul gaye.", "ok");
+    rmRender();
+  } catch (e) { rmMsg("❌ " + e.message, "bad"); }
 }
 async function rmTx(mutate) {
   // mutate(rooms, bookings, reservations) -> { rooms } or { error }
@@ -1815,7 +1871,7 @@ async function rmAdd() {
   if (res.error) return rmMsg("❌ " + res.error, "bad");
   document.getElementById("rmNewId").value = "";
   document.getElementById("rmNewName").value = "";
-  rmMsg("✅ Room " + id + " add ho gaya — hotel app me turant dikh jaayega.", "ok");
+  rmMsg("✅ Room " + id + " add ho gaya — hotel app me turant dikh jaayega." + (RM.prof && RM.prof.roomOrderToken ? " Iska QR: \"🆕 Sirf naye rooms ka QR\" ya room ke saamne 🖨️ QR." : ""), "ok");
 }
 async function rmDelete(idx) {
   if (RM.busy) return;
@@ -2045,18 +2101,29 @@ function qmGenToken(again) {
     qmMsg("✅ QR link ready. Hotel app khulte hi menu aur occupied rooms apne-aap live ho jayenge (2 min ke andar).", "ok");
   });
 }
+// shared: QR sheet for any hotel (used by 📲 QR page and 🛏️ Rooms)
+function qrValidLogo(p) { const l = (p && p.qrLogo) || (p && p.hotelLogo); return /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$/.test(l || "") ? l : ""; }
+async function qrPrintIds(kind, ids, tok, hotelName, lg) {
+  if (!tok) return "Pehle QR link banao.";
+  if (!ids.length) return kind === "room" ? "Koi room nahi mila." : "Pehle tables add karo.";
+  const qr = await new Promise((res, rej) => { if (window.qrcode) return res(window.qrcode); const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("QR maker load nahi hua")); document.head.appendChild(s); });
+  const name = escHtml(hotelName || "");
+  const link = id => qmBase() + "?order=" + tok + "&" + kind + "=" + encodeURIComponent(id);
+  const cards = ids.map(id => { const q = qr(0, lg ? "H" : "M"); q.addData(link(id)); q.make(); const svg = q.createSvgTag(5, 2); return "<div class=c><div class=h>" + name + "</div>" + (lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div><div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
+  const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + (kind === "room" ? "Room" : "Table") + " QR codes</title><style>" + (lg ? ".q{position:relative;display:inline-block;width:42mm;height:42mm}.q svg{width:100%!important;height:100%!important;display:block}.lg{position:absolute;left:50%;top:50%;width:11mm;height:11mm;transform:translate(-50%,-50%);background:#fff url('" + lg + "') center/8.6mm 8.6mm no-repeat;border-radius:2mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}" : "") + "body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+  const w = window.open("", "_blank");
+  if (!w) return "Pop-up allow karo, phir dobara Print dabao.";
+  w.document.write(html); w.document.close();
+  return null;
+}
+// which rooms already have a printed QR (this admin device) — for "sirf naye rooms"
+function qrPrintedGet(key) { try { const v = JSON.parse(localStorage.getItem("ab_rmqr_" + key) || "[]"); return Array.isArray(v) ? v.map(String) : []; } catch (e) { return []; } }
+function qrPrintedAdd(key, ids) { const cur = qrPrintedGet(key); ids.forEach(id => { if (cur.indexOf(String(id)) < 0) cur.push(String(id)); }); try { localStorage.setItem("ab_rmqr_" + key, JSON.stringify(cur.slice(-2000))); } catch (e) {} }
 async function qmPrint(kind) {
-  const tok = QM.profile.roomOrderToken; if (!tok) return;
   const ids = kind === "room" ? QM.rooms.slice().sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true })).map(r => String(r.id)) : (QM.profile.restaurantTables || []).slice();
-  if (!ids.length) { qmMsg(kind === "room" ? "Koi room nahi mila." : "Pehle tables add karo.", "bad"); return; }
   try {
-    const qr = await new Promise((res, rej) => { if (window.qrcode) return res(window.qrcode); const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("QR maker load nahi hua")); document.head.appendChild(s); });
-    const name = escHtml(QM.profile.hotelName || QM.hotel || "");
-    const lg = qmLogoOn() ? qmLogo() : "";
-    const cards = ids.map(id => { const q = qr(0, lg ? "H" : "M"); q.addData(qmLink(kind, id)); q.make(); const svg = q.createSvgTag(5, 2); return "<div class=c><div class=h>" + name + "</div>" + (lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div><div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
-    const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + (kind === "room" ? "Room" : "Table") + " QR codes</title><style>" + (lg ? ".q{position:relative;display:inline-block;width:42mm;height:42mm}.q svg{width:100%!important;height:100%!important;display:block}.lg{position:absolute;left:50%;top:50%;width:11mm;height:11mm;transform:translate(-50%,-50%);background:#fff url('" + lg + "') center/8.6mm 8.6mm no-repeat;border-radius:2mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}" : "") + "body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
-    const w = window.open("", "_blank");
-    if (w) { w.document.write(html); w.document.close(); } else qmMsg("Pop-up allow karo, phir dobara Print dabao.", "bad");
+    const err = await qrPrintIds(kind, ids, QM.profile.roomOrderToken, QM.profile.hotelName || QM.hotel, qmLogoOn() ? qmLogo() : "");
+    if (err) qmMsg(err, "bad"); else if (kind === "room") qrPrintedAdd(QM.key, ids);
   } catch (e) { qmMsg("❌ " + e.message, "bad"); }
 }
 // ── tables ──
