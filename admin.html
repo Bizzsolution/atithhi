@@ -1767,6 +1767,37 @@ function qmRef(id) { return window._db.collection("hotels").doc(QM.key).collecti
 function qmClean(t) { return String(t || "").trim().replace(/[^A-Za-z0-9-]/g, "").slice(0, 10); }
 function qmToken() { const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let s = "RO"; const r = new Uint32Array(16); crypto.getRandomValues(r); for (let k = 0; k < 16; k++) s += A[r[k] % A.length]; return s; }
 function qmBase() { return window.location.origin + "/"; }
+// QR ke beech hotel logo (logo ho to QR "H" level pe — 30% tak dhaka bhi scan hota hai)
+function qmLogo() { const l = (QM.profile && QM.profile.qrLogo) || (QM.profile && QM.profile.hotelLogo); return /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$/.test(l || "") ? l : ""; }
+function qmLogoOn() { try { return localStorage.getItem("ab_qm_logo") !== "0"; } catch (e) { return true; } }
+function qmSetLogo(v) { try { localStorage.setItem("ab_qm_logo", v ? "1" : "0"); } catch (e) {} }
+// QR ka apna logo (sirf QR pe lagta hai — hotel app / bill ka logo nahi badalta)
+function qmUploadLogo(input) {
+  const f = input.files && input.files[0]; input.value = "";
+  if (!f) return;
+  if (!/^image\/(png|jpe?g|webp)$/.test(f.type)) { qmMsg("Sirf PNG / JPG / WEBP image chalegi.", "bad"); return; }
+  if (f.size > 8 * 1024 * 1024) { qmMsg("Image 8 MB se chhoti honi chahiye.", "bad"); return; }
+  const rd = new FileReader();
+  rd.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const S = 256, c = document.createElement("canvas"); c.width = S; c.height = S;
+      const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, S, S);
+      const k = Math.min(S / img.width, S / img.height), w = img.width * k, h = img.height * k;
+      x.drawImage(img, (S - w) / 2, (S - h) / 2, w, h);
+      let url = c.toDataURL("image/png");
+      if (url.length > 80000) url = c.toDataURL("image/jpeg", 0.88);
+      qmRun(async () => { await qmSaveProfile({ qrLogo: url }); qmSetLogo(true); qmMsg("✅ QR logo save hua — ab print me QR ke beech ye logo aayega (hotel app ka logo nahi badla).", "ok"); });
+    };
+    img.onerror = () => qmMsg("Ye image khul nahi rahi.", "bad");
+    img.src = rd.result;
+  };
+  rd.readAsDataURL(f);
+}
+function qmRemoveLogo() {
+  if (!confirm("QR logo hatana hai?" + (QM.profile.hotelLogo ? " (phir hotel ka logo QR pe aayega)" : ""))) return;
+  return qmRun(async () => { await qmSaveProfile({ qrLogo: "" }); qmMsg("✅ QR logo hata diya.", "ok"); });
+}
 function qmLink(kind, id) { return qmBase() + "?order=" + QM.profile.roomOrderToken + "&" + kind + "=" + encodeURIComponent(id); }
 function qmMsg(text, type) {
   const el = document.getElementById("qmMsg"); if (!el) return;
@@ -1817,20 +1848,23 @@ async function qmLoad() {
     QM.cfg = Object.assign({}, QM_BQ_DEFAULT, (c.exists && c.data().value && typeof c.data().value === "object") ? c.data().value : {});
     const y = new Date().getFullYear(); QM.events = [];
     for (const yr of [y - 1, y, y + 1]) { try { const s = await qmRef("bq_" + yr).get(); if (s.exists && Array.isArray(s.data().value)) QM.events.push(...s.data().value); } catch (e) {} }
-    qmMsg(QM.profileExists ? "" : "⚠️ Is hotel ka profile abhi cloud me nahi hai — pehle hotel app ek baar kholke Settings save karo.", QM.profileExists ? "" : "bad");
+    qmMsg(QM.profileExists ? "" : "ℹ️ Is hotel ne abhi app me Settings save nahi ki hai — koi baat nahi, QR link aur tables yahin se ban jayenge (hotel ki baaki settings nahi badlengi).", "inf");
   } catch (e) { qmMsg("❌ Load nahi hua: " + (e && e.message || e), "bad"); }
   qmRender();
 }
-// profile ka sirf ek field badlo (latest copy pe, transaction me)
+// profile ka sirf ek field badlo (latest copy pe, transaction me).
+// Profile cloud me na ho to sirf yahi field likhte hain — hotel app cloud
+// profile ko apne local profile me MILATA hai (replace nahi karta), isliye
+// hotel ka naam / logo / baaki settings safe rehti hain.
 async function qmSaveProfile(patch) {
   let out = null;
   await window._db.runTransaction(async tx => {
     const ps = await tx.get(qmRef("profile"));
-    if (!ps.exists || !ps.data().value || typeof ps.data().value !== "object") throw new Error("Hotel ka profile cloud me nahi mila");
-    out = Object.assign({}, ps.data().value, patch);
-    tx.set(qmRef("profile"), Object.assign({}, ps.data(), { value: out, ts: Date.now() }));
+    const has = ps.exists && ps.data().value && typeof ps.data().value === "object" && !Array.isArray(ps.data().value);
+    out = Object.assign({}, has ? ps.data().value : {}, patch);
+    tx.set(qmRef("profile"), Object.assign({}, has ? ps.data() : {}, { value: out, ts: Date.now() }));
   });
-  QM.profile = out;
+  QM.profile = out; QM.profileExists = true;
   return out;
 }
 // public menu document pe tables turant update (hotel app baaki publish karta hai)
@@ -1860,8 +1894,9 @@ async function qmPrint(kind) {
   try {
     const qr = await new Promise((res, rej) => { if (window.qrcode) return res(window.qrcode); const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("QR maker load nahi hua")); document.head.appendChild(s); });
     const name = escHtml(QM.profile.hotelName || QM.hotel || "");
-    const cards = ids.map(id => { const q = qr(0, "M"); q.addData(qmLink(kind, id)); q.make(); return "<div class=c><div class=h>" + name + "</div>" + q.createSvgTag(5, 2) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div><div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
-    const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + (kind === "room" ? "Room" : "Table") + " QR codes</title><style>body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+    const lg = qmLogoOn() ? qmLogo() : "";
+    const cards = ids.map(id => { const q = qr(0, lg ? "H" : "M"); q.addData(qmLink(kind, id)); q.make(); const svg = q.createSvgTag(5, 2); return "<div class=c><div class=h>" + name + "</div>" + (lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg) + "<div class=r>" + (kind === "room" ? "ROOM " : "TABLE ") + escHtml(id) + "</div><div class=t>" + (kind === "room" ? "Scan to order food to your room" : "Scan to see the menu and order") + "</div></div>"; }).join("");
+    const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>" + (kind === "room" ? "Room" : "Table") + " QR codes</title><style>" + (lg ? ".q{position:relative;display:inline-block;width:42mm;height:42mm}.q svg{width:100%!important;height:100%!important;display:block}.lg{position:absolute;left:50%;top:50%;width:11mm;height:11mm;transform:translate(-50%,-50%);background:#fff url('" + lg + "') center/8.6mm 8.6mm no-repeat;border-radius:2mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}" : "") + "body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
     const w = window.open("", "_blank");
     if (w) { w.document.write(html); w.document.close(); } else qmMsg("Pop-up allow karo, phir dobara Print dabao.", "bad");
   } catch (e) { qmMsg("❌ " + e.message, "bad"); }
@@ -1948,7 +1983,7 @@ function qmSaveGst() {
 }
 function qmRender() {
   const body = document.getElementById("qmBody"); if (!body) return;
-  const P = QM.profile, tok = P.roomOrderToken, dis = QM.busy || !QM.profileExists ? "disabled" : "";
+  const P = QM.profile, tok = P.roomOrderToken, dis = QM.busy ? "disabled" : "";
   const on = f => QM.features.includes(f);
   const chip = (f, label) => `<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:${on(f) ? "#052e16" : "#1e293b"};color:${on(f) ? "#4ade80" : "#64748b"}">${on(f) ? "✅" : "⛔"} ${label}</span>`;
   const sec = (title, inner) => `<div style="background:#1e293b;border-radius:10px;padding:12px;margin:12px 0"><div style="font-size:12px;font-weight:700;color:#fbbf24;margin-bottom:8px">${title}</div>${inner}</div>`;
@@ -1957,16 +1992,25 @@ function qmRender() {
   const upcoming = QM.events.filter(e => e && e.status === "booked" && String(e.date) >= today).length, quotes = QM.events.filter(e => e && e.status === "quote").length;
   body.innerHTML =
     `<div style="display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 2px">${chip("qr_ordering", "Room QR")}${chip("table_qr", "Table QR")}${chip("restaurant", "Restaurant")}${chip("banquet", "Banquet")}<span style="font-size:11px;color:#64748b;align-self:center">(add-on ON/OFF 🎛️ Features se)</span></div>` +
-    sec("🔗 QR LINK", tok
+    sec("🔗 QR LINK", (!on("qr_ordering") && !on("table_qr") ? `<div data-t="qm-addon-warn" style="font-size:11.5px;color:#fbbf24;background:#451a03;border-radius:8px;padding:7px 10px;margin-bottom:8px">⚠️ Room QR aur Table QR dono add-on OFF hain — QR ban/print ho jayega, par guest order tab kar payega jab 🎛️ Features me ON karoge.</div>` : !on("qr_ordering") ? `<div style="font-size:11.5px;color:#fbbf24;margin-bottom:6px">⚠️ Room QR add-on OFF hai — room QR se order nahi hoga.</div>` : !on("table_qr") ? `<div style="font-size:11.5px;color:#fbbf24;margin-bottom:6px">⚠️ Table QR add-on OFF hai — table QR se order nahi hoga.</div>` : "") + (tok
       ? `<div style="font-size:12px;color:#cbd5e1;word-break:break-all">Link: <code>${escHtml(qmBase())}?order=${escHtml(tok)}&amp;room=…</code></div>
+         <div style="display:flex;align-items:center;gap:10px;margin-top:10px;padding:8px 10px;background:#0f172a;border-radius:8px">
+           ${qmLogo() ? `<img data-t="qm-logo-preview" alt="QR logo" src="${qmLogo()}" style="width:44px;height:44px;object-fit:contain;background:#fff;border-radius:6px;flex:0 0 auto">` : `<div style="width:44px;height:44px;border-radius:6px;background:#1e293b;display:flex;align-items:center;justify-content:center;color:#64748b;flex:0 0 auto">🖼️</div>`}
+           <div style="flex:1;min-width:0">
+             <label data-t="qm-logo-toggle" style="display:flex;align-items:center;gap:8px;font-size:12px;color:${qmLogo() ? "#e2e8f0" : "#64748b"}"><input type="checkbox" data-t="qm-logo" ${qmLogo() ? "" : "disabled"} ${qmLogo() && qmLogoOn() ? "checked" : ""} onchange="qmSetLogo(this.checked)" style="width:16px;height:16px;flex:0 0 auto;margin:0"><span>${qmLogo() ? "QR ke beech logo lagao" : "QR me logo — pehle logo upload karo"}</span></label>
+             <div style="font-size:10.5px;color:#64748b;margin-top:2px">${QM.profile.qrLogo ? "QR logo (admin se upload)" : QM.profile.hotelLogo ? "Hotel app ka logo use ho raha hai" : "Koi logo nahi"}</div>
+           </div>
+           <label class="btn" style="background:#1e3a5f;color:#bae6fd;cursor:pointer;margin:0">📤 ${QM.profile.qrLogo ? "Badlo" : "Upload"}<input type="file" data-t="qm-logo-file" accept="image/png,image/jpeg,image/webp" onchange="qmUploadLogo(this)" style="display:none" ${dis}></label>
+           ${QM.profile.qrLogo ? `<button class="btn btn-danger" ${dis} data-t="qm-logo-remove" onclick="qmRemoveLogo()">🗑️</button>` : ""}
+         </div>
          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
            <button class="btn" ${dis} data-t="qm-print-rooms" onclick="qmPrint('room')" style="background:#1e3a5f;color:#bae6fd">🖨️ Room QR print (${QM.rooms.length})</button>
            <button class="btn" ${dis} data-t="qm-print-tables" onclick="qmPrint('table')" style="background:#3b1d0b;color:#fdba74">🖨️ Table QR print (${tables.length})</button>
            <button class="btn btn-danger" ${dis} data-t="qm-regen" onclick="qmGenToken(true)">♻️ Naya link (purane QR band)</button></div>`
       : `<div style="font-size:12px;color:#94a3b8;margin-bottom:8px">Abhi QR link nahi bana. Ek hi link se room aur table dono ke QR bante hain.</div>
-         <button class="btn btn-success" ${dis} data-t="qm-gen" onclick="qmGenToken(false)" style="width:100%;padding:10px">➕ QR link banao</button>`) +
+         <button class="btn btn-success" ${dis} data-t="qm-gen" onclick="qmGenToken(false)" style="width:100%;padding:10px">➕ QR link banao</button>`)) +
     sec("🍽️ RESTAURANT TABLES (" + tables.length + ")",
-      `<div style="display:grid;grid-template-columns:2fr auto;gap:8px">
+      (on("table_qr") && !on("restaurant") ? `<div style="font-size:11.5px;color:#fbbf24;margin-bottom:6px">⚠️ Restaurant add-on OFF hai — table ka bill banane ke liye Restaurant bhi ON karo.</div>` : "") + `<div style="display:grid;grid-template-columns:2fr auto;gap:8px">
          <input id="qmNewTable" data-t="qm-new-table" maxlength="200" placeholder="Naam: 1, 2, G1, Roof-1 (comma se kai)">
          <button class="btn btn-success" ${dis} data-t="qm-add-table" onclick="qmAddTables()">➕ Add</button></div>
        <div style="display:grid;grid-template-columns:2fr auto;gap:8px;margin-top:6px">

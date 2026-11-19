@@ -14155,11 +14155,11 @@ function RoomQrCard({ profile, rooms, onSaveToken }) {
     try {
       const qr = await loadQr();
       const list = (rooms || []).slice().sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+      const lg = qrLogoWanted() ? qrLogoUrl(profile) : "";
       const cards = list.map(r => {
-        const q = qr(0, "M"); q.addData(link(r.id)); q.make();
-        return "<div class=c><div class=h>" + escHtml((profile && profile.hotelName) || "") + "</div>" + q.createSvgTag(5, 2) + "<div class=r>ROOM " + escHtml(r.id) + "</div><div class=t>Scan to order food &amp; drinks to your room</div></div>";
+        return "<div class=c><div class=h>" + escHtml((profile && profile.hotelName) || "") + "</div>" + qrCardSvg(qr, link(r.id), lg) + "<div class=r>ROOM " + escHtml(r.id) + "</div><div class=t>Scan to order food &amp; drinks to your room</div></div>";
       }).join("");
-      const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>Room QR codes</title><style>body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+      const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>Room QR codes</title><style>" + qrLogoCss(lg) + "body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
       const w = window.open("", "_blank");
       if (w) { w.document.write(html); w.document.close(); } else alert("Please allow pop-ups to print the QR codes.");
     } catch (e) { alert(e.message); }
@@ -14171,6 +14171,7 @@ function RoomQrCard({ profile, rooms, onSaveToken }) {
       _h("button", { className: "btn-p", "data-t": "ro-setup", onClick: create, disabled: busy, style: { width: "100%" } }, busy ? "Setting up…" : "Turn on QR ordering"))
       : _h(React.Fragment, null,
         _h("div", { style: { fontSize: 12, color: "var(--muted)", margin: "4px 0 8px" } }, "Print and keep each room's QR code in that room. Only checked-in rooms can order."),
+        _h(QrLogoToggle, { profile }),
         _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
           _h("button", { className: "btn-p", "data-t": "ro-print-qr", onClick: printSheet, style: { flex: "1 1 160px" } }, "🖨️ Print QR codes (all rooms)"),
           _h("button", { className: "btn-s", onClick: () => { const r = (rooms || [])[0]; if (r) window.open(link(r.id), "_blank"); }, style: { flex: "1 1 120px" } }, "👀 Preview guest page"))),
@@ -15052,6 +15053,21 @@ function BanquetDetail({ ev, cfg, events, user, by, boss, openHtml, onBack, onEd
       (ev.status === "quote" || (ev.status === "booked" && boss)) && _h("button", { className: "btn-s", "data-t": "bq-cancel", disabled: busy, onClick: () => setCancel({ reason: "" }), style: { flex: "1 1 130px", color: "#b91c1c" } }, "Cancel " + (ev.status === "quote" ? "quotation" : "booking"))));
 }
 
+// ── QR print: hotel logo in the middle (v5.38) ───────────────────────
+// With a logo the QR uses the highest error-correction level ("H", 30%),
+// so the small logo in the middle never stops it from scanning.
+function qrLogoUrl(profile) { const l = (profile && profile.qrLogo) || (profile && profile.hotelLogo) || (function () { try { return localStorage.getItem("hotelLogo") || ""; } catch (e) { return ""; } })(); return /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$/.test(l || "") ? l : ""; }
+function qrLogoWanted() { try { return localStorage.getItem("ab_qr_logo") !== "0"; } catch (e) { return true; } }
+function qrLogoCss(lg) { return lg ? ".q{position:relative;display:inline-block;width:42mm;height:42mm}.q svg{width:100%!important;height:100%!important;display:block}.lg{position:absolute;left:50%;top:50%;width:11mm;height:11mm;transform:translate(-50%,-50%);background:#fff url('" + lg + "') center/8.6mm 8.6mm no-repeat;border-radius:2mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}" : ""; }
+function qrCardSvg(qr, url, lg) { const q = qr(0, lg ? "H" : "M"); q.addData(url); q.make(); const svg = q.createSvgTag(5, 2); return lg ? "<div class=q>" + svg + "<i class=lg></i></div>" : svg; }
+function QrLogoToggle({ profile }) {
+  const _h = React.createElement;
+  const lg = qrLogoUrl(profile);
+  const [on, setOn] = useState(qrLogoWanted());
+  return _h("label", { "data-t": "qr-logo-toggle", style: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, margin: "0 0 8px", color: lg ? "var(--navy)" : "var(--muted)" } },
+    _h("input", { type: "checkbox", "data-t": "qr-logo-check", disabled: !lg, checked: !!lg && on, onChange: e => { setOn(e.target.checked); try { localStorage.setItem("ab_qr_logo", e.target.checked ? "1" : "0"); } catch (er) {} } }),
+    lg ? _h("span", null, "🖼️ Hotel logo in the middle of the QR") : _h("span", null, "🖼️ Hotel logo in the QR — add a logo in Settings first"));
+}
 // ── RESTAURANT TABLE QR (paid add-on "table_qr") ─────────────────────
 // Same token, same guest page and same approval flow as the room QR:
 // a table's QR is …/?order=<TOKEN>&table=5 and its orders carry
@@ -15160,11 +15176,11 @@ function TableQrCard({ profile, rooms, onSaveTables, onSaveToken }) {
         if (window.qrcode) return res(window.qrcode);
         const s = document.createElement("script"); s.src = "/qrcode.js"; s.onload = () => res(window.qrcode); s.onerror = () => rej(new Error("Could not load the QR maker")); document.head.appendChild(s);
       });
+      const lg = qrLogoWanted() ? qrLogoUrl(profile) : "";
       const cards = saved.map(t => {
-        const q = qr(0, "M"); q.addData(link(t)); q.make();
-        return "<div class=c><div class=h>" + escHtml((profile && profile.hotelName) || "") + "</div>" + q.createSvgTag(5, 2) + "<div class=r>TABLE " + escHtml(t) + "</div><div class=t>Scan to see the menu and order</div></div>";
+        return "<div class=c><div class=h>" + escHtml((profile && profile.hotelName) || "") + "</div>" + qrCardSvg(qr, link(t), lg) + "<div class=r>TABLE " + escHtml(t) + "</div><div class=t>Scan to see the menu and order</div></div>";
       }).join("");
-      const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>Table QR codes</title><style>body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+      const html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>Table QR codes</title><style>" + qrLogoCss(lg) + "body{font-family:Arial,sans-serif;margin:10mm}.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}.c{border:1.5px dashed #999;border-radius:6px;padding:6mm;text-align:center;page-break-inside:avoid}.c svg{width:42mm;height:42mm}.h{font-weight:700;font-size:13px}.r{font-size:20px;font-weight:800;margin-top:2mm}.t{font-size:11px;color:#444}</style></head><body><div class=g>" + cards + "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
       const w = window.open("", "_blank");
       if (w) { w.document.write(html); w.document.close(); } else alert("Please allow pop-ups to print the QR codes.");
     } catch (e) { alert(e.message); }
@@ -15178,6 +15194,7 @@ function TableQrCard({ profile, rooms, onSaveTables, onSaveToken }) {
       _h("button", { className: "btn-s", "data-t": "tq-fill", onClick: fill, style: { width: "auto" } }, "Number them 1, 2, 3…")),
     _h("textarea", { "data-t": "tq-list", value: text, rows: 2, onChange: e => setText(e.target.value), placeholder: "Table names, separated by commas (e.g. 1, 2, 3, G1, Roof-1)", style: { width: "100%", boxSizing: "border-box", fontSize: 13 } }),
     _h("div", { style: { fontSize: 11.5, color: "var(--muted)", margin: "2px 0 8px" } }, list.length + " tables · letters, numbers and - only, up to 10 characters each"),
+    saved.length > 0 && token && _h(QrLogoToggle, { profile }),
     _h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
       _h("button", { className: "btn-p", "data-t": "tq-save", disabled: busy || (!changed && !!token) || !list.length, onClick: save, style: { flex: "1 1 140px" } }, busy ? "Saving…" : "Save tables"),
       saved.length > 0 && token && _h("button", { className: "btn-s", "data-t": "tq-print", onClick: printSheet, style: { flex: "1 1 140px" } }, "🖨️ Print table QR codes"),
